@@ -278,3 +278,145 @@ class ApprovalGateway:
             self._db.refresh(case_obj)
 
         return approval, proposal, case_obj
+
+    def simulate_demo_approval(
+        self,
+        *,
+        proposal_id: str,
+        reason: str = "Phê duyệt mô phỏng tự phục vụ (SIMULATED_DEMO_APPROVAL - MOCK ONLY)",
+        expiry_minutes: int = 120,
+    ) -> tuple[Approval, ActionProposal, Case | None]:
+        """Explicitly labeled self-serve MOCK demonstration approval flow.
+
+        Invariants:
+        - Completely separate from authenticated manager approval (`decide_proposal`).
+        - Strictly restricted to `SOURCE_MODE == MOCK`.
+        - Runs the full deterministic `PolicyEngine` check (so policy/risk violations still fail
+          with 409 CONFLICT).
+        - Explicitly records `approver_role = 'SIMULATED_DEMO_APPROVAL'` and
+          `approval_mode = 'SIMULATED_DEMO_APPROVAL'` in the Approval digest and CaseEvent.
+        """
+        if get_settings().source_mode != SourceMode.MOCK:
+            raise AppError(
+                ErrorCode.FORBIDDEN,
+                "SIMULATED_DEMO_APPROVAL is strictly restricted to SOURCE_MODE=MOCK",
+                status_code=403,
+            )
+
+        proposal = self._db.scalar(
+            select(ActionProposal)
+            .where(
+                ActionProposal.id == proposal_id,
+                ActionProposal.session_id == self._session_id,
+            )
+            .with_for_update()
+        )
+        if proposal is None:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                f"ActionProposal '{proposal_id}' not found in current session",
+                status_code=404,
+            )
+
+        if proposal.status != ActionProposalStatus.PROPOSED.value:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"ActionProposal '{proposal_id}' cannot be decided because its status is "
+                f"'{proposal.status}' (expected 'PROPOSED')",
+                status_code=409,
+                details={"proposal_id": proposal.id, "current_status": proposal.status},
+            )
+
+        contract = get_action_contract(proposal.action_type)
+        policy_engine = PolicyEngine(self._db, self._session_id)
+        eval_res = policy_engine.evaluate(
+            proposal,
+            approver_role=None,
+            lock_rows=True,
+            for_execution=False,
+        )
+        if not eval_res.allowed:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"PolicyEngine blocked simulated demo approval ({eval_res.violation_code}): "
+                f"{eval_res.violation_message}",
+                status_code=409,
+                details={
+                    "violation_code": eval_res.violation_code,
+                    "checked_preconditions": eval_res.checked_preconditions,
+                    "context_snapshot": eval_res.context_snapshot,
+                },
+            )
+
+        sim_role = "SIMULATED_DEMO_APPROVAL"
+        sim_id = f"sim_demo_guest_{self._session_id[-8:]}"
+        now = datetime.now(UTC)
+        expiry = now + timedelta(minutes=expiry_minutes)
+        digest = compute_approval_digest(
+            session_id=self._session_id,
+            proposal_id=proposal.id,
+            case_id=proposal.case_id,
+            action_type=contract.action_type,
+            params_json=proposal.params_json,
+            evidence_refs=proposal.evidence_refs,
+            expected_version=proposal.expected_version,
+            policy_version=contract.policy_version,
+            approver_role=sim_role,
+            approver_id=sim_id,
+        )
+
+        approval = Approval(
+            id=f"APPR-{uuid.uuid4().hex[:10].upper()}",
+            proposal_id=proposal.id,
+            approver_role=sim_role,
+            approver_id=sim_id,
+            policy_version=contract.policy_version,
+            decision=ApprovalDecision.APPROVED.value,
+            digest=digest,
+            expiry=expiry,
+            created_at=now,
+        )
+        self._db.add(approval)
+        proposal.status = ActionProposalStatus.APPROVED.value
+
+        case_obj: Case | None = None
+        if proposal.case_id is not None:
+            case_obj = self._db.scalar(
+                select(Case)
+                .where(
+                    Case.id == proposal.case_id,
+                    Case.session_id == self._session_id,
+                )
+                .with_for_update()
+            )
+            if case_obj is not None:
+                evt = CaseEvent(
+                    id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
+                    case_id=case_obj.id,
+                    session_id=self._session_id,
+                    type="ACTION_APPROVED",
+                    payload_json={
+                        "approval_id": approval.id,
+                        "proposal_id": proposal.id,
+                        "action_type": contract.action_type,
+                        "decision": ApprovalDecision.APPROVED.value,
+                        "approval_mode": "SIMULATED_DEMO_APPROVAL",
+                        "is_simulated_demo_approval": True,
+                        "approver_role": sim_role,
+                        "approver_id": sim_id,
+                        "reason": reason,
+                        "digest": digest,
+                        "policy_version": contract.policy_version,
+                        "expiry": expiry.isoformat(),
+                    },
+                    created_at=now,
+                )
+                self._db.add(evt)
+
+        self._db.commit()
+        self._db.refresh(approval)
+        self._db.refresh(proposal)
+        if case_obj is not None:
+            self._db.refresh(case_obj)
+
+        return approval, proposal, case_obj

@@ -5,8 +5,23 @@ from __future__ import annotations
 from enum import StrEnum
 from functools import lru_cache
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+INSECURE_DEFAULT_SECRETS: frozenset[str] = frozenset(
+    {
+        "",
+        "finresolve-demo-manager-hmac-signing-key-local-only",
+        "change-me",
+        "change-me-local-only",
+        "default",
+        "secret",
+        "password",
+        "123456",
+        "demo-secret",
+    }
+)
+LOCAL_DEV_ENVIRONMENTS: frozenset[str] = frozenset({"local", "test", "dev", "development"})
 
 
 class SourceMode(StrEnum):
@@ -71,6 +86,31 @@ class Settings(BaseSettings):
         if value is not SourceMode.MOCK:
             raise ValueError("Only SOURCE_MODE=MOCK is supported in this build")
         return value
+
+    @model_validator(mode="after")
+    def _validate_demo_approval_secret(self) -> Settings:
+        env_norm = self.app_env.strip().lower()
+        secret_val = self.demo_approval_secret.get_secret_value().strip()
+
+        # Always reject trivial weak placeholder values even in local/test if explicitly set
+        if secret_val.lower() in {"change-me", "default", "secret", "password", "123456", ""}:
+            raise ValueError(
+                "DEMO_APPROVAL_SECRET cannot be empty or an insecure placeholder value"
+            )
+
+        # In deployed environments (non-local/test), strictly require an explicit strong secret
+        if env_norm not in LOCAL_DEV_ENVIRONMENTS:
+            if (
+                secret_val in INSECURE_DEFAULT_SECRETS
+                or "local-only" in secret_val.lower()
+                or "change-me" in secret_val.lower()
+                or len(secret_val) < 32
+            ):
+                raise ValueError(
+                    f"Deployed environment (APP_ENV='{self.app_env}') requires an explicit, "
+                    "strong DEMO_APPROVAL_SECRET (>= 32 chars, not the local default)"
+                )
+        return self
 
     @property
     def cors_origins(self) -> list[str]:

@@ -72,12 +72,24 @@ def client() -> Iterator[TestClient]:
 
 @pytest.fixture
 def active_session(client: TestClient) -> dict[str, str]:
-    """Helper fixture to create an active demo session."""
+    """Helper fixture to create an active demo session (public route returns guest token only)."""
+    from app.core.session import issue_demo_manager_token
+    from app.db.session import get_sessionmaker
+    from app.models.session import DemoSession
+
     res = client.post("/api/v1/demo/sessions", json={"ttl_minutes": 60, "max_cases": 10})
     assert res.status_code == 201
     data = res.json()
+    assert "manager_token" not in data
+
+    maker = get_sessionmaker()
+    with maker() as db:
+        sess_obj = db.get(DemoSession, data["session_id"])
+        assert sess_obj is not None
+        mgr_token = issue_demo_manager_token(sess_obj, role="DEMO_MANAGER")
+
     return {
         "id": data["session_id"],
         "token": data["token"],
-        "manager_token": data["manager_token"],
+        "manager_token": mgr_token,
     }

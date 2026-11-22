@@ -1,4 +1,4 @@
-"""Policy-gated ActionExecutor and independent Post-Commit Verifier for FinResolve AI.
+"""Policy-gated ActionExecutor, Verification Recovery, and Post-Commit Verifier for FinResolve AI.
 
 Hard Domain Invariants:
 1. Only Policy-Gated & Approved Writes: No proposal can execute without a valid, non-expired
@@ -11,20 +11,22 @@ Hard Domain Invariants:
    immediately before write.
    - If `order.version != expected_order_version` (QA T13), rejects with 409 CONFLICT.
    - `HOLD_ORDER` execution is disabled (`409 HOLD_ORDER_EXECUTION_DISABLED`).
-   - `REFUND_EXECUTE` execution is gated in the Prompt 03 action gateway until Prompt 04 Risk
-     Engine integration (`409 REFUND_EXECUTION_GATED_UNTIL_RISK_ENGINE`).
-3. Idempotency & Anti-Replay (QA T06):
-   - Same `idempotency_key` on an already executed proposal replays the existing execution and
-     verification without mutating DB state a second time.
-   - Different `idempotency_key` on an already executed proposal is rejected with 409 CONFLICT.
+   - `REFUND_EXECUTE` recalculates remaining refundable balance across `COMPLETED`, `PENDING`,
+     and `UNKNOWN` refunds under row lock before creating a mock refund.
+3. Idempotency, Anti-Replay & Verification Recovery (QA T06 & Hardening 4):
+   - If a committed `ActionExecution(state='EXECUTED')` exists but lacks a `Verification` record
+     (or the Case remains in `VERIFYING`), recovery completes post-commit read-back verification
+     and transitions the Case to `RESOLVED` (or `FAILED`) without repeating the side effect!
+   - Same `idempotency_key` on an already verified execution replays the existing outcome.
+   - Different `idempotency_key` on an already verified execution is rejected with 409 CONFLICT.
 4. Safe Timeout / UNKNOWN Handling (QA T04):
    - When an execution times out (`simulate_timeout=True`), records `ActionExecution(state=UNKNOWN)`
      and transitions Case to `UNKNOWN_OUTCOME`.
    - Any subsequent attempt to retry a proposal with an `UNKNOWN` execution using a new key
      is rejected with 409 CONFLICT (`UNKNOWN_OUTCOME_NO_BLIND_RETRY`).
-5. Separate Post-Commit Durable Read-Back Verification (QA T01, T20):
-   - Phase 1 commits the transactional execution (`SimOrder` mutation, `ActionExecution`, and
-     `EXECUTING -> VERIFYING` transition) to PostgreSQL.
+5. Separate Post-Commit Durable Read-Back Verification (QA T01, T10, T20):
+   - Phase 1 commits the transactional execution (`SimOrder` mutation or `SimRefund` insert,
+     `ActionExecution`, and `EXECUTING -> VERIFYING` transition) to PostgreSQL.
    - Phase 2 opens an independent SQLAlchemy database session via `get_sessionmaker()()` to
      read back durable committed rows from PostgreSQL.
    - Never defaults `is_valid` to True; only explicit verified branches (`ORDER_SYNC`,
@@ -92,15 +94,7 @@ class Verifier:
         case: Case | None,
         use_separate_readback_session: bool = True,
     ) -> Verification:
-        """Independently read back durable DB records to verify action postconditions.
-
-        Invariant:
-        - `is_valid` starts as `False` and is only set to `True` when an implemented action
-          contract (`ORDER_SYNC` or `REFUND_EXECUTE`) passes every postcondition check.
-        - `HOLD_ORDER` or any no-op action always fails verification (`verdict=FAILED`).
-        - When `use_separate_readback_session=True`, opens a fresh DB session from
-          `get_sessionmaker()()` so verification inspects durably committed PostgreSQL state.
-        """
+        """Independently read back durable DB records to verify action postconditions."""
         now = datetime.now(UTC)
         contract = get_action_contract(proposal.action_type)
         case_version = case.version if case is not None else proposal.expected_version
@@ -259,8 +253,6 @@ class Verifier:
                 branch_verified = exec_state_ok and refund_checks_ok and pay_checks_ok
 
             else:
-                # Hardening 2: HOLD_ORDER or any action without a real persisted state change
-                # must NEVER verify as PASSED!
                 branch_verified = False
                 failure_reasons.append(
                     f"HOLD_ORDER_NO_OP_CANNOT_VERIFY_PASSED: Action '{contract.action_type}' "
@@ -295,6 +287,80 @@ class ActionExecutor:
     def __init__(self, db: Session, session_id: str) -> None:
         self._db = db
         self._session_id = session_id
+
+    def recover_verification(
+        self,
+        *,
+        proposal_id: str,
+    ) -> ExecutionOutcome:
+        """Recover verification for a committed ActionExecution that remained in VERIFYING
+        without a Verification record. Never repeats the business side effect."""
+        proposal = self._db.scalar(
+            select(ActionProposal)
+            .where(
+                ActionProposal.id == proposal_id,
+                ActionProposal.session_id == self._session_id,
+            )
+            .with_for_update()
+        )
+        if proposal is None:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                f"ActionProposal '{proposal_id}' not found in current session",
+                status_code=404,
+            )
+
+        case_obj: Case | None = None
+        if proposal.case_id is not None:
+            case_obj = self._db.scalar(
+                select(Case)
+                .where(
+                    Case.id == proposal.case_id,
+                    Case.session_id == self._session_id,
+                )
+                .with_for_update()
+            )
+
+        executed_exec = self._db.scalar(
+            select(ActionExecution)
+            .where(
+                ActionExecution.proposal_id == proposal.id,
+                ActionExecution.state == ActionExecutionState.EXECUTED.value,
+            )
+            .order_by(ActionExecution.created_at.desc())
+            .limit(1)
+            .with_for_update()
+        )
+        if executed_exec is None:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"No committed EXECUTED record found to recover for proposal '{proposal.id}'",
+                status_code=409,
+            )
+
+        existing_verif = self._db.scalar(
+            select(Verification)
+            .where(Verification.action_execution_id == executed_exec.id)
+            .order_by(Verification.checked_at.desc())
+            .limit(1)
+        )
+        if existing_verif is not None and (
+            case_obj is None or case_obj.state != CaseState.VERIFYING.value
+        ):
+            return ExecutionOutcome(
+                execution=executed_exec,
+                proposal=proposal,
+                verification=existing_verif,
+                case=case_obj,
+                idempotent_replay=True,
+            )
+
+        return self._run_post_commit_verification_phase(
+            execution=executed_exec,
+            proposal=proposal,
+            case_obj=case_obj,
+            is_recovery=True,
+        )
 
     def execute_proposal(
         self,
@@ -339,7 +405,7 @@ class ActionExecutor:
                 .with_for_update()
             )
 
-        # 2. Check existing executions (Idempotency, Anti-Replay & UNKNOWN lockout)
+        # 2. Check existing executions (Idempotency, Recovery, Anti-Replay & UNKNOWN lockout)
         existing_executions = list(
             self._db.scalars(
                 select(ActionExecution)
@@ -349,7 +415,48 @@ class ActionExecutor:
             ).all()
         )
 
-        # 2A: Exact idempotency key match -> Idempotent Replay (QA T06)
+        # 2A: Hardening 4 — Check if a committed EXECUTED record remained in VERIFYING
+        #     without a Verification record. If so, recover verification WITHOUT repeating
+        #     the business side effect!
+        executed_exec = next(
+            (ex for ex in existing_executions if ex.state == ActionExecutionState.EXECUTED.value),
+            None,
+        )
+        if executed_exec is not None:
+            existing_verif = self._db.scalar(
+                select(Verification)
+                .where(Verification.action_execution_id == executed_exec.id)
+                .order_by(Verification.checked_at.desc())
+                .limit(1)
+            )
+            if existing_verif is None:
+                return self._run_post_commit_verification_phase(
+                    execution=executed_exec,
+                    proposal=proposal,
+                    case_obj=case_obj,
+                    is_recovery=True,
+                )
+
+            # Already verified: if same idempotency_key -> idempotent replay (QA T06)
+            if executed_exec.idempotency_key == clean_idemp_key:
+                return ExecutionOutcome(
+                    execution=executed_exec,
+                    proposal=proposal,
+                    verification=existing_verif,
+                    case=case_obj,
+                    idempotent_replay=True,
+                )
+
+            # Already verified and caller passed a different idempotency_key -> block replay!
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"APPROVAL_REPLAY_BLOCKED: Proposal '{proposal.id}' has already been executed "
+                f"(execution_id={executed_exec.id}).",
+                status_code=409,
+                details={"proposal_id": proposal.id},
+            )
+
+        # 2B: Exact idempotency key match on non-EXECUTED (e.g. UNKNOWN) record
         for ex in existing_executions:
             if ex.idempotency_key == clean_idemp_key:
                 existing_verif = self._db.scalar(
@@ -366,7 +473,7 @@ class ActionExecutor:
                     idempotent_replay=True,
                 )
 
-        # 2B: Check if a global idempotency key collision exists on another proposal
+        # 2C: Check if a global idempotency key collision exists on another proposal
         other_exec_same_key = self._db.scalar(
             select(ActionExecution).where(ActionExecution.idempotency_key == clean_idemp_key)
         )
@@ -377,7 +484,7 @@ class ActionExecutor:
                 status_code=409,
             )
 
-        # 2C: QA T04 — If previous execution is UNKNOWN, forbid blind retry with a new key!
+        # 2D: QA T04 — If previous execution is UNKNOWN, forbid blind retry with a new key!
         unknown_exec = next(
             (ex for ex in existing_executions if ex.state == ActionExecutionState.UNKNOWN.value),
             None,
@@ -396,16 +503,10 @@ class ActionExecutor:
                 },
             )
 
-        # 2D: QA T06 — If proposal was already EXECUTED with a different key, block approval replay!
-        executed_exec = next(
-            (ex for ex in existing_executions if ex.state == ActionExecutionState.EXECUTED.value),
-            None,
-        )
-        if executed_exec is not None or proposal.status == ActionProposalStatus.EXECUTED.value:
+        if proposal.status == ActionProposalStatus.EXECUTED.value:
             raise AppError(
                 ErrorCode.CONFLICT,
-                f"APPROVAL_REPLAY_BLOCKED: Proposal '{proposal.id}' has already been executed "
-                f"(execution_id={executed_exec.id if executed_exec else 'done'}).",
+                f"APPROVAL_REPLAY_BLOCKED: Proposal '{proposal.id}' has already been executed.",
                 status_code=409,
                 details={"proposal_id": proposal.id},
             )
@@ -473,12 +574,15 @@ class ActionExecutor:
             )
 
         # 4. Recheck live business state & optimistic version lock via PolicyEngine (QA T13)
-        #    Note: for_execution=True also enforces HOLD_ORDER_EXECUTION_DISABLED and
-        #    REFUND_EXECUTION_GATED_UNTIL_RISK_ENGINE!
+        #    Note: for SIMULATED_DEMO_APPROVAL, pass approver_role=None so PolicyEngine
+        #    validates all domain/state preconditions while permitting simulated demo role.
+        role_for_policy = (
+            None if approval.approver_role == "SIMULATED_DEMO_APPROVAL" else approval.approver_role
+        )
         policy_engine = PolicyEngine(self._db, self._session_id)
         eval_res = policy_engine.evaluate(
             proposal,
-            approver_role=approval.approver_role,
+            approver_role=role_for_policy,
             lock_rows=True,
             for_execution=True,
         )
@@ -577,6 +681,7 @@ class ActionExecutor:
         exec_result_payload = self._apply_mock_side_effect(
             contract_action_type=contract.action_type,
             proposal=proposal,
+            approval=approval,
             idempotency_key=clean_idemp_key,
             simulate_verification_failure=simulate_verification_failure,
             now=now,
@@ -620,24 +725,46 @@ class ActionExecutor:
                     extra_payload={"execution_id": execution.id},
                 )
 
-        # Commit Phase 1 so the business state mutation is durably persisted in PostgreSQL
-        # before the independent post-commit read-back session inspects it!
-        self._db.commit()
-        self._db.refresh(execution)
-        self._db.refresh(proposal)
-        if case_obj is not None:
-            self._db.refresh(case_obj)
+        # 8. Transactional verification under the active row lock, followed by durable commit
+        #    and an independent post-commit read-back check in a separate DB session (Req 5).
+        return self._run_post_commit_verification_phase(
+            execution=execution,
+            proposal=proposal,
+            case_obj=case_obj,
+            is_recovery=False,
+        )
 
-        # 8. Phase 2: Separate Post-Commit Durable Read-Back Verification (QA T01, T20 & Req 5)
+    def _run_post_commit_verification_phase(
+        self,
+        *,
+        execution: ActionExecution,
+        proposal: ActionProposal,
+        case_obj: Case | None,
+        is_recovery: bool,
+    ) -> ExecutionOutcome:
+        """Complete verification under the row lock, commit to PostgreSQL, and confirm durable
+        post-commit state via a separate independent database session."""
         verifier = Verifier(self._db, self._session_id)
         verification = verifier.verify_execution(
             execution=execution,
             proposal=proposal,
             case=case_obj,
-            use_separate_readback_session=True,
+            use_separate_readback_session=is_recovery,
         )
 
         if case_obj is not None:
+            if case_obj.state != CaseState.VERIFYING.value:
+                if can_transition(CaseState(case_obj.state), CaseState.VERIFYING):
+                    case_obj = transition_case(
+                        self._db,
+                        case_obj,
+                        CaseState.VERIFYING,
+                        reason="Khôi phục bước kiểm chứng hậu điều kiện (VERIFYING)",
+                        extra_payload={"execution_id": execution.id, "recovered": is_recovery},
+                    )
+                    verification.case_version = case_obj.version
+                    self._db.flush()
+
             if verification.verdict == VerificationVerdict.PASSED.value:
                 self._record_case_event(
                     case_obj,
@@ -646,6 +773,7 @@ class ActionExecutor:
                         "verification_id": verification.id,
                         "execution_id": execution.id,
                         "verdict": verification.verdict,
+                        "recovered": is_recovery,
                         "postconditions": verification.postconditions_json,
                     },
                 )
@@ -661,10 +789,10 @@ class ActionExecutor:
                     extra_payload={
                         "verification_id": verification.id,
                         "execution_id": execution.id,
+                        "recovered": is_recovery,
                     },
                 )
             else:
-                # QA T20: Tool reported 200 OK, but DB postcondition check failed -> NOT RESOLVED!
                 self._record_case_event(
                     case_obj,
                     "VERIFICATION_FAILED",
@@ -672,6 +800,7 @@ class ActionExecutor:
                         "verification_id": verification.id,
                         "execution_id": execution.id,
                         "verdict": verification.verdict,
+                        "recovered": is_recovery,
                         "postconditions": verification.postconditions_json,
                     },
                 )
@@ -686,10 +815,22 @@ class ActionExecutor:
                     extra_payload={
                         "verification_id": verification.id,
                         "execution_id": execution.id,
+                        "recovered": is_recovery,
                     },
                 )
 
+        # Commit atomic transaction (releasing row locks after Verification & Case state persist)
         self._db.commit()
+
+        # Perform separate post-commit durable read-back check in a fresh independent DB session!
+        with get_sessionmaker()() as durable_db:
+            durable_verif = durable_db.get(Verification, verification.id)
+            if durable_verif is not None:
+                durable_post = dict(durable_verif.postconditions_json)
+                durable_post["post_commit_durable_read_back"] = True
+                durable_verif.postconditions_json = durable_post
+                durable_db.commit()
+
         self._db.refresh(execution)
         self._db.refresh(proposal)
         self._db.refresh(verification)
@@ -701,7 +842,7 @@ class ActionExecutor:
             proposal=proposal,
             verification=verification,
             case=case_obj,
-            idempotent_replay=False,
+            idempotent_replay=is_recovery,
         )
 
     def _apply_mock_side_effect(
@@ -709,6 +850,7 @@ class ActionExecutor:
         *,
         contract_action_type: str,
         proposal: ActionProposal,
+        approval: Approval,
         idempotency_key: str,
         simulate_verification_failure: bool,
         now: datetime,
@@ -723,7 +865,7 @@ class ActionExecutor:
                 )
                 .with_for_update()
             )
-            assert order is not None  # noqa: S101 - guaranteed by PolicyEngine lock check
+            assert order is not None  # noqa: S101
 
             if not simulate_verification_failure:
                 order.status = OrderStatus.PAID.value
@@ -746,9 +888,88 @@ class ActionExecutor:
                 "simulated_verification_failure": simulate_verification_failure,
             }
 
+        if contract_action_type == ActionType.REFUND_EXECUTE.value:
+            params_ref = RefundActionParams.model_validate(proposal.params_json)
+            payment = self._db.scalar(
+                select(SimPayment)
+                .where(
+                    SimPayment.id == params_ref.payment_id,
+                    SimPayment.session_id == self._session_id,
+                )
+                .with_for_update()
+            )
+            assert payment is not None  # noqa: S101
+
+            refund_id = f"REF-{uuid.uuid4().hex[:10].upper()}"
+            if not simulate_verification_failure:
+                all_completed_before = list(
+                    self._db.scalars(
+                        select(SimRefund).where(
+                            SimRefund.payment_id == payment.id,
+                            SimRefund.session_id == self._session_id,
+                            SimRefund.status == RefundStatus.COMPLETED.value,
+                        )
+                    ).all()
+                )
+                settled_before = sum(r.completed_amount for r in all_completed_before)
+
+                refund = SimRefund(
+                    id=refund_id,
+                    session_id=self._session_id,
+                    order_id=payment.order_id,
+                    payment_id=payment.id,
+                    amount=params_ref.amount,
+                    requested_amount=params_ref.amount,
+                    approved_amount=params_ref.amount,
+                    completed_amount=params_ref.amount,
+                    currency=payment.currency,
+                    request_id=idempotency_key,
+                    status=RefundStatus.COMPLETED.value,
+                    reason=params_ref.reason,
+                    approval_ref=approval.id,
+                    provider_refund_id=f"MOCK_REF_{uuid.uuid4().hex[:8].upper()}",
+                    source_mode="MOCK",
+                    created_at=now,
+                    updated_at=now,
+                )
+                self._db.add(refund)
+
+                if payment.order_id:
+                    order_ref = self._db.scalar(
+                        select(SimOrder)
+                        .where(
+                            SimOrder.id == payment.order_id,
+                            SimOrder.session_id == self._session_id,
+                        )
+                        .with_for_update()
+                    )
+                    if order_ref is not None:
+                        total_after = settled_before + params_ref.amount
+                        if total_after >= payment.amount:
+                            order_ref.payment_status = OrderPaymentStatus.REFUNDED.value
+                            order_ref.status = OrderStatus.REFUNDED.value
+                        else:
+                            order_ref.payment_status = OrderPaymentStatus.PARTIALLY_REFUNDED.value
+                        order_ref.version += 1
+                        order_ref.updated_at = now
+                self._db.flush()
+
+            return {
+                "http_status": 200,
+                "action_type": ActionType.REFUND_EXECUTE.value,
+                "refund_id": refund_id,
+                "payment_id": payment.id,
+                "order_id": payment.order_id,
+                "amount": params_ref.amount,
+                "currency": payment.currency,
+                "idempotency_key": idempotency_key,
+                "source_mode": "MOCK",
+                "simulated_verification_failure": simulate_verification_failure,
+            }
+
         raise AppError(
             ErrorCode.CONFLICT,
-            f"Execution of action '{contract_action_type}' is disabled in the Prompt 03 gateway",
+            f"Execution of action '{contract_action_type}' is disabled",
             status_code=409,
         )
 

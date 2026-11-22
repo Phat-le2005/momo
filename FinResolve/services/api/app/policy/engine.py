@@ -529,17 +529,9 @@ class PolicyEngine:
             "refund_amount_within_remaining_eligible_balance_across_completed_pending_unknown"
         )
 
-        # Hardening 3: Keep REFUND_EXECUTE proposal-only in the Prompt 03 action gateway
-        # until Prompt 04 Risk Engine is integrated.
-        if for_execution:
-            return self._deny(
-                contract,
-                "REFUND_EXECUTION_GATED_UNTIL_RISK_ENGINE",
-                "REFUND_EXECUTE is kept proposal-only in Prompt 03 until Prompt 04 Risk Engine "
-                "integration is enabled",
-                checked,
-            )
-
+        # Hardening 3 & Prompt 04: Valid conditional/partial refunds that pass all
+        # merchant, currency, result_code, source_mode, and remaining balance invariants
+        # are allowed to proceed under approval in MOCK mode.
         return PolicyEvaluationResult(
             allowed=True,
             policy_version=POLICY_VERSION,

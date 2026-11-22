@@ -1,4 +1,4 @@
-"""Action Proposal inspection, Approval Gateway, and Action Execution routes."""
+"""Action Proposal inspection, Approval Gateway, Demo Simulation, Execution, and Recovery routes."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from app.schemas.actions import (
     ApproveActionRequest,
     ExecuteActionRequest,
     ExecuteActionResponse,
+    SimulateDemoApprovalRequest,
     VerificationResponse,
 )
 
@@ -127,6 +128,50 @@ def approve_action_proposal(
         case_id=proposal.case_id,
         action_type=contract.action_type,
         decision=approval.decision,
+        approval_mode="AUTHENTICATED_MANAGER",
+        is_simulated_demo_approval=False,
+        approver_role=approval.approver_role,
+        approver_id=approval.approver_id,
+        reason=req.reason,
+        digest=approval.digest,
+        policy_version=approval.policy_version,
+        expiry=approval.expiry,
+        proposal_status=proposal.status,
+        case_state=case_obj.state if case_obj else None,
+        case_version=case_obj.version if case_obj else None,
+        created_at=approval.created_at,
+    )
+
+
+@router.post(
+    "/{proposal_id}/simulate-demo-approval",
+    response_model=ApprovalResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Self-serve MOCK demonstration approval labeled SIMULATED_DEMO_APPROVAL",
+)
+def simulate_demo_action_approval(
+    proposal_id: str,
+    payload: SimulateDemoApprovalRequest | None = None,
+    current_session: DemoSession = Depends(get_current_session),
+    db: Session = Depends(get_db),
+) -> ApprovalResponse:
+    req = payload or SimulateDemoApprovalRequest()
+    gateway = ApprovalGateway(db, current_session.id)
+    approval, proposal, case_obj = gateway.simulate_demo_approval(
+        proposal_id=proposal_id,
+        reason=req.reason,
+        expiry_minutes=req.expiry_minutes,
+    )
+    contract = get_action_contract(proposal.action_type)
+
+    return ApprovalResponse(
+        approval_id=approval.id,
+        proposal_id=proposal.id,
+        case_id=proposal.case_id,
+        action_type=contract.action_type,
+        decision=approval.decision,
+        approval_mode="SIMULATED_DEMO_APPROVAL",
+        is_simulated_demo_approval=True,
         approver_role=approval.approver_role,
         approver_id=approval.approver_id,
         reason=req.reason,
@@ -163,7 +208,29 @@ def execute_action_proposal(
         simulate_timeout=req.simulate_timeout,
         simulate_verification_failure=req.simulate_verification_failure,
     )
+    return _to_execute_response(outcome)
 
+
+@router.post(
+    "/{proposal_id}/verify",
+    response_model=ExecuteActionResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Recover post-commit verification for a committed execution stuck in VERIFYING",
+)
+def recover_action_verification(
+    proposal_id: str,
+    current_session: DemoSession = Depends(get_current_session),
+    db: Session = Depends(get_db),
+) -> ExecuteActionResponse:
+    executor = ActionExecutor(db, current_session.id)
+    outcome = executor.recover_verification(proposal_id=proposal_id)
+    return _to_execute_response(outcome)
+
+
+def _to_execute_response(outcome: object) -> ExecuteActionResponse:
+    from app.policy.executor import ExecutionOutcome
+
+    assert isinstance(outcome, ExecutionOutcome)  # noqa: S101
     verif_resp: VerificationResponse | None = None
     if outcome.verification is not None:
         v = outcome.verification

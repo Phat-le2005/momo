@@ -16,9 +16,13 @@ class CreateSessionRequest(BaseModel):
 
 
 class DemoSessionResponse(BaseModel):
+    """Public guest session response.
+
+    Invariant: Never returns a manager authorization capability token.
+    """
+
     session_id: str
     token: str
-    manager_token: str = ""
     status: str
     max_cases: int
     case_count: int

@@ -45,12 +45,29 @@ class ApproveActionRequest(BaseModel):
     )
 
 
+class SimulateDemoApprovalRequest(BaseModel):
+    reason: str = Field(
+        default="Phê duyệt mô phỏng tự phục vụ (SIMULATED_DEMO_APPROVAL - MOCK ONLY)",
+        min_length=3,
+        max_length=512,
+        description="Lý do phê duyệt mô phỏng trong chế độ tự phục vụ MOCK",
+    )
+    expiry_minutes: int = Field(
+        default=120,
+        ge=1,
+        le=1440,
+        description="Thời hạn hiệu lực của phê duyệt mô phỏng (phút)",
+    )
+
+
 class ApprovalResponse(BaseModel):
     approval_id: str
     proposal_id: str
     case_id: str | None
     action_type: str
     decision: str
+    approval_mode: str = "AUTHENTICATED_MANAGER"
+    is_simulated_demo_approval: bool = False
     approver_role: str
     approver_id: str
     reason: str

@@ -298,8 +298,13 @@ def test_hardening1_cross_tenant_manager_token_and_approval_rejected(
 
     # Create Session B
     sess_b = client.post("/api/v1/demo/sessions").json()
+    assert "manager_token" not in sess_b
     token_b = sess_b["token"]
-    manager_token_b = sess_b["manager_token"]
+    maker = get_sessionmaker()
+    with maker() as db:
+        sess_b_obj = db.get(DemoSession, sess_b["session_id"])
+        assert sess_b_obj is not None
+        manager_token_b = issue_demo_manager_token(sess_b_obj, role="DEMO_MANAGER")
 
     # 1. Session A's X-Demo-Session paired with Session B's X-Demo-Manager-Token -> 403 FORBIDDEN!
     cross_token_res = client.post(
@@ -550,14 +555,21 @@ def test_hardening3_refund_policy_mismatches_and_proposal_only_execution_gate(
         json={"decision": "APPROVED"},
     )
     assert r_fin_ok.status_code == 200
+    assert r_fin_ok.json()["approval_mode"] == "AUTHENTICATED_MANAGER"
+    assert r_fin_ok.json()["is_simulated_demo_approval"] is False
 
-    # Executing REFUND_EXECUTE via Prompt 03 /execute endpoint is gated until Prompt 04 Risk Engine
-    r_exec_gated = client.post(
+    # Executing the valid partial refund (100,000 / 300,000 VND) under FINANCE_LEAD approval
+    # succeeds in MOCK mode and passes post-commit durable read-back verification!
+    r_exec_ok = client.post(
         "/api/v1/actions/PROP-REF-VALID-01/execute",
-        headers={**finance_headers, "X-Idempotency-Key": "EXEC-REF-GATED-01"},
+        headers={**finance_headers, "X-Idempotency-Key": "EXEC-REF-VALID-01"},
     )
-    assert r_exec_gated.status_code == 409
-    assert "REFUND_EXECUTION_GATED_UNTIL_RISK_ENGINE" in r_exec_gated.json()["error"]["message"]
+    assert r_exec_ok.status_code == 200
+    exec_body = r_exec_ok.json()
+    assert exec_body["execution_state"] == "EXECUTED"
+    assert exec_body["verification"]["verdict"] == "PASSED"
+    assert exec_body["verification"]["postconditions_json"]["observed_completed_amount"] == 100000
+    assert exec_body["verification"]["postconditions_json"]["post_commit_durable_read_back"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -975,3 +987,204 @@ def test_prevent_overlapping_investigations_on_one_case(
     )
     assert overlap_async.status_code == 409
     assert "OVERLAPPING_INVESTIGATION_BLOCKED" in overlap_async.json()["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# 11. Commit caffa301 Hardening: Public Guest Session, Simulated Demo Approval,
+#     Deployed Secret Validation & Verification Recovery
+# ---------------------------------------------------------------------------
+
+
+def test_caffa301_public_session_never_returns_manager_capability_and_simulated_approval_labeled(
+    client: TestClient,
+) -> None:
+    """Requirements 1 & 2:
+    - Public `POST /api/v1/demo/sessions` never returns a real manager authorization capability.
+    - Self-serve MOCK demonstrations use `/simulate-demo-approval`, which is explicitly labeled
+      `SIMULATED_DEMO_APPROVAL` and completely separate from `/approve`."""
+    sess_res = client.post("/api/v1/demo/sessions")
+    assert sess_res.status_code == 201
+    sess_body = sess_res.json()
+
+    # 1. Verify no manager_token or dmk_ secret is ever exposed in public session creation
+    assert "manager_token" not in sess_body
+    for val in sess_body.values():
+        assert not str(val).startswith("dmk_")
+
+    guest_token = sess_body["token"]
+    guest_headers = {"X-Demo-Session": guest_token}
+
+    # Create Case and run AI investigation
+    c_res = client.post(
+        "/api/v1/cases",
+        headers=guest_headers,
+        json={
+            "text": "Tôi đã thanh toán 250.000đ qua MoMo cho đơn hàng ORD-SYNC mã GD MOMO_TXN_888.",
+            "type": "PAYMENT_DISPUTE",
+        },
+    )
+    case_id = c_res.json()["id"]
+    inv_res = client.post(f"/api/v1/cases/{case_id}/investigate", headers=guest_headers)
+    proposal_id = inv_res.json()["proposed_action_ids"][0]
+
+    # 2. Guest cannot call authenticated manager `/approve` endpoint (403 FORBIDDEN)
+    real_appr_attempt = client.post(
+        f"/api/v1/actions/{proposal_id}/approve",
+        headers=guest_headers,
+        json={"decision": "APPROVED"},
+    )
+    assert real_appr_attempt.status_code == 403
+
+    # 3. Guest can use the separate self-serve `/simulate-demo-approval` flow in MOCK mode,
+    #    which is explicitly labeled SIMULATED_DEMO_APPROVAL!
+    sim_appr_res = client.post(
+        f"/api/v1/actions/{proposal_id}/simulate-demo-approval",
+        headers=guest_headers,
+        json={"reason": "Giám khảo chạy kịch bản tự phục vụ (MOCK)"},
+    )
+    assert sim_appr_res.status_code == 200
+    sim_data = sim_appr_res.json()
+    assert sim_data["approval_mode"] == "SIMULATED_DEMO_APPROVAL"
+    assert sim_data["is_simulated_demo_approval"] is True
+    assert sim_data["approver_role"] == "SIMULATED_DEMO_APPROVAL"
+    assert sim_data["approver_id"].startswith("sim_demo_guest_")
+
+    # 4. Execute and verify postconditions -> RESOLVED
+    exec_res = client.post(
+        f"/api/v1/actions/{proposal_id}/execute",
+        headers={**guest_headers, "X-Idempotency-Key": "EXEC-SIM-DEMO-01"},
+    )
+    assert exec_res.status_code == 200
+    assert exec_res.json()["case_state"] == "RESOLVED"
+
+
+def test_caffa301_deployed_env_rejects_default_or_weak_demo_approval_secret() -> None:
+    """Requirement 3:
+    Require DEMO_APPROVAL_SECRET from environment for deployed environments and reject
+    insecure defaults."""
+    import pytest
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    # 1. Deployed environment (production, staging, demo) with default local secret -> REJECTED!
+    for deployed_env in ("production", "staging", "demo", "cloud"):
+        with pytest.raises(ValidationError) as exc_default:
+            Settings(app_env=deployed_env)
+        assert "requires an explicit, strong DEMO_APPROVAL_SECRET" in str(exc_default.value)
+
+    # 2. Deployed environment with short or placeholder secret -> REJECTED!
+    for bad_secret in (
+        "change-me",
+        "secret",
+        "short-secret-123",
+        "my-local-only-secret-key-long-enough",
+    ):
+        with pytest.raises(ValidationError):
+            Settings(
+                app_env="production",
+                demo_approval_secret=bad_secret,  # type: ignore[arg-type]
+            )
+
+    # 3. Deployed environment with a strong 32+ char custom secret -> ACCEPTED!
+    strong_secret = "prod_hmac_key_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a"  # noqa: S105
+    valid_prod_settings = Settings(
+        app_env="production",
+        demo_approval_secret=strong_secret,  # type: ignore[arg-type]
+    )
+    assert valid_prod_settings.app_env == "production"
+
+
+def test_caffa301_recovery_for_committed_execution_stuck_in_verifying_without_repeating_write(
+    client: TestClient, active_session: dict[str, str]
+) -> None:
+    """Requirement 4 & 5:
+    If Phase 1 committed an `ActionExecution(state='EXECUTED')` and transitioned the Case to
+    `VERIFYING`, but crashed before creating a `Verification` record, recovery completes
+    verification and transitions the Case to `RESOLVED` without repeating the side effect!"""
+    token = active_session["token"]
+    manager_token = active_session["manager_token"]
+    session_id = active_session["id"]
+    headers = {"X-Demo-Session": token, "X-Demo-Manager-Token": manager_token}
+
+    c_res = client.post(
+        "/api/v1/cases",
+        headers=headers,
+        json={
+            "text": "Tôi đã thanh toán 250.000đ qua MoMo cho đơn hàng ORD-SYNC mã GD MOMO_TXN_888.",
+            "type": "PAYMENT_DISPUTE",
+        },
+    )
+    case_id = c_res.json()["id"]
+    inv_res = client.post(f"/api/v1/cases/{case_id}/investigate", headers=headers)
+    proposal_id = inv_res.json()["proposed_action_ids"][0]
+
+    appr_res = client.post(
+        f"/api/v1/actions/{proposal_id}/approve",
+        headers=headers,
+        json={"decision": "APPROVED"},
+    )
+    assert appr_res.status_code == 200
+
+    # Simulate Phase 1 committed in PostgreSQL (order mutated to PAID version=2, execution=EXECUTED,
+    # Case=VERIFYING), but NO Verification row was created!
+    maker = get_sessionmaker()
+    with maker() as db:
+        prop = db.get(ActionProposal, proposal_id)
+        case = db.get(Case, case_id)
+        assert prop is not None and case is not None
+        target_order_id = prop.params_json["order_id"]
+        order = db.get(SimOrder, target_order_id)
+        assert order is not None
+
+        # Phase 1 committed state:
+        order.status = OrderStatus.PAID.value
+        order.payment_status = OrderPaymentStatus.PAID.value
+        order.version = 2
+        prop.status = ActionProposalStatus.EXECUTED.value
+        case.state = CaseState.VERIFYING.value
+        case.version += 1
+
+        unverified_exec = ActionExecution(
+            id="EXEC-STUCK-VERIFYING-01",
+            proposal_id=prop.id,
+            idempotency_key="KEY-STUCK-01",
+            state=ActionExecutionState.EXECUTED.value,
+            result_json={
+                "http_status": 200,
+                "action_type": "ORDER_SYNC",
+                "order_id": order.id,
+                "new_order_version": 2,
+            },
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        db.add(unverified_exec)
+        db.commit()
+
+    # Trigger recovery via POST /api/v1/actions/{proposal_id}/execute (even with a new retry key!)
+    recover_res = client.post(
+        f"/api/v1/actions/{proposal_id}/execute",
+        headers={**headers, "X-Idempotency-Key": "KEY-RECOVERY-RETRY-02"},
+    )
+    assert recover_res.status_code == 200
+    rec_data = recover_res.json()
+
+    # Verification was recovered and Case is now RESOLVED!
+    assert rec_data["execution_id"] == "EXEC-STUCK-VERIFYING-01"
+    assert rec_data["case_state"] == CaseState.RESOLVED.value
+    assert rec_data["idempotent_replay"] is True
+    assert rec_data["verification"] is not None
+    assert rec_data["verification"]["verdict"] == VerificationVerdict.PASSED.value
+
+    # CRITICAL INVARIANT: The business side effect was NOT repeated (order.version is still 2!)
+    with maker() as db:
+        order_after = db.scalar(
+            select(SimOrder).where(
+                SimOrder.session_id == session_id,
+                SimOrder.id == target_order_id,
+            )
+        )
+        assert order_after is not None
+        assert order_after.version == 2
+        assert order_after.status == OrderStatus.PAID.value
