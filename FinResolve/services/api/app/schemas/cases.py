@@ -1,4 +1,4 @@
-"""Pydantic schemas for Case, Evidence, CaseEvent, and Status."""
+"""Pydantic schemas for Case, Evidence, CaseEvent, Status, and AI Investigation."""
 
 from __future__ import annotations
 
@@ -51,6 +51,29 @@ class CaseEventResponse(BaseModel):
     created_at: datetime
 
 
+class ActionProposalSummaryResponse(BaseModel):
+    id: str
+    case_id: str | None
+    action_type: str
+    params_json: dict[str, Any]
+    evidence_refs: list[str]
+    expected_version: int
+    risk_level: str
+    status: str
+    created_at: datetime
+
+
+class RiskSignalSummaryResponse(BaseModel):
+    id: str
+    case_id: str
+    category: str
+    level: str
+    evidence_refs: list[str]
+    response: str
+    details_json: dict[str, Any]
+    created_at: datetime
+
+
 class CaseResponse(BaseModel):
     id: str
     session_id: str
@@ -63,6 +86,11 @@ class CaseResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     evidence: list[EvidenceResponse] = []
+    action_proposals: list[ActionProposalSummaryResponse] = []
+    risk_signals: list[RiskSignalSummaryResponse] = []
+    unknowns: list[str] = []
+    latest_decision_summary: str | None = None
+    model_mode: str | None = None
 
 
 class CaseStatusResponse(BaseModel):
@@ -70,3 +98,14 @@ class CaseStatusResponse(BaseModel):
     state: str
     version: int
     updated_at: datetime
+    model_mode: str | None = None
+    latest_decision_summary: str | None = None
+    pending_proposals_count: int = 0
+
+
+class InvestigateCaseRequest(BaseModel):
+    max_steps: int = Field(default=6, ge=1, le=10)
+    simulate_timeout: bool = Field(
+        default=False,
+        description="Cờ mô phỏng timeout từ cổng thanh toán để kiểm thử QA T04 (UNKNOWN_OUTCOME)",
+    )

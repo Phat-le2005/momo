@@ -1,4 +1,4 @@
-"""Case routes: intake, detail, events timeline, and status polling."""
+"""Case routes: intake, detail, events timeline, status polling, and bounded AI investigation."""
 
 from __future__ import annotations
 
@@ -11,18 +11,25 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from app.ai_core.runtime import BoundedAgentRuntime
+from app.ai_core.schemas import InvestigationRunResult
+from app.core.config import get_settings
 from app.core.errors import AppError, ErrorCode
 from app.core.session import get_current_session
 from app.db.session import get_db
+from app.models.actions import ActionProposal
 from app.models.cases import Case, CaseEvent, Evidence
-from app.models.enums import CaseState, EvidenceKind
+from app.models.enums import ActionProposalStatus, CaseState, EvidenceKind
 from app.models.session import DemoSession
 from app.schemas.cases import (
+    ActionProposalSummaryResponse,
     CaseEventResponse,
     CaseResponse,
     CaseStatusResponse,
     CreateCaseRequest,
     EvidenceResponse,
+    InvestigateCaseRequest,
+    RiskSignalSummaryResponse,
 )
 
 router = APIRouter(prefix="/cases", tags=["cases"])
@@ -55,7 +62,12 @@ def create_case(
     if idempotency_key:
         stmt = (
             select(Case)
-            .options(selectinload(Case.evidence))
+            .options(
+                selectinload(Case.evidence),
+                selectinload(Case.action_proposals),
+                selectinload(Case.risk_signals),
+                selectinload(Case.events),
+            )
             .where(
                 Case.session_id == current_session.id,
                 Case.idempotency_key == idempotency_key,
@@ -154,7 +166,12 @@ def create_case(
         if idempotency_key:
             stmt = (
                 select(Case)
-                .options(selectinload(Case.evidence))
+                .options(
+                    selectinload(Case.evidence),
+                    selectinload(Case.action_proposals),
+                    selectinload(Case.risk_signals),
+                    selectinload(Case.events),
+                )
                 .where(
                     Case.session_id == current_session.id,
                     Case.idempotency_key == idempotency_key,
@@ -178,10 +195,31 @@ def create_case(
         raise
 
 
+@router.post(
+    "/{case_id}/investigate",
+    response_model=InvestigationRunResult,
+    status_code=status.HTTP_200_OK,
+    summary="Run bounded agentic AI investigation on a Case (read tools + proposal only)",
+)
+def investigate_case(
+    case_id: str,
+    payload: InvestigateCaseRequest | None = None,
+    current_session: DemoSession = Depends(get_current_session),
+    db: Session = Depends(get_db),
+) -> InvestigationRunResult:
+    req = payload or InvestigateCaseRequest()
+    runtime = BoundedAgentRuntime(db, max_steps=req.max_steps)
+    return runtime.investigate_case(
+        case_id=case_id,
+        session_id=current_session.id,
+        simulate_timeout=req.simulate_timeout,
+    )
+
+
 @router.get(
     "/{case_id}",
     response_model=CaseResponse,
-    summary="Get Case detail and evidence (scoped to session)",
+    summary="Get Case detail, evidence, proposals, and risk signals (scoped to session)",
 )
 def get_case(
     case_id: str,
@@ -190,7 +228,12 @@ def get_case(
 ) -> CaseResponse:
     stmt = (
         select(Case)
-        .options(selectinload(Case.evidence))
+        .options(
+            selectinload(Case.evidence),
+            selectinload(Case.action_proposals),
+            selectinload(Case.risk_signals),
+            selectinload(Case.events),
+        )
         .where(Case.id == case_id, Case.session_id == current_session.id)
     )
     case_obj = db.scalar(stmt)
@@ -240,30 +283,72 @@ def get_case_events(
 @router.get(
     "/{case_id}/status",
     response_model=CaseStatusResponse,
-    summary="Get lightweight Case status and version",
+    summary="Get lightweight Case status, version, and active investigation metadata",
 )
 def get_case_status(
     case_id: str,
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> CaseStatusResponse:
-    stmt_case = select(Case).where(Case.id == case_id, Case.session_id == current_session.id)
+    stmt_case = (
+        select(Case)
+        .options(selectinload(Case.events), selectinload(Case.action_proposals))
+        .where(Case.id == case_id, Case.session_id == current_session.id)
+    )
     case_obj = db.scalar(stmt_case)
     if case_obj is None:
         raise AppError(ErrorCode.NOT_FOUND, f"Case '{case_id}' not found", status_code=404)
+
+    latest_summary, model_mode, _ = _extract_latest_investigation_meta(case_obj.events)
+    pending_proposals = sum(
+        1 for p in case_obj.action_proposals if p.status == ActionProposalStatus.PROPOSED.value
+    )
 
     return CaseStatusResponse(
         case_id=case_obj.id,
         state=case_obj.state,
         version=case_obj.version,
         updated_at=case_obj.updated_at,
+        model_mode=model_mode or get_settings().model_mode.value,
+        latest_decision_summary=latest_summary,
+        pending_proposals_count=pending_proposals,
     )
+
+
+def _extract_latest_investigation_meta(
+    events: list[CaseEvent] | None,
+) -> tuple[str | None, str | None, list[str]]:
+    if not events:
+        return None, None, []
+    latest_summary: str | None = None
+    model_mode: str | None = None
+    unknowns: list[str] = []
+
+    for evt in reversed(events):
+        if evt.type in ("INVESTIGATION_COMPLETED", "AI_PLAN_GENERATED"):
+            if latest_summary is None:
+                latest_summary = evt.payload_json.get("decision_summary")
+            if model_mode is None:
+                model_mode = evt.payload_json.get("model_mode")
+            if not unknowns and isinstance(evt.payload_json.get("unknowns"), list):
+                unknowns = [str(u) for u in evt.payload_json["unknowns"]]
+            if latest_summary and model_mode:
+                break
+    return latest_summary, model_mode, unknowns
 
 
 def _to_case_response(
     case_obj: Case, fallback_evidence: list[Evidence] | None = None
 ) -> CaseResponse:
     evidence_list = case_obj.evidence if case_obj.evidence else (fallback_evidence or [])
+    proposals_list: list[ActionProposal] = (
+        list(case_obj.action_proposals) if case_obj.action_proposals else []
+    )
+    risks_list = list(case_obj.risk_signals) if case_obj.risk_signals else []
+    events_list = list(case_obj.events) if case_obj.events else []
+
+    latest_summary, model_mode, unknowns = _extract_latest_investigation_meta(events_list)
+
     return CaseResponse(
         id=case_obj.id,
         session_id=case_obj.session_id,
@@ -288,4 +373,34 @@ def _to_case_response(
             )
             for ev in evidence_list
         ],
+        action_proposals=[
+            ActionProposalSummaryResponse(
+                id=pr.id,
+                case_id=pr.case_id,
+                action_type=pr.action_type,
+                params_json=pr.params_json,
+                evidence_refs=pr.evidence_refs,
+                expected_version=pr.expected_version,
+                risk_level=pr.risk_level,
+                status=pr.status,
+                created_at=pr.created_at,
+            )
+            for pr in proposals_list
+        ],
+        risk_signals=[
+            RiskSignalSummaryResponse(
+                id=rk.id,
+                case_id=rk.case_id,
+                category=rk.category,
+                level=rk.level,
+                evidence_refs=rk.evidence_refs,
+                response=rk.response,
+                details_json=rk.details_json,
+                created_at=rk.created_at,
+            )
+            for rk in risks_list
+        ],
+        unknowns=unknowns,
+        latest_decision_summary=latest_summary,
+        model_mode=model_mode,
     )
