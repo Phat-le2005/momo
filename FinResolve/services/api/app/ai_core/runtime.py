@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.ai_core.context import ContextBuilder
@@ -99,15 +100,61 @@ class BoundedAgentRuntime:
         start_monotonic = time.monotonic()
         effective_run_id = run_id or f"RUN-{uuid.uuid4().hex[:10].upper()}"
 
-        case = self._db.scalar(
-            select(Case).where(Case.id == case_id, Case.session_id == session_id)
-        )
+        # Prevent overlapping concurrent investigations on the same Case using NOWAIT row lock
+        try:
+            case = self._db.scalar(
+                select(Case)
+                .where(Case.id == case_id, Case.session_id == session_id)
+                .with_for_update(nowait=True)
+            )
+        except OperationalError as err:
+            self._db.rollback()
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"OVERLAPPING_INVESTIGATION_BLOCKED: Another investigation is currently "
+                f"running on Case '{case_id}'",
+                status_code=409,
+                details={"case_id": case_id},
+            ) from err
+
         if case is None:
             raise AppError(
                 ErrorCode.NOT_FOUND,
                 f"Case '{case_id}' not found",
                 status_code=404,
             )
+
+        # Check for an already-queued or active investigation run on this Case
+        recent_lifecycle_evt = self._db.scalar(
+            select(CaseEvent)
+            .where(
+                CaseEvent.case_id == case.id,
+                CaseEvent.session_id == session_id,
+                CaseEvent.type.in_(
+                    [
+                        "INVESTIGATION_QUEUED",
+                        "INVESTIGATION_STARTED",
+                        "INVESTIGATION_COMPLETED",
+                        "INVESTIGATION_FAILED",
+                    ]
+                ),
+            )
+            .order_by(CaseEvent.created_at.desc())
+            .limit(1)
+        )
+        if recent_lifecycle_evt is not None:
+            active_evt_run_id = str(recent_lifecycle_evt.payload_json.get("run_id") or "")
+            if recent_lifecycle_evt.type == "INVESTIGATION_STARTED" or (
+                recent_lifecycle_evt.type == "INVESTIGATION_QUEUED"
+                and active_evt_run_id != effective_run_id
+            ):
+                raise AppError(
+                    ErrorCode.CONFLICT,
+                    f"OVERLAPPING_INVESTIGATION_BLOCKED: Case '{case.id}' already has an "
+                    f"active investigation run ('{active_evt_run_id}')",
+                    status_code=409,
+                    details={"case_id": case.id, "active_run_id": active_evt_run_id},
+                )
 
         # QA T19: Enforce per-case / per-session investigation rate limit
         existing_runs_count = (
@@ -135,6 +182,14 @@ class BoundedAgentRuntime:
 
         # Transition Case to INVESTIGATING if not already there
         current_state = CaseState(case.state)
+        if current_state == CaseState.INVESTIGATING and existing_runs_count > 0:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"OVERLAPPING_INVESTIGATION_BLOCKED: Case '{case.id}' is already in "
+                "INVESTIGATING state",
+                status_code=409,
+                details={"case_id": case.id, "state": case.state},
+            )
         if current_state != CaseState.INVESTIGATING:
             if can_transition(current_state, CaseState.INVESTIGATING):
                 case = transition_case(
@@ -151,7 +206,7 @@ class BoundedAgentRuntime:
             else:
                 raise AppError(
                     ErrorCode.CONFLICT,
-                    f"Cannot start investigation when Case is in terminal state '{case.state}'",
+                    f"Cannot start investigation when Case is in state '{case.state}'",
                     status_code=409,
                 )
 

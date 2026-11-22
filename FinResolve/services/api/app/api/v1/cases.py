@@ -10,7 +10,7 @@ from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, Response, status
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, selectinload
 
 from app.ai_core.model_adapter import get_model_adapter
@@ -35,6 +35,7 @@ from app.schemas.cases import (
     InvestigateCaseRequest,
     InvestigationJobStatusResponse,
     RiskSignalSummaryResponse,
+    VerificationSummaryResponse,
 )
 
 logger = logging.getLogger("finresolve.cases")
@@ -257,14 +258,35 @@ def investigate_case(
     req = payload or InvestigateCaseRequest()
 
     if req.run_async:
-        # Validate Case ownership and rate limit upfront before scheduling background job
-        case_obj = db.scalar(
-            select(Case)
-            .options(selectinload(Case.evidence))
-            .where(Case.id == case_id, Case.session_id == current_session.id)
-        )
+        # Validate Case ownership, non-overlapping lock, and rate limit before scheduling
+        try:
+            case_obj = db.scalar(
+                select(Case)
+                .options(selectinload(Case.evidence), selectinload(Case.events))
+                .where(Case.id == case_id, Case.session_id == current_session.id)
+                .with_for_update(nowait=True)
+            )
+        except OperationalError as err:
+            db.rollback()
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"OVERLAPPING_INVESTIGATION_BLOCKED: Another investigation is currently "
+                f"running on Case '{case_id}'",
+                status_code=409,
+            ) from err
+
         if case_obj is None:
             raise AppError(ErrorCode.NOT_FOUND, f"Case '{case_id}' not found", status_code=404)
+
+        active_run_id, inv_status = _extract_run_job_status(case_obj.events)
+        if inv_status == "RUNNING" or case_obj.state == CaseState.INVESTIGATING.value:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"OVERLAPPING_INVESTIGATION_BLOCKED: Case '{case_obj.id}' already has an "
+                f"active investigation in progress ('{active_run_id}')",
+                status_code=409,
+                details={"case_id": case_obj.id, "active_run_id": active_run_id},
+            )
 
         existing_runs = (
             db.scalar(
@@ -444,6 +466,7 @@ def get_case(
             selectinload(Case.evidence),
             selectinload(Case.action_proposals),
             selectinload(Case.risk_signals),
+            selectinload(Case.verifications),
             selectinload(Case.events),
         )
         .where(Case.id == case_id, Case.session_id == current_session.id)
@@ -575,6 +598,7 @@ def _to_case_response(
         list(case_obj.action_proposals) if case_obj.action_proposals else []
     )
     risks_list = list(case_obj.risk_signals) if case_obj.risk_signals else []
+    verifications_list = list(case_obj.verifications) if case_obj.verifications else []
     events_list = list(case_obj.events) if case_obj.events else []
 
     latest_summary, model_mode, unknowns = _extract_latest_investigation_meta(events_list)
@@ -629,6 +653,18 @@ def _to_case_response(
                 created_at=rk.created_at,
             )
             for rk in risks_list
+        ],
+        verifications=[
+            VerificationSummaryResponse(
+                id=vf.id,
+                case_id=vf.case_id,
+                action_execution_id=vf.action_execution_id,
+                case_version=vf.case_version,
+                verdict=vf.verdict,
+                postconditions_json=vf.postconditions_json,
+                checked_at=vf.checked_at,
+            )
+            for vf in verifications_list
         ],
         unknowns=unknowns,
         latest_decision_summary=latest_summary,

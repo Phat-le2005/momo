@@ -74,6 +74,16 @@ class RiskSignalSummaryResponse(BaseModel):
     created_at: datetime
 
 
+class VerificationSummaryResponse(BaseModel):
+    id: str
+    case_id: str | None
+    action_execution_id: str | None
+    case_version: int
+    verdict: str
+    postconditions_json: dict[str, Any]
+    checked_at: datetime
+
+
 class CaseResponse(BaseModel):
     id: str
     session_id: str
@@ -88,6 +98,7 @@ class CaseResponse(BaseModel):
     evidence: list[EvidenceResponse] = []
     action_proposals: list[ActionProposalSummaryResponse] = []
     risk_signals: list[RiskSignalSummaryResponse] = []
+    verifications: list[VerificationSummaryResponse] = []
     unknowns: list[str] = []
     latest_decision_summary: str | None = None
     model_mode: str | None = None
