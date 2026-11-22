@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
+from app.core.session import issue_demo_manager_token
 from app.db.seed import seed_demo_session
 from app.db.session import get_db
 from app.models.enums import SessionStatus
@@ -55,9 +56,12 @@ def create_demo_session(
     db.commit()
     db.refresh(demo_session)
 
+    manager_token = issue_demo_manager_token(demo_session, role="DEMO_MANAGER")
+
     return DemoSessionResponse(
         session_id=demo_session.id,
         token=demo_session.token,
+        manager_token=manager_token,
         status=demo_session.status,
         max_cases=demo_session.max_cases,
         case_count=demo_session.case_count,

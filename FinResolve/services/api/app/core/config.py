@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     web_origin: str = "http://localhost:3000"
 
     source_mode: SourceMode = SourceMode.MOCK
+    demo_approval_secret: SecretStr = SecretStr(
+        "finresolve-demo-manager-hmac-signing-key-local-only"
+    )
 
     model_provider: str = ""
     model_name: str = ""

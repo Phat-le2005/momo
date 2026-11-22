@@ -1,13 +1,16 @@
 """Scoped ApprovalGateway with cryptographic digest binding for FinResolve AI.
 
 Hard Domain Invariants:
-1. Digest Binding: Every Approval digest is cryptographically bound to:
+1. Server-Derived Principal Authorization (No Impersonation):
+   `approver_role` and `approver_id` are derived strictly from the server-validated,
+   session-scoped `ApproverPrincipal` (`X-Demo-Manager-Token`), NEVER from untrusted request JSON.
+   The guest token alone cannot self-assert `DEMO_MANAGER`, `OPS_MANAGER`, or `FINANCE_LEAD`.
+2. Strict Digest Binding (No Legacy Digest Fallback):
+   Every Approval digest is cryptographically bound to:
    `(session_id, proposal_id, case_id, action_type, canonical_params_json, sorted_evidence_refs,
-     expected_version, policy_version, approver_role)`.
-   Any change to order_id, amount, parameters, or evidence invalidates the digest (QA T11).
-2. Scoped Role Authorization: Only authorized roles in `contract.required_approver_roles`
-   (`OPS_MANAGER`, `FINANCE_LEAD`, `DEMO_MANAGER`) within an authenticated demo session can
-   approve proposals. Unprivileged roles (`GUEST`, `CUSTOMER`, `AI_AGENT`) are rejected with 403.
+     expected_version, policy_version, approver_role, approver_id)`.
+   Any change to order_id, amount, parameters, evidence, policy_version, role, or approver_id
+   invalidates the digest (QA T11).
 3. No Approval Replay: A proposal can only be decided once while in `PROPOSED` status.
 4. Policy Pre-Check: `PolicyEngine` validates live preconditions before an `APPROVED` decision
    can be recorded.
@@ -25,7 +28,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.cases.state_machine import can_transition, transition_case
+from app.core.config import SourceMode, get_settings
 from app.core.errors import AppError, ErrorCode
+from app.core.session import ApproverPrincipal
 from app.models.actions import ActionProposal, Approval
 from app.models.cases import Case, CaseEvent
 from app.models.enums import ActionProposalStatus, ApprovalDecision, CaseState
@@ -44,24 +49,17 @@ def compute_approval_digest(
     expected_version: int,
     policy_version: str = POLICY_VERSION,
     approver_role: str,
+    approver_id: str,
 ) -> str:
-    """Compute canonical SHA-256 digest binding an Approval to exact action parameters & policy."""
+    """Compute canonical v2 SHA-256 digest binding parameters, policy, and principal."""
     canonical_params = json.dumps(params_json, sort_keys=True, separators=(",", ":"))
     canonical_evidence = json.dumps(sorted(str(e) for e in evidence_refs), separators=(",", ":"))
     payload = (
-        f"v1|{session_id}|{proposal_id}|{case_id or ''}|{action_type}|"
+        f"v2|{session_id}|{proposal_id}|{case_id or ''}|{action_type}|"
         f"{canonical_params}|{canonical_evidence}|{expected_version}|"
-        f"{policy_version}|{approver_role.strip().upper()}"
+        f"{policy_version}|{approver_role.strip().upper()}|{approver_id.strip()}"
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def compute_legacy_approval_digest(proposal: ActionProposal) -> str:
-    """Backward-compatible digest format used by simulator unit tests in P01."""
-    digest_src = (
-        f"{proposal.id}:{proposal.action_type}:{proposal.params_json}:{proposal.expected_version}"
-    )
-    return hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
 
 
 class ApprovalGateway:
@@ -75,13 +73,50 @@ class ApprovalGateway:
         self,
         *,
         proposal_id: str,
-        approver_role: str,
-        approver_id: str = "demo_manager_01",
+        principal: ApproverPrincipal,
         decision: ApprovalDecision | str = ApprovalDecision.APPROVED,
         reason: str = "Phê duyệt đề xuất hành động sau khi kiểm tra bằng chứng",
         expiry_minutes: int = 120,
+        claimed_role: str | None = None,
+        claimed_id: str | None = None,
     ) -> tuple[Approval, ActionProposal, Case | None]:
         """Record an authenticated, policy-validated approval or rejection on an ActionProposal."""
+        if get_settings().source_mode != SourceMode.MOCK or principal.source_mode != "MOCK":
+            raise AppError(
+                ErrorCode.FORBIDDEN,
+                "Demo approval capability is strictly restricted to SOURCE_MODE=MOCK",
+                status_code=403,
+            )
+
+        if principal.session_id != self._session_id:
+            raise AppError(
+                ErrorCode.FORBIDDEN,
+                "CROSS_SESSION_APPROVAL_FORBIDDEN: Approver principal does not belong to "
+                "the active demo session",
+                status_code=403,
+            )
+
+        # Hardening 1: Reject any attempt in request JSON to spoof or override principal role/id
+        if claimed_role is not None and claimed_role.strip():
+            if claimed_role.strip().upper() != principal.role:
+                raise AppError(
+                    ErrorCode.FORBIDDEN,
+                    f"APPROVAL_IMPERSONATION_BLOCKED: Request JSON claimed approver_role "
+                    f"'{claimed_role}', which does not match authenticated capability role "
+                    f"'{principal.role}'",
+                    status_code=403,
+                )
+
+        if claimed_id is not None and claimed_id.strip():
+            if claimed_id.strip() != principal.principal_id:
+                raise AppError(
+                    ErrorCode.FORBIDDEN,
+                    f"APPROVAL_IMPERSONATION_BLOCKED: Request JSON claimed approver_id "
+                    f"'{claimed_id}', which does not match authenticated principal "
+                    f"'{principal.principal_id}'",
+                    status_code=403,
+                )
+
         decision_str = (
             decision.value if isinstance(decision, ApprovalDecision) else str(decision).upper()
         )
@@ -95,13 +130,8 @@ class ApprovalGateway:
                 status_code=400,
             )
 
-        norm_role = approver_role.strip().upper()
-        if not norm_role or norm_role in ("GUEST", "CUSTOMER", "AI", "AI_AGENT", "ANONYMOUS"):
-            raise AppError(
-                ErrorCode.FORBIDDEN,
-                f"Role '{approver_role}' is not permitted to approve or reject business actions",
-                status_code=403,
-            )
+        norm_role = principal.role
+        approver_id = principal.principal_id
 
         # 1. Lock ActionProposal row scoped to current session
         proposal = self._db.scalar(
@@ -145,6 +175,7 @@ class ApprovalGateway:
                 proposal,
                 approver_role=norm_role,
                 lock_rows=True,
+                for_execution=False,
             )
             if not eval_res.allowed:
                 raise AppError(
@@ -171,12 +202,15 @@ class ApprovalGateway:
             expected_version=proposal.expected_version,
             policy_version=contract.policy_version,
             approver_role=norm_role,
+            approver_id=approver_id,
         )
 
         approval = Approval(
             id=f"APPR-{uuid.uuid4().hex[:10].upper()}",
             proposal_id=proposal.id,
             approver_role=norm_role,
+            approver_id=approver_id,
+            policy_version=contract.policy_version,
             decision=decision_str,
             digest=digest,
             expiry=expiry,

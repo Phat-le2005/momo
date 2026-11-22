@@ -18,6 +18,7 @@ class CreateSessionRequest(BaseModel):
 class DemoSessionResponse(BaseModel):
     session_id: str
     token: str
+    manager_token: str = ""
     status: str
     max_cases: int
     case_count: int

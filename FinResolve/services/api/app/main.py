@@ -36,7 +36,13 @@ def create_app() -> FastAPI:
         allow_origins=settings.cors_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "X-Demo-Session", REQUEST_ID_HEADER],
+        allow_headers=[
+            "Content-Type",
+            "X-Demo-Session",
+            "X-Demo-Manager-Token",
+            "X-Idempotency-Key",
+            REQUEST_ID_HEADER,
+        ],
         expose_headers=[REQUEST_ID_HEADER],
     )
     app.add_middleware(RequestIdMiddleware)

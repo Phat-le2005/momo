@@ -76,4 +76,8 @@ def active_session(client: TestClient) -> dict[str, str]:
     res = client.post("/api/v1/demo/sessions", json={"ttl_minutes": 60, "max_cases": 10})
     assert res.status_code == 201
     data = res.json()
-    return {"id": data["session_id"], "token": data["token"]}
+    return {
+        "id": data["session_id"],
+        "token": data["token"],
+        "manager_token": data["manager_token"],
+    }

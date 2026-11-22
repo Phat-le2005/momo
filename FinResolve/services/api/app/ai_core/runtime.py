@@ -124,37 +124,49 @@ class BoundedAgentRuntime:
                 status_code=404,
             )
 
-        # Check for an already-queued or active investigation run on this Case
-        recent_lifecycle_evt = self._db.scalar(
-            select(CaseEvent)
-            .where(
-                CaseEvent.case_id == case.id,
-                CaseEvent.session_id == session_id,
-                CaseEvent.type.in_(
-                    [
-                        "INVESTIGATION_QUEUED",
-                        "INVESTIGATION_STARTED",
-                        "INVESTIGATION_COMPLETED",
-                        "INVESTIGATION_FAILED",
-                    ]
-                ),
-            )
-            .order_by(CaseEvent.created_at.desc())
-            .limit(1)
-        )
-        if recent_lifecycle_evt is not None:
-            active_evt_run_id = str(recent_lifecycle_evt.payload_json.get("run_id") or "")
-            if recent_lifecycle_evt.type == "INVESTIGATION_STARTED" or (
-                recent_lifecycle_evt.type == "INVESTIGATION_QUEUED"
-                and active_evt_run_id != effective_run_id
-            ):
-                raise AppError(
-                    ErrorCode.CONFLICT,
-                    f"OVERLAPPING_INVESTIGATION_BLOCKED: Case '{case.id}' already has an "
-                    f"active investigation run ('{active_evt_run_id}')",
-                    status_code=409,
-                    details={"case_id": case.id, "active_run_id": active_evt_run_id},
+        # Check for an already-queued or active unfinished investigation run on this Case
+        lifecycle_evts = list(
+            self._db.scalars(
+                select(CaseEvent).where(
+                    CaseEvent.case_id == case.id,
+                    CaseEvent.session_id == session_id,
+                    CaseEvent.type.in_(
+                        [
+                            "INVESTIGATION_QUEUED",
+                            "INVESTIGATION_STARTED",
+                            "INVESTIGATION_COMPLETED",
+                            "INVESTIGATION_FAILED",
+                        ]
+                    ),
                 )
+            ).all()
+        )
+        started_run_ids: set[str] = set()
+        queued_run_ids: set[str] = set()
+        finished_run_ids: set[str] = set()
+        for l_evt in lifecycle_evts:
+            r_id = str(l_evt.payload_json.get("run_id") or "")
+            if not r_id:
+                continue
+            if l_evt.type == "INVESTIGATION_STARTED":
+                started_run_ids.add(r_id)
+            elif l_evt.type == "INVESTIGATION_QUEUED":
+                queued_run_ids.add(r_id)
+            elif l_evt.type in ("INVESTIGATION_COMPLETED", "INVESTIGATION_FAILED"):
+                finished_run_ids.add(r_id)
+
+        unfinished_started = started_run_ids - finished_run_ids
+        unfinished_queued = (queued_run_ids - finished_run_ids) - {effective_run_id}
+        active_unfinished = unfinished_started | unfinished_queued
+        if active_unfinished:
+            active_evt_run_id = sorted(active_unfinished)[0]
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"OVERLAPPING_INVESTIGATION_BLOCKED: Case '{case.id}' already has an "
+                f"active investigation run ('{active_evt_run_id}')",
+                status_code=409,
+                details={"case_id": case.id, "active_run_id": active_evt_run_id},
+            )
 
         # QA T19: Enforce per-case / per-session investigation rate limit
         existing_runs_count = (

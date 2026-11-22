@@ -6,6 +6,8 @@ Hard Domain Invariants:
 2. Never grants privilege from model text or untrusted CLAIM evidence.
 3. Rechecks current business state and optimistic concurrency version (`order.version`)
    immediately before both approval and execution.
+4. Enforces merchant, currency, result_code, source_mode, and remaining balance invariants
+   on REFUND_EXECUTE proposals.
 """
 
 from __future__ import annotations
@@ -68,6 +70,7 @@ class PolicyEngine:
         *,
         approver_role: str | None = None,
         lock_rows: bool = False,
+        for_execution: bool = False,
     ) -> PolicyEvaluationResult:
         """Evaluate an ActionProposal against its BusinessActionContract and live DB state."""
         contract = get_action_contract(proposal.action_type)
@@ -212,6 +215,7 @@ class PolicyEngine:
                 params=validated_params,
                 checked=checked,
                 lock_rows=lock_rows,
+                for_execution=for_execution,
             )
         if isinstance(validated_params, HoldOrderActionParams):
             return self._evaluate_hold_order(
@@ -219,6 +223,7 @@ class PolicyEngine:
                 params=validated_params,
                 checked=checked,
                 lock_rows=lock_rows,
+                for_execution=for_execution,
             )
 
         return self._deny(contract, "UNHANDLED_CONTRACT", "Unhandled contract type", checked)
@@ -269,7 +274,6 @@ class PolicyEngine:
                 checked,
             )
 
-        # Verify payment belongs to this exact order
         if payment.order_id != order.id:
             return self._deny(
                 contract,
@@ -280,7 +284,6 @@ class PolicyEngine:
             )
         checked.append("payment_bound_to_exact_order_id")
 
-        # Verify payment is authoritative SUCCESS
         if (
             payment.status != PaymentStatus.SUCCESS.value
             or payment.verified_at is None
@@ -295,7 +298,6 @@ class PolicyEngine:
             )
         checked.append("payment_status_is_verified_success")
 
-        # Verify merchant, amount, and currency match
         if (
             not payment.merchant_id
             or payment.merchant_id != params.merchant_id
@@ -312,7 +314,6 @@ class PolicyEngine:
             )
         checked.append("payment_merchant_and_amount_match_order")
 
-        # Verify no ambiguous second payment exists for this order
         order_payments = list(
             self._db.scalars(
                 select(SimPayment).where(
@@ -347,7 +348,6 @@ class PolicyEngine:
             )
         checked.append("order_version_matches_expected_order_version")
 
-        # Verify order is currently PENDING and UNPAID
         if (
             order.status != OrderStatus.PENDING.value
             or order.payment_status != OrderPaymentStatus.UNPAID.value
@@ -384,7 +384,10 @@ class PolicyEngine:
         params: RefundActionParams,
         checked: list[str],
         lock_rows: bool,
+        for_execution: bool = False,
     ) -> PolicyEvaluationResult:
+        """Strictly validate all payment, order, merchant, currency, result_code, source_mode,
+        and refund balance invariants, and enforce proposal-only gate before Prompt 04."""
         stmt_pay = select(SimPayment).where(
             SimPayment.id == params.payment_id,
             SimPayment.session_id == self._session_id,
@@ -401,6 +404,43 @@ class PolicyEngine:
                 checked,
             )
 
+        if payment.source_mode != "MOCK":
+            return self._deny(
+                contract,
+                "NON_MOCK_ENTITY_FORBIDDEN",
+                f"Payment '{payment.id}' has source_mode='{payment.source_mode}', expected 'MOCK'",
+                checked,
+            )
+
+        if not payment.merchant_id or payment.merchant_id != params.merchant_id:
+            return self._deny(
+                contract,
+                "PAYMENT_MERCHANT_MISMATCH",
+                f"Payment merchant_id '{payment.merchant_id}' does not match "
+                f"proposal merchant_id '{params.merchant_id}'",
+                checked,
+            )
+        checked.append("payment_merchant_verified")
+
+        if payment.currency != params.currency:
+            return self._deny(
+                contract,
+                "PAYMENT_CURRENCY_MISMATCH",
+                f"Payment currency '{payment.currency}' does not match "
+                f"proposal currency '{params.currency}'",
+                checked,
+            )
+        checked.append("payment_currency_verified")
+
+        if payment.result_code != 0:
+            return self._deny(
+                contract,
+                "PAYMENT_RESULT_CODE_INVALID",
+                f"Payment '{payment.id}' has non-zero result_code={payment.result_code}",
+                checked,
+            )
+        checked.append("payment_result_code_zero")
+
         if params.order_id and payment.order_id != params.order_id:
             return self._deny(
                 contract,
@@ -408,6 +448,37 @@ class PolicyEngine:
                 f"Payment '{payment.id}' does not belong to order '{params.order_id}'",
                 checked,
             )
+
+        target_order_id = params.order_id or payment.order_id
+        if target_order_id:
+            stmt_ord = select(SimOrder).where(
+                SimOrder.id == target_order_id,
+                SimOrder.session_id == self._session_id,
+            )
+            if lock_rows:
+                stmt_ord = stmt_ord.with_for_update()
+            order = self._db.scalar(stmt_ord)
+            if order is None:
+                return self._deny(
+                    contract,
+                    "ORDER_NOT_FOUND",
+                    f"Order '{target_order_id}' linked to refund not found in session",
+                    checked,
+                )
+            if order.source_mode != "MOCK":
+                return self._deny(
+                    contract,
+                    "NON_MOCK_ENTITY_FORBIDDEN",
+                    f"Order '{order.id}' has source_mode='{order.source_mode}', expected 'MOCK'",
+                    checked,
+                )
+            if order.currency != payment.currency:
+                return self._deny(
+                    contract,
+                    "ORDER_PAYMENT_CURRENCY_MISMATCH",
+                    f"Order currency '{order.currency}' != payment currency '{payment.currency}'",
+                    checked,
+                )
 
         if payment.status != PaymentStatus.SUCCESS.value or payment.verified_at is None:
             return self._deny(
@@ -458,6 +529,17 @@ class PolicyEngine:
             "refund_amount_within_remaining_eligible_balance_across_completed_pending_unknown"
         )
 
+        # Hardening 3: Keep REFUND_EXECUTE proposal-only in the Prompt 03 action gateway
+        # until Prompt 04 Risk Engine is integrated.
+        if for_execution:
+            return self._deny(
+                contract,
+                "REFUND_EXECUTION_GATED_UNTIL_RISK_ENGINE",
+                "REFUND_EXECUTE is kept proposal-only in Prompt 03 until Prompt 04 Risk Engine "
+                "integration is enabled",
+                checked,
+            )
+
         return PolicyEvaluationResult(
             allowed=True,
             policy_version=POLICY_VERSION,
@@ -467,6 +549,8 @@ class PolicyEngine:
             context_snapshot={
                 "payment_id": payment.id,
                 "order_id": payment.order_id,
+                "merchant_id": payment.merchant_id,
+                "currency": payment.currency,
                 "amount": params.amount,
                 "remaining_balance_before": remaining_balance,
             },
@@ -479,6 +563,7 @@ class PolicyEngine:
         params: HoldOrderActionParams,
         checked: list[str],
         lock_rows: bool,
+        for_execution: bool = False,
     ) -> PolicyEvaluationResult:
         stmt_order = select(SimOrder).where(
             SimOrder.id == params.order_id,
@@ -495,6 +580,17 @@ class PolicyEngine:
                 checked,
             )
         checked.append("order_exists_in_session")
+
+        # Hardening 2: Disable HOLD_ORDER execution so a no-op action never executes or resolves
+        if for_execution:
+            return self._deny(
+                contract,
+                "HOLD_ORDER_EXECUTION_DISABLED",
+                "HOLD_ORDER execution is disabled until durable order-hold persistence is "
+                "implemented; never executes or reports PASSED for a no-op action",
+                checked,
+            )
+
         return PolicyEvaluationResult(
             allowed=True,
             policy_version=POLICY_VERSION,

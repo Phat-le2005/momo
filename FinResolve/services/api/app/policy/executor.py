@@ -1,12 +1,18 @@
-"""Policy-gated ActionExecutor and independent Verifier for FinResolve AI.
+"""Policy-gated ActionExecutor and independent Post-Commit Verifier for FinResolve AI.
 
 Hard Domain Invariants:
 1. Only Policy-Gated & Approved Writes: No proposal can execute without a valid, non-expired
-   `Approval` whose cryptographic digest matches the exact `action_type`, `params_json`,
-   `evidence_refs`, `expected_version`, and `policy_version` (QA T11, T12).
+   `Approval` whose v2 cryptographic digest matches the exact `session_id`, `proposal_id`,
+   `case_id`, `action_type`, `params_json`, `evidence_refs`, `expected_version`,
+   `policy_version`, `approver_role`, and `approver_id` (QA T11, T12). Legacy digests are
+   strictly rejected.
 2. Live State Recheck Under Lock: Acquires `SELECT FOR UPDATE` on `ActionProposal`, `Approval`,
-   `Case`, `SimOrder`, and `SimPayment` and re-evaluates `PolicyEngine` immediately before write.
-   If `order.version != expected_order_version` (QA T13), rejects with 409 CONFLICT.
+   `Case`, `SimOrder`, and `SimPayment` and re-evaluates `PolicyEngine(..., for_execution=True)`
+   immediately before write.
+   - If `order.version != expected_order_version` (QA T13), rejects with 409 CONFLICT.
+   - `HOLD_ORDER` execution is disabled (`409 HOLD_ORDER_EXECUTION_DISABLED`).
+   - `REFUND_EXECUTE` execution is gated in the Prompt 03 action gateway until Prompt 04 Risk
+     Engine integration (`409 REFUND_EXECUTION_GATED_UNTIL_RISK_ENGINE`).
 3. Idempotency & Anti-Replay (QA T06):
    - Same `idempotency_key` on an already executed proposal replays the existing execution and
      verification without mutating DB state a second time.
@@ -16,12 +22,13 @@ Hard Domain Invariants:
      and transitions Case to `UNKNOWN_OUTCOME`.
    - Any subsequent attempt to retry a proposal with an `UNKNOWN` execution using a new key
      is rejected with 409 CONFLICT (`UNKNOWN_OUTCOME_NO_BLIND_RETRY`).
-5. Independent Read-Back Verification (QA T01, T20):
-   - A tool/executor returning HTTP 200 never suffices for `RESOLVED`.
-   - `Verifier` independently reads back PostgreSQL domain records after execution to check every
-     contract postcondition. Only if all postconditions hold does it record `Verification(PASSED)`
-     and transition the Case `VERIFYING -> RESOLVED`. If postconditions fail (QA T20), it records
-     `Verification(FAILED)` and transitions the Case `VERIFYING -> FAILED`.
+5. Separate Post-Commit Durable Read-Back Verification (QA T01, T20):
+   - Phase 1 commits the transactional execution (`SimOrder` mutation, `ActionExecution`, and
+     `EXECUTING -> VERIFYING` transition) to PostgreSQL.
+   - Phase 2 opens an independent SQLAlchemy database session via `get_sessionmaker()()` to
+     read back durable committed rows from PostgreSQL.
+   - Never defaults `is_valid` to True; only explicit verified branches (`ORDER_SYNC`,
+     `REFUND_EXECUTE`) can achieve `PASSED`. A no-op `HOLD_ORDER` always evaluates to `FAILED`.
 """
 
 from __future__ import annotations
@@ -36,6 +43,7 @@ from sqlalchemy.orm import Session
 
 from app.cases.state_machine import can_transition, transition_case
 from app.core.errors import AppError, ErrorCode
+from app.db.session import get_sessionmaker
 from app.models.actions import ActionExecution, ActionProposal, Approval, Verification
 from app.models.cases import Case, CaseEvent
 from app.models.enums import (
@@ -51,9 +59,8 @@ from app.models.enums import (
     VerificationVerdict,
 )
 from app.models.simulator import SimOrder, SimPayment, SimRefund
-from app.policy.approval import compute_approval_digest, compute_legacy_approval_digest
+from app.policy.approval import compute_approval_digest
 from app.policy.contracts import (
-    HoldOrderActionParams,
     OrderSyncActionParams,
     RefundActionParams,
     get_action_contract,
@@ -71,7 +78,7 @@ class ExecutionOutcome:
 
 
 class Verifier:
-    """Independent postcondition verifier querying authoritative PostgreSQL records after writes."""
+    """Independent postcondition verifier querying durable committed PostgreSQL records."""
 
     def __init__(self, db: Session, session_id: str) -> None:
         self._db = db
@@ -83,141 +90,187 @@ class Verifier:
         execution: ActionExecution,
         proposal: ActionProposal,
         case: Case | None,
+        use_separate_readback_session: bool = True,
     ) -> Verification:
-        """Independently read back DB records to verify action postconditions."""
+        """Independently read back durable DB records to verify action postconditions.
+
+        Invariant:
+        - `is_valid` starts as `False` and is only set to `True` when an implemented action
+          contract (`ORDER_SYNC` or `REFUND_EXECUTE`) passes every postcondition check.
+        - `HOLD_ORDER` or any no-op action always fails verification (`verdict=FAILED`).
+        - When `use_separate_readback_session=True`, opens a fresh DB session from
+          `get_sessionmaker()()` so verification inspects durably committed PostgreSQL state.
+        """
         now = datetime.now(UTC)
         contract = get_action_contract(proposal.action_type)
         case_version = case.version if case is not None else proposal.expected_version
 
-        is_valid = True
         failure_reasons: list[str] = []
         postconditions_detail: dict[str, Any] = {
             "contract_action_type": contract.action_type,
             "policy_version": contract.policy_version,
             "execution_id": execution.id,
+            "post_commit_durable_read_back": use_separate_readback_session,
         }
 
-        if execution.state != ActionExecutionState.EXECUTED.value:
-            is_valid = False
-            failure_reasons.append(
-                f"ActionExecution state is '{execution.state}', expected 'EXECUTED'"
+        maker = get_sessionmaker()
+        read_session = maker() if use_separate_readback_session else self._db
+        try:
+            persisted_exec = read_session.scalar(
+                select(ActionExecution).where(ActionExecution.id == execution.id)
             )
+            exec_to_check = persisted_exec or execution
 
-        if contract.action_type == ActionType.ORDER_SYNC.value:
-            params = OrderSyncActionParams.model_validate(proposal.params_json)
-            # Independent read-back of SimOrder and SimPayment
-            order = self._db.scalar(
-                select(SimOrder).where(
-                    SimOrder.id == params.order_id,
-                    SimOrder.session_id == self._session_id,
+            exec_state_ok = exec_to_check.state == ActionExecutionState.EXECUTED.value
+            if not exec_state_ok:
+                failure_reasons.append(
+                    f"ActionExecution state is '{exec_to_check.state}', expected 'EXECUTED'"
                 )
-            )
-            payment = self._db.scalar(
-                select(SimPayment).where(
-                    SimPayment.id == params.payment_id,
-                    SimPayment.session_id == self._session_id,
+
+            branch_verified = False
+
+            if contract.action_type == ActionType.ORDER_SYNC.value:
+                params = OrderSyncActionParams.model_validate(proposal.params_json)
+                order = read_session.scalar(
+                    select(SimOrder).where(
+                        SimOrder.id == params.order_id,
+                        SimOrder.session_id == self._session_id,
+                    )
                 )
-            )
-
-            expected_new_version = params.expected_order_version + 1
-            if order is None:
-                is_valid = False
-                failure_reasons.append(f"SimOrder '{params.order_id}' not found on read-back")
-            else:
-                postconditions_detail["observed_order_status"] = order.status
-                postconditions_detail["observed_order_payment_status"] = order.payment_status
-                postconditions_detail["observed_order_version"] = order.version
-                postconditions_detail["expected_order_version_after"] = expected_new_version
-
-                if order.status != OrderStatus.PAID.value:
-                    is_valid = False
-                    failure_reasons.append(
-                        f"Order status is '{order.status}' after execution, expected 'PAID'"
+                payment = read_session.scalar(
+                    select(SimPayment).where(
+                        SimPayment.id == params.payment_id,
+                        SimPayment.session_id == self._session_id,
                     )
-                if order.payment_status != OrderPaymentStatus.PAID.value:
-                    is_valid = False
-                    failure_reasons.append(
-                        f"Order payment_status is '{order.payment_status}', expected 'PAID'"
-                    )
-                if order.version != expected_new_version:
-                    is_valid = False
-                    failure_reasons.append(
-                        f"Order version is {order.version}, expected {expected_new_version}"
-                    )
-
-            if payment is None:
-                is_valid = False
-                failure_reasons.append(f"SimPayment '{params.payment_id}' not found on read-back")
-            else:
-                postconditions_detail["observed_payment_status"] = payment.status
-                postconditions_detail["observed_payment_verified"] = payment.verified_at is not None
-                if (
-                    payment.status != PaymentStatus.SUCCESS.value
-                    or payment.verified_at is None
-                    or (order is not None and payment.order_id != order.id)
-                    or (order is not None and payment.amount != order.amount)
-                ):
-                    is_valid = False
-                    failure_reasons.append(
-                        "Payment record failed authoritative SUCCESS or order-binding read-back"
-                    )
-
-        elif contract.action_type == ActionType.REFUND_EXECUTE.value:
-            params_ref = RefundActionParams.model_validate(proposal.params_json)
-            refund = self._db.scalar(
-                select(SimRefund).where(
-                    SimRefund.request_id == execution.idempotency_key,
-                    SimRefund.session_id == self._session_id,
                 )
-            )
-            payment = self._db.scalar(
-                select(SimPayment).where(
-                    SimPayment.id == params_ref.payment_id,
-                    SimPayment.session_id == self._session_id,
-                )
-            )
 
-            if refund is None:
-                is_valid = False
-                failure_reasons.append("SimRefund record not found in database on read-back")
-            else:
-                postconditions_detail["refund_id"] = refund.id
-                postconditions_detail["observed_refund_status"] = refund.status
-                postconditions_detail["observed_completed_amount"] = refund.completed_amount
-                if refund.status != RefundStatus.COMPLETED.value:
-                    is_valid = False
+                expected_new_version = params.expected_order_version + 1
+                order_checks_ok = True
+                if order is None:
+                    order_checks_ok = False
                     failure_reasons.append(
-                        f"SimRefund status is '{refund.status}', expected 'COMPLETED'"
+                        f"SimOrder '{params.order_id}' not found on durable read-back"
                     )
-                if refund.completed_amount != params_ref.amount:
-                    is_valid = False
-                    failure_reasons.append(
-                        f"SimRefund completed_amount ({refund.completed_amount}) != "
-                        f"expected ({params_ref.amount})"
-                    )
+                else:
+                    postconditions_detail["observed_order_status"] = order.status
+                    postconditions_detail["observed_order_payment_status"] = order.payment_status
+                    postconditions_detail["observed_order_version"] = order.version
+                    postconditions_detail["expected_order_version_after"] = expected_new_version
 
-            if payment is None or payment.status != PaymentStatus.SUCCESS.value:
-                is_valid = False
-                failure_reasons.append("Original payment missing or not in SUCCESS status")
-            else:
-                completed_refunds = list(
-                    self._db.scalars(
-                        select(SimRefund).where(
-                            SimRefund.payment_id == payment.id,
-                            SimRefund.session_id == self._session_id,
-                            SimRefund.status == RefundStatus.COMPLETED.value,
+                    if order.status != OrderStatus.PAID.value:
+                        order_checks_ok = False
+                        failure_reasons.append(
+                            f"Order status is '{order.status}' after execution, expected 'PAID'"
                         )
-                    ).all()
-                )
-                total_completed = sum(r.completed_amount for r in completed_refunds)
-                postconditions_detail["total_completed_refunds_on_payment"] = total_completed
-                if total_completed > payment.amount:
-                    is_valid = False
-                    failure_reasons.append(
-                        f"Total completed refunds ({total_completed}) exceeds "
-                        f"payment amount ({payment.amount})"
-                    )
+                    if order.payment_status != OrderPaymentStatus.PAID.value:
+                        order_checks_ok = False
+                        failure_reasons.append(
+                            f"Order payment_status is '{order.payment_status}', expected 'PAID'"
+                        )
+                    if order.version != expected_new_version:
+                        order_checks_ok = False
+                        failure_reasons.append(
+                            f"Order version is {order.version}, expected {expected_new_version}"
+                        )
 
+                payment_checks_ok = True
+                if payment is None:
+                    payment_checks_ok = False
+                    failure_reasons.append(
+                        f"SimPayment '{params.payment_id}' not found on durable read-back"
+                    )
+                else:
+                    postconditions_detail["observed_payment_status"] = payment.status
+                    postconditions_detail["observed_payment_verified"] = (
+                        payment.verified_at is not None
+                    )
+                    if (
+                        payment.status != PaymentStatus.SUCCESS.value
+                        or payment.verified_at is None
+                        or payment.result_code != 0
+                        or (order is not None and payment.order_id != order.id)
+                        or (order is not None and payment.amount != order.amount)
+                    ):
+                        payment_checks_ok = False
+                        failure_reasons.append(
+                            "Payment record failed authoritative SUCCESS or order-binding read-back"
+                        )
+
+                branch_verified = exec_state_ok and order_checks_ok and payment_checks_ok
+
+            elif contract.action_type == ActionType.REFUND_EXECUTE.value:
+                params_ref = RefundActionParams.model_validate(proposal.params_json)
+                refund = read_session.scalar(
+                    select(SimRefund).where(
+                        SimRefund.request_id == execution.idempotency_key,
+                        SimRefund.session_id == self._session_id,
+                    )
+                )
+                payment = read_session.scalar(
+                    select(SimPayment).where(
+                        SimPayment.id == params_ref.payment_id,
+                        SimPayment.session_id == self._session_id,
+                    )
+                )
+
+                refund_checks_ok = True
+                if refund is None:
+                    refund_checks_ok = False
+                    failure_reasons.append("SimRefund record not found in database on read-back")
+                else:
+                    postconditions_detail["refund_id"] = refund.id
+                    postconditions_detail["observed_refund_status"] = refund.status
+                    postconditions_detail["observed_completed_amount"] = refund.completed_amount
+                    if refund.status != RefundStatus.COMPLETED.value:
+                        refund_checks_ok = False
+                        failure_reasons.append(
+                            f"SimRefund status is '{refund.status}', expected 'COMPLETED'"
+                        )
+                    if refund.completed_amount != params_ref.amount:
+                        refund_checks_ok = False
+                        failure_reasons.append(
+                            f"SimRefund completed_amount ({refund.completed_amount}) != "
+                            f"expected ({params_ref.amount})"
+                        )
+
+                pay_checks_ok = True
+                if payment is None or payment.status != PaymentStatus.SUCCESS.value:
+                    pay_checks_ok = False
+                    failure_reasons.append("Original payment missing or not in SUCCESS status")
+                else:
+                    completed_refunds = list(
+                        read_session.scalars(
+                            select(SimRefund).where(
+                                SimRefund.payment_id == payment.id,
+                                SimRefund.session_id == self._session_id,
+                                SimRefund.status == RefundStatus.COMPLETED.value,
+                            )
+                        ).all()
+                    )
+                    total_completed = sum(r.completed_amount for r in completed_refunds)
+                    postconditions_detail["total_completed_refunds_on_payment"] = total_completed
+                    if total_completed > payment.amount:
+                        pay_checks_ok = False
+                        failure_reasons.append(
+                            f"Total completed refunds ({total_completed}) exceeds "
+                            f"payment amount ({payment.amount})"
+                        )
+
+                branch_verified = exec_state_ok and refund_checks_ok and pay_checks_ok
+
+            else:
+                # Hardening 2: HOLD_ORDER or any action without a real persisted state change
+                # must NEVER verify as PASSED!
+                branch_verified = False
+                failure_reasons.append(
+                    f"HOLD_ORDER_NO_OP_CANNOT_VERIFY_PASSED: Action '{contract.action_type}' "
+                    "does not persist a verifiable domain postcondition"
+                )
+        finally:
+            if use_separate_readback_session:
+                read_session.close()
+
+        is_valid = branch_verified and len(failure_reasons) == 0
         postconditions_detail["read_back_verified"] = is_valid
         postconditions_detail["failure_reasons"] = failure_reasons
         verdict = VerificationVerdict.PASSED.value if is_valid else VerificationVerdict.FAILED.value
@@ -357,7 +410,7 @@ class ActionExecutor:
                 details={"proposal_id": proposal.id},
             )
 
-        # 3. Verify Proposal is APPROVED and validate Approval record (expiry & digest)
+        # 3. Verify Proposal is APPROVED and validate Approval record (expiry & strict v2 digest)
         if proposal.status != ActionProposalStatus.APPROVED.value:
             raise AppError(
                 ErrorCode.FORBIDDEN,
@@ -387,8 +440,16 @@ class ActionExecutor:
                 details={"approval_id": approval.id, "expiry": approval.expiry.isoformat()},
             )
 
-        # QA T11: Verify cryptographic digest binding to exact action parameters & policy
         contract = get_action_contract(proposal.action_type)
+        if approval.policy_version != contract.policy_version:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"APPROVAL_POLICY_VERSION_MISMATCH: Approval policy_version "
+                f"'{approval.policy_version}' != current contract '{contract.policy_version}'",
+                status_code=409,
+            )
+
+        # Hardening 4 & QA T11: Strictly verify v2 digest binding (reject legacy digests!)
         expected_digest = compute_approval_digest(
             session_id=self._session_id,
             proposal_id=proposal.id,
@@ -399,23 +460,27 @@ class ActionExecutor:
             expected_version=proposal.expected_version,
             policy_version=contract.policy_version,
             approver_role=approval.approver_role,
+            approver_id=approval.approver_id,
         )
-        legacy_digest = compute_legacy_approval_digest(proposal)
-        if approval.digest not in (expected_digest, legacy_digest):
+        if approval.digest != expected_digest:
             raise AppError(
                 ErrorCode.CONFLICT,
-                "APPROVAL_DIGEST_MISMATCH: Approval is bound to different action parameters, "
-                "order, amount, or evidence than current proposal state",
+                "APPROVAL_DIGEST_MISMATCH: Approval digest does not match current proposal "
+                "parameters, evidence, policy version, or approver identity (legacy digests "
+                "and tampered parameters are rejected)",
                 status_code=409,
                 details={"approval_id": approval.id, "proposal_id": proposal.id},
             )
 
         # 4. Recheck live business state & optimistic version lock via PolicyEngine (QA T13)
+        #    Note: for_execution=True also enforces HOLD_ORDER_EXECUTION_DISABLED and
+        #    REFUND_EXECUTION_GATED_UNTIL_RISK_ENGINE!
         policy_engine = PolicyEngine(self._db, self._session_id)
         eval_res = policy_engine.evaluate(
             proposal,
             approver_role=approval.approver_role,
             lock_rows=True,
+            for_execution=True,
         )
         if not eval_res.allowed:
             raise AppError(
@@ -508,11 +573,10 @@ class ActionExecutor:
                 idempotent_replay=False,
             )
 
-        # 7. Perform Policy-Gated Mock Write
+        # 7. Phase 1: Perform Policy-Gated Mock Write & Commit to Durable Storage
         exec_result_payload = self._apply_mock_side_effect(
             contract_action_type=contract.action_type,
             proposal=proposal,
-            approval=approval,
             idempotency_key=clean_idemp_key,
             simulate_verification_failure=simulate_verification_failure,
             now=now,
@@ -556,12 +620,21 @@ class ActionExecutor:
                     extra_payload={"execution_id": execution.id},
                 )
 
-        # 8. Independent Read-Back Verification (QA T01, T20)
+        # Commit Phase 1 so the business state mutation is durably persisted in PostgreSQL
+        # before the independent post-commit read-back session inspects it!
+        self._db.commit()
+        self._db.refresh(execution)
+        self._db.refresh(proposal)
+        if case_obj is not None:
+            self._db.refresh(case_obj)
+
+        # 8. Phase 2: Separate Post-Commit Durable Read-Back Verification (QA T01, T20 & Req 5)
         verifier = Verifier(self._db, self._session_id)
         verification = verifier.verify_execution(
             execution=execution,
             proposal=proposal,
             case=case_obj,
+            use_separate_readback_session=True,
         )
 
         if case_obj is not None:
@@ -581,8 +654,8 @@ class ActionExecutor:
                     case_obj,
                     CaseState.RESOLVED,
                     reason=(
-                        f"Kiểm chứng độc lập (read-back) thành công ({verification.id}); "
-                        "hoàn tất xử lý Case (RESOLVED)."
+                        f"Kiểm chứng độc lập sau commit (post-commit read-back) thành công "
+                        f"({verification.id}); hoàn tất xử lý Case (RESOLVED)."
                     ),
                     verification=verification,
                     extra_payload={
@@ -636,7 +709,6 @@ class ActionExecutor:
         *,
         contract_action_type: str,
         proposal: ActionProposal,
-        approval: Approval,
         idempotency_key: str,
         simulate_verification_failure: bool,
         now: datetime,
@@ -669,97 +741,16 @@ class ActionExecutor:
                 "currency": params.currency,
                 "order_status_reported": "PAID",
                 "new_order_version": order.version,
+                "idempotency_key": idempotency_key,
                 "source_mode": "MOCK",
                 "simulated_verification_failure": simulate_verification_failure,
             }
 
-        if contract_action_type == ActionType.REFUND_EXECUTE.value:
-            params_ref = RefundActionParams.model_validate(proposal.params_json)
-            payment = self._db.scalar(
-                select(SimPayment)
-                .where(
-                    SimPayment.id == params_ref.payment_id,
-                    SimPayment.session_id == self._session_id,
-                )
-                .with_for_update()
-            )
-            assert payment is not None  # noqa: S101
-
-            refund_id = f"REF-{uuid.uuid4().hex[:10].upper()}"
-            if not simulate_verification_failure:
-                refund = SimRefund(
-                    id=refund_id,
-                    session_id=self._session_id,
-                    order_id=payment.order_id,
-                    payment_id=payment.id,
-                    amount=params_ref.amount,
-                    requested_amount=params_ref.amount,
-                    approved_amount=params_ref.amount,
-                    completed_amount=params_ref.amount,
-                    currency=payment.currency,
-                    request_id=idempotency_key,
-                    status=RefundStatus.COMPLETED.value,
-                    reason=params_ref.reason,
-                    approval_ref=approval.id,
-                    provider_refund_id=f"MOCK_REF_{uuid.uuid4().hex[:8].upper()}",
-                    source_mode="MOCK",
-                    created_at=now,
-                    updated_at=now,
-                )
-                self._db.add(refund)
-
-                if payment.order_id:
-                    order = self._db.scalar(
-                        select(SimOrder)
-                        .where(
-                            SimOrder.id == payment.order_id,
-                            SimOrder.session_id == self._session_id,
-                        )
-                        .with_for_update()
-                    )
-                    if order is not None:
-                        all_completed = list(
-                            self._db.scalars(
-                                select(SimRefund).where(
-                                    SimRefund.payment_id == payment.id,
-                                    SimRefund.session_id == self._session_id,
-                                    SimRefund.status == RefundStatus.COMPLETED.value,
-                                )
-                            ).all()
-                        )
-                        total_after = (
-                            sum(r.completed_amount for r in all_completed) + params_ref.amount
-                        )
-                        if total_after >= payment.amount:
-                            order.payment_status = OrderPaymentStatus.REFUNDED.value
-                            order.status = OrderStatus.REFUNDED.value
-                        else:
-                            order.payment_status = OrderPaymentStatus.PARTIALLY_REFUNDED.value
-                        order.version += 1
-                        order.updated_at = now
-                self._db.flush()
-
-            return {
-                "http_status": 200,
-                "action_type": ActionType.REFUND_EXECUTE.value,
-                "refund_id": refund_id,
-                "payment_id": payment.id,
-                "order_id": payment.order_id,
-                "amount": params_ref.amount,
-                "currency": payment.currency,
-                "source_mode": "MOCK",
-                "simulated_verification_failure": simulate_verification_failure,
-            }
-
-        # HOLD_ORDER
-        params_hold = HoldOrderActionParams.model_validate(proposal.params_json)
-        return {
-            "http_status": 200,
-            "action_type": ActionType.HOLD_ORDER.value,
-            "order_id": params_hold.order_id,
-            "reason": params_hold.reason,
-            "source_mode": "MOCK",
-        }
+        raise AppError(
+            ErrorCode.CONFLICT,
+            f"Execution of action '{contract_action_type}' is disabled in the Prompt 03 gateway",
+            status_code=409,
+        )
 
     def _record_case_event(
         self,

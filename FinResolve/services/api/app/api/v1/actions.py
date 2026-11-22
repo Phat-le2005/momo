@@ -7,7 +7,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.errors import AppError, ErrorCode
-from app.core.session import get_current_session
+from app.core.session import (
+    ApproverPrincipal,
+    get_current_approver_principal,
+    get_current_session,
+)
 from app.db.session import get_db
 from app.models.actions import ActionProposal
 from app.models.session import DemoSession
@@ -95,23 +99,25 @@ def get_action_proposal(
     "/{proposal_id}/approve",
     response_model=ApprovalResponse,
     status_code=status.HTTP_200_OK,
-    summary="Approve or reject a proposed business action with cryptographic digest binding",
+    summary="Approve or reject a proposed action using server-validated manager capability",
 )
 def approve_action_proposal(
     proposal_id: str,
     payload: ApproveActionRequest | None = None,
     current_session: DemoSession = Depends(get_current_session),
+    principal: ApproverPrincipal = Depends(get_current_approver_principal),
     db: Session = Depends(get_db),
 ) -> ApprovalResponse:
     req = payload or ApproveActionRequest()
     gateway = ApprovalGateway(db, current_session.id)
     approval, proposal, case_obj = gateway.decide_proposal(
         proposal_id=proposal_id,
-        approver_role=req.approver_role,
-        approver_id=req.approver_id,
+        principal=principal,
         decision=req.decision,
         reason=req.reason,
         expiry_minutes=req.expiry_minutes,
+        claimed_role=req.approver_role,
+        claimed_id=req.approver_id,
     )
     contract = get_action_contract(proposal.action_type)
 
@@ -122,10 +128,10 @@ def approve_action_proposal(
         action_type=contract.action_type,
         decision=approval.decision,
         approver_role=approval.approver_role,
-        approver_id=req.approver_id,
+        approver_id=approval.approver_id,
         reason=req.reason,
         digest=approval.digest,
-        policy_version=contract.policy_version,
+        policy_version=approval.policy_version,
         expiry=approval.expiry,
         proposal_status=proposal.status,
         case_state=case_obj.state if case_obj else None,

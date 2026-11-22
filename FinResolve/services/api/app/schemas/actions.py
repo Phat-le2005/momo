@@ -15,17 +15,21 @@ class ApproveActionRequest(BaseModel):
         default=ApprovalDecision.APPROVED,
         description="Quyết định phê duyệt (APPROVED hoặc REJECTED)",
     )
-    approver_role: str = Field(
-        default="DEMO_MANAGER",
-        min_length=2,
+    approver_role: str | None = Field(
+        default=None,
         max_length=64,
-        description="Vai trò phê duyệt được cấp quyền (OPS_MANAGER, FINANCE_LEAD, DEMO_MANAGER)",
+        description=(
+            "Không được dùng để cấp quyền (quyền lấy từ X-Demo-Manager-Token); "
+            "nếu truyền khác principal sẽ bị từ chối 403"
+        ),
     )
-    approver_id: str = Field(
-        default="demo_manager_01",
-        min_length=2,
+    approver_id: str | None = Field(
+        default=None,
         max_length=64,
-        description="Định danh người phê duyệt trong phiên demo",
+        description=(
+            "Không được dùng để mạo danh (định danh lấy từ X-Demo-Manager-Token); "
+            "nếu truyền khác principal sẽ bị từ chối 403"
+        ),
     )
     reason: str = Field(
         default="Đã đối chiếu bằng chứng xác thực và đồng ý phê duyệt đề xuất",

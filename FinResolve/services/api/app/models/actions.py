@@ -57,6 +57,15 @@ class Approval(Base):
         index=True,
     )
     approver_role: Mapped[str] = mapped_column(String(64), nullable=False)
+    approver_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="demo_manager", server_default="demo_manager"
+    )
+    policy_version: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="FinResolve-Policy-v1.2",
+        server_default="FinResolve-Policy-v1.2",
+    )
     decision: Mapped[str] = mapped_column(String(32), nullable=False)
     digest: Mapped[str] = mapped_column(String(128), nullable=False)
     expiry: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
