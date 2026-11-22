@@ -140,7 +140,7 @@ def test_issue2_payment_notification_processing() -> None:
         db.add_all([sess, order, payment])
         db.commit()
 
-        # 2a: Valid transition PENDING -> SUCCESS from trusted source
+        # 2a: Valid transition PENDING -> SUCCESS from verified adapter
         updated_pay, is_new = process_provider_notification(
             db,
             session_id=session_id,
@@ -150,6 +150,7 @@ def test_issue2_payment_notification_processing() -> None:
             status=PaymentStatus.SUCCESS,
             verification_source="WEBHOOK_IPN",
             is_trusted=True,
+            adapter_verified=True,
         )
         db.commit()
         assert is_new is True
@@ -167,6 +168,8 @@ def test_issue2_payment_notification_processing() -> None:
             provider_ref="MOMO_TXN_NOTIF_01",
             amount=300000,
             status=PaymentStatus.SUCCESS,
+            is_trusted=True,
+            adapter_verified=True,
         )
         assert is_new2 is False
         assert same_pay.id == updated_pay.id
@@ -180,6 +183,8 @@ def test_issue2_payment_notification_processing() -> None:
                 provider_ref="MOMO_TXN_NOTIF_01",
                 amount=500000,  # Conflict: was 300,000
                 status=PaymentStatus.SUCCESS,
+                is_trusted=True,
+                adapter_verified=True,
             )
         assert exc_amount.value.status_code == 409
         assert "Payment amount conflict" in exc_amount.value.message
@@ -240,6 +245,8 @@ def test_issue2_concurrent_payment_notifications_safe() -> None:
                 amount=150000,
                 status=PaymentStatus.SUCCESS,
                 request_id=f"REQ_RACE_{idx}",
+                is_trusted=True,
+                adapter_verified=True,
             )
             thread_db.commit()
             return pay.id, is_new

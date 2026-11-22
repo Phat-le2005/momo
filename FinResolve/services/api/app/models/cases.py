@@ -95,9 +95,7 @@ class Evidence(Base):
     session_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("demo_sessions.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    kind: Mapped[str] = mapped_column(
-        String(32), nullable=False, default=EvidenceKind.CLAIM.value
-    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default=EvidenceKind.CLAIM.value)
     source: Mapped[str] = mapped_column(String(64), nullable=False)
     source_ref: Mapped[str] = mapped_column(String(128), nullable=False)
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)

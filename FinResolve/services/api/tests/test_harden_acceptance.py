@@ -34,8 +34,10 @@ from app.models.simulator import (
     Warehouse,
 )
 from app.simulator.services import (
+    approve_refund_proposal,
     process_provider_notification,
     process_refund_request,
+    propose_refund,
     reserve_inventory,
 )
 
@@ -283,13 +285,38 @@ def test_acceptance_b_refund_exceeding_remaining_eligible_rejected() -> None:
         db.add_all([sess, order, pay])
         db.commit()
 
+        # Step 0: Calling process_refund_request without real approval must fail with 403
+        with pytest.raises(AppError) as exc_unauth:
+            process_refund_request(
+                db,
+                session_id=session_id,
+                payment_id=payment_id,
+                amount=200000,
+                reason="Hủy hàng",
+            )
+        assert exc_unauth.value.status_code == 403
+        assert "cannot bypass real Approval" in exc_unauth.value.message
+
         # Step 1: Partial refund for 200,000 VND (eligible remaining: 300,000 VND)
+        prop1 = propose_refund(
+            db,
+            session_id=session_id,
+            payment_id=payment_id,
+            amount=200000,
+            reason="Hủy một phần hàng",
+        )
+        db.commit()
+        appr1 = approve_refund_proposal(db, proposal_id=prop1.id, session_id=session_id)
+        db.commit()
+
         ref1 = process_refund_request(
             db,
             session_id=session_id,
             payment_id=payment_id,
             amount=200000,
             reason="Hủy một phần hàng",
+            approval_id=appr1.id,
+            is_authorized=True,
         )
         db.commit()
         assert ref1.completed_amount == 200000
@@ -298,7 +325,7 @@ def test_acceptance_b_refund_exceeding_remaining_eligible_rejected() -> None:
         # Step 2: Attempting second refund for 350,000 VND (exceeds 300,000 VND)
         # MUST FAIL with 409
         with pytest.raises(AppError) as exc_info:
-            process_refund_request(
+            propose_refund(
                 db,
                 session_id=session_id,
                 payment_id=payment_id,
@@ -309,7 +336,7 @@ def test_acceptance_b_refund_exceeding_remaining_eligible_rejected() -> None:
         assert "exceeds remaining eligible refundable balance" in exc_info.value.message
 
         # Step 3: Legitimate second refund for remaining 300,000 VND succeeds
-        ref2 = process_refund_request(
+        prop2 = propose_refund(
             db,
             session_id=session_id,
             payment_id=payment_id,
@@ -317,12 +344,25 @@ def test_acceptance_b_refund_exceeding_remaining_eligible_rejected() -> None:
             reason="Hoàn phần còn lại",
         )
         db.commit()
+        appr2 = approve_refund_proposal(db, proposal_id=prop2.id, session_id=session_id)
+        db.commit()
+
+        ref2 = process_refund_request(
+            db,
+            session_id=session_id,
+            payment_id=payment_id,
+            amount=300000,
+            reason="Hoàn phần còn lại",
+            approval_id=appr2.id,
+            is_authorized=True,
+        )
+        db.commit()
         assert ref2.completed_amount == 300000
         assert order.payment_status == OrderPaymentStatus.REFUNDED.value
 
         # Step 4: Attempting third refund after fully refunded -> MUST FAIL with 409
         with pytest.raises(AppError) as exc_info2:
-            process_refund_request(
+            propose_refund(
                 db,
                 session_id=session_id,
                 payment_id=payment_id,
@@ -351,7 +391,7 @@ def test_acceptance_c_duplicate_provider_notification_deduplicated() -> None:
         db.add(sess)
         db.commit()
 
-        # First IPN webhook notification
+        # First IPN webhook notification from verified provider adapter
         pay1, is_new1 = process_provider_notification(
             db,
             session_id=session_id,
@@ -360,6 +400,8 @@ def test_acceptance_c_duplicate_provider_notification_deduplicated() -> None:
             amount=250000,
             status=PaymentStatus.SUCCESS,
             request_id="REQ_IPN_001",
+            is_trusted=True,
+            adapter_verified=True,
         )
         db.commit()
         assert is_new1 is True
@@ -374,6 +416,8 @@ def test_acceptance_c_duplicate_provider_notification_deduplicated() -> None:
             amount=250000,
             status=PaymentStatus.SUCCESS,
             request_id="REQ_IPN_001",
+            is_trusted=True,
+            adapter_verified=True,
         )
         db.commit()
         assert is_new2 is False

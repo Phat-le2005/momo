@@ -19,8 +19,8 @@ class ActionProposal(Base):
     __tablename__ = "action_proposals"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    case_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("cases.id", ondelete="CASCADE"), nullable=False, index=True
+    case_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("cases.id", ondelete="CASCADE"), nullable=True, index=True
     )
     session_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("demo_sessions.id", ondelete="CASCADE"), nullable=False, index=True
@@ -108,8 +108,8 @@ class Verification(Base):
     __tablename__ = "verifications"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    case_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("cases.id", ondelete="CASCADE"), nullable=False, index=True
+    case_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("cases.id", ondelete="CASCADE"), nullable=True, index=True
     )
     action_execution_id: Mapped[str | None] = mapped_column(
         String(64),
