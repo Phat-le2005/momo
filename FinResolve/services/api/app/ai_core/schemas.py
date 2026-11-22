@@ -5,7 +5,7 @@ Hard Domain Invariants:
    privileged fields such as `payment_verified`, `is_trusted`, `override_policy`, or `auto_execute`.
 2. Strict tool allowlist: `READ_TOOL` can ONLY invoke the 7 authorized read-only tools.
 3. No write execution from AI: `PROPOSE_ACTION` can only propose `propose_order_sync`,
-   `propose_refund`, or `HOLD_ORDER`.
+   `propose_refund`, or `HOLD_ORDER`, with strictly validated argument types and references.
 4. No SSRF / arbitrary URLs: rejects any tool arguments containing URLs (`http://`, `https://`)
    or cross-session overrides (`session_id`, `tenant_id`).
 """
@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -64,6 +64,50 @@ _URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_STRING_ARG_KEYS: frozenset[str] = frozenset(
+    {
+        "order_id",
+        "payment_id",
+        "provider_ref",
+        "customer_phone",
+        "product_id",
+        "sku",
+        "category",
+        "reason",
+        "question",
+        "risk_category",
+        "status",
+        "observed_payment_status",
+    }
+)
+
+_IDENTIFIER_ARG_KEYS: frozenset[str] = frozenset(
+    {
+        "order_id",
+        "payment_id",
+        "provider_ref",
+        "customer_phone",
+        "product_id",
+        "sku",
+    }
+)
+
+_INT_ARG_KEYS: frozenset[str] = frozenset(
+    {
+        "amount",
+        "requested_amount",
+        "remaining_refundable_amount",
+        "expected_order_version",
+        "order_amount",
+        "payment_amount",
+    }
+)
+
+
+def is_strict_int(value: Any) -> TypeGuard[int]:
+    """Return True if value is an integer and NOT a boolean (since bool subclasses int)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
 
 def _scan_dict_for_violations(data: dict[str, Any], path: str = "args") -> None:
     """Recursively inspect dictionary arguments for forbidden privilege keys and arbitrary URLs."""
@@ -89,6 +133,44 @@ def _scan_dict_for_violations(data: dict[str, Any], path: str = "args") -> None:
                     )
                 elif isinstance(item, dict):
                     _scan_dict_for_violations(item, path=f"{path}.{key}[{idx}]")
+
+
+def _validate_arg_types(args: dict[str, Any]) -> None:
+    """Validate scalar argument types in next_step.args to prevent malformed model payloads."""
+    for key, val in args.items():
+        if val is None:
+            continue
+        if key in _STRING_ARG_KEYS:
+            if not isinstance(val, str):
+                raise ValueError(f"Argument '{key}' must be a string, got {type(val).__name__}")
+            stripped = val.strip()
+            if key in _IDENTIFIER_ARG_KEYS and (not stripped or len(stripped) > 128):
+                raise ValueError(
+                    f"Identifier argument '{key}' must be a non-empty string <= 128 chars"
+                )
+            if len(stripped) > 1000:
+                raise ValueError(f"String argument '{key}' exceeds maximum length of 1000 chars")
+        elif key in _INT_ARG_KEYS:
+            if not is_strict_int(val):
+                raise ValueError(
+                    f"Argument '{key}' must be a strict integer (not {type(val).__name__})"
+                )
+            if key in ("amount", "requested_amount", "order_amount", "payment_amount") and (
+                val <= 0 or val > 100_000_000_000
+            ):
+                raise ValueError(
+                    f"Monetary argument '{key}' must be between 1 and 100,000,000,000 VND"
+                )
+            if key == "remaining_refundable_amount" and (val < 0 or val > 100_000_000_000):
+                raise ValueError(f"Argument '{key}' must be a non-negative integer")
+            if key == "expected_order_version" and (val < 1 or val > 1_000_000):
+                raise ValueError("Argument 'expected_order_version' must be >= 1")
+        elif key == "simulate_timeout":
+            if not isinstance(val, bool):
+                raise ValueError("Argument 'simulate_timeout' must be a boolean")
+        elif key == "candidate_refs":
+            if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+                raise ValueError("Argument 'candidate_refs' must be a list of strings")
 
 
 class PlanStepKind(StrEnum):
@@ -118,6 +200,7 @@ class NextStep(BaseModel):
     def _validate_step_safety(self) -> NextStep:
         # 1. Inspect args recursively for privilege escalation keys or arbitrary URLs
         _scan_dict_for_violations(self.args, path="next_step.args")
+        _validate_arg_types(self.args)
 
         if self.tool_name and _URL_PATTERN.search(self.tool_name):
             raise ValueError("tool_name must not contain a URL")
@@ -134,7 +217,7 @@ class NextStep(BaseModel):
                     f"Allowed read tools: {sorted(ALLOWED_READ_TOOLS)}"
                 )
 
-        # 3. Enforce strict PROPOSE_ACTION allowlist (proposals only, never direct writes)
+        # 3. Enforce strict PROPOSE_ACTION allowlist & required argument references
         elif self.kind == PlanStepKind.PROPOSE_ACTION:
             chosen_action = self.action_type or self.tool_name
             if not chosen_action:
@@ -146,10 +229,32 @@ class NextStep(BaseModel):
                     f"Unauthorized action proposal '{chosen_action}'. "
                     f"AI may only propose: {sorted(ALLOWED_PROPOSAL_ACTIONS)}"
                 )
-            # Normalize so both tool_name and action_type are consistent
             self.action_type = chosen_action
             if self.tool_name is None:
                 self.tool_name = chosen_action
+
+            if chosen_action in ("propose_order_sync", "ORDER_SYNC"):
+                order_id = self.args.get("order_id")
+                payment_id = self.args.get("payment_id")
+                if not isinstance(order_id, str) or not order_id.strip():
+                    raise ValueError(
+                        "PROPOSE_ACTION for ORDER_SYNC requires a non-empty string 'order_id'"
+                    )
+                if not isinstance(payment_id, str) or not payment_id.strip():
+                    raise ValueError(
+                        "PROPOSE_ACTION for ORDER_SYNC requires a non-empty string 'payment_id'"
+                    )
+            elif chosen_action in ("propose_refund", "REFUND_EXECUTE"):
+                payment_id = self.args.get("payment_id")
+                amount = self.args.get("amount")
+                if not isinstance(payment_id, str) or not payment_id.strip():
+                    raise ValueError(
+                        "PROPOSE_ACTION for REFUND_EXECUTE requires a non-empty string 'payment_id'"
+                    )
+                if not is_strict_int(amount) or int(amount) <= 0:
+                    raise ValueError(
+                        "PROPOSE_ACTION for REFUND_EXECUTE requires a positive integer 'amount'"
+                    )
 
         return self
 

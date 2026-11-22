@@ -4,9 +4,13 @@ Hard Domain Invariants:
 1. Strictly READ-ONLY: None of these tools mutate any database record.
 2. Strictly Session-Scoped: Every query is bound to `self.session_id` validated by the server.
    Any `session_id` passed by model arguments is ignored/rejected.
-3. Provenance & Freshness: Every tool result carries `source`, `source_ref`, `source_mode="MOCK"`,
+3. Cross-Order Isolation: `find_payment_candidates` for a specific order NEVER returns a payment
+   bound to a different `order_id`, even if the monetary amounts are identical.
+4. Ambiguity Detection: If an order prefix, customer phone, or amount matches multiple orders
+   (or if only an amount is given without a reliable identifier), `get_order` reports
+   `is_ambiguous=True` / `requires_identifier=True` and never randomly picks an order.
+5. Provenance & Freshness: Every tool result carries `source`, `source_ref`, `source_mode="MOCK"`,
    `observed_at`, and `freshness_ms`.
-4. No Oracle Leakage: Only observable business and provider fields are returned.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.ai_core.schemas import ALLOWED_READ_TOOLS
+from app.ai_core.schemas import ALLOWED_READ_TOOLS, is_strict_int
 from app.models.actions import ActionProposal
 from app.models.enums import PaymentStatus, RefundStatus
 from app.models.simulator import (
@@ -34,6 +38,18 @@ from app.models.simulator import (
     SimRefund,
     Warehouse,
 )
+
+
+def _safe_str(args: dict[str, Any], key: str) -> str:
+    val = args.get(key)
+    return val.strip() if isinstance(val, str) else ""
+
+
+def _safe_pos_int(args: dict[str, Any], key: str) -> int | None:
+    val = args.get(key)
+    if is_strict_int(val) and int(val) > 0:
+        return int(val)
+    return None
 
 
 class ToolResult(BaseModel):
@@ -83,11 +99,17 @@ class ReadToolRegistry:
         result.freshness_ms = elapsed_ms
         return result
 
-    def _resolve_order(self, args: dict[str, Any]) -> SimOrder | None:
-        """Find a single SimOrder in the current session by exact ID, prefix, phone, or amount."""
-        order_id = str(args.get("order_id") or "").strip()
-        customer_phone = str(args.get("customer_phone") or "").strip()
-        amount = args.get("amount")
+    def _find_matching_orders(self, args: dict[str, Any]) -> tuple[list[SimOrder], bool, str]:
+        """Locate matching orders in the current session.
+
+        Returns `(matching_orders, requires_identifier, lookup_mode)`:
+        - Does NOT resolve an order from `amount` alone without `order_id` or `customer_phone`.
+        - If multiple orders match a prefix or phone, returns all of them so caller sees
+          `len(matching_orders) > 1` (`is_ambiguous=True`).
+        """
+        order_id = _safe_str(args, "order_id")
+        customer_phone = _safe_str(args, "customer_phone")
+        amount = _safe_pos_int(args, "amount")
 
         if order_id:
             # 1. Exact match within session
@@ -97,58 +119,125 @@ class ReadToolRegistry:
                 .where(SimOrder.session_id == self._session_id, SimOrder.id == order_id)
             )
             if exact is not None:
-                return exact
+                return [exact], False, "exact_order_id"
 
-            # 2. Prefix match within session (e.g. "ORD-SYNC" -> "ORD-SYNC-<suffix>")
-            prefix_matches = self._db.scalars(
-                select(SimOrder)
-                .options(selectinload(SimOrder.items))
-                .where(
-                    SimOrder.session_id == self._session_id,
-                    SimOrder.id.ilike(f"{order_id}%"),
+            # 2. Prefix match within session (require at least 5 chars e.g. "ORD-S" or "ORD-SYNC")
+            if len(order_id) >= 5:
+                prefix_matches = list(
+                    self._db.scalars(
+                        select(SimOrder)
+                        .options(selectinload(SimOrder.items))
+                        .where(
+                            SimOrder.session_id == self._session_id,
+                            SimOrder.id.ilike(f"{order_id}%"),
+                        )
+                        .order_by(SimOrder.created_at.asc())
+                    ).all()
                 )
-                .order_by(SimOrder.created_at.asc())
-            ).all()
-            if len(prefix_matches) == 1:
-                return prefix_matches[0]
+                if prefix_matches:
+                    return prefix_matches, False, "prefix_order_id"
+
+            return [], False, "order_id_not_found"
 
         if customer_phone:
-            by_phone = self._db.scalars(
-                select(SimOrder)
-                .options(selectinload(SimOrder.items))
-                .where(
-                    SimOrder.session_id == self._session_id,
-                    SimOrder.customer_phone == customer_phone,
-                )
-                .order_by(SimOrder.created_at.asc())
-            ).all()
-            if len(by_phone) == 1:
-                return by_phone[0]
+            by_phone = list(
+                self._db.scalars(
+                    select(SimOrder)
+                    .options(selectinload(SimOrder.items))
+                    .where(
+                        SimOrder.session_id == self._session_id,
+                        SimOrder.customer_phone == customer_phone,
+                    )
+                    .order_by(SimOrder.created_at.asc())
+                ).all()
+            )
+            return by_phone, False, "customer_phone"
 
-        if isinstance(amount, int) and amount > 0:
-            by_amount = self._db.scalars(
-                select(SimOrder)
-                .options(selectinload(SimOrder.items))
-                .where(
-                    SimOrder.session_id == self._session_id,
-                    SimOrder.amount == amount,
-                )
-                .order_by(SimOrder.created_at.asc())
-            ).all()
-            if len(by_amount) == 1:
-                return by_amount[0]
+        if amount is not None:
+            by_amount = list(
+                self._db.scalars(
+                    select(SimOrder)
+                    .options(selectinload(SimOrder.items))
+                    .where(
+                        SimOrder.session_id == self._session_id,
+                        SimOrder.amount == amount,
+                    )
+                    .order_by(SimOrder.created_at.asc())
+                ).all()
+            )
+            # Amount alone is never a reliable unique order identifier!
+            return by_amount, True, "amount_only_unreliable"
 
+        return [], True, "missing_identifiers"
+
+    def _resolve_unique_order(self, args: dict[str, Any]) -> SimOrder | None:
+        """Return a SimOrder only if uniquely identified by order_id or customer_phone."""
+        orders, requires_id, _ = self._find_matching_orders(args)
+        if not requires_id and len(orders) == 1:
+            return orders[0]
         return None
 
     def _get_order(self, args: dict[str, Any], *, simulate_timeout: bool = False) -> ToolResult:
         now = datetime.now(UTC)
-        order = self._resolve_order(args)
-        requested_ref = str(
-            args.get("order_id") or args.get("customer_phone") or args.get("amount") or "query"
+        orders, requires_identifier, lookup_mode = self._find_matching_orders(args)
+        requested_ref = (
+            _safe_str(args, "order_id")
+            or _safe_str(args, "customer_phone")
+            or str(_safe_pos_int(args, "amount") or "missing")
         )
 
-        if order is None:
-            # Also list available session orders metadata if query had no specific match
+        # If only amount was given (or no identifiers at all), refuse to pick an order
+        if requires_identifier:
+            candidate_ids = [o.id for o in orders]
+            return ToolResult(
+                tool_name="get_order",
+                status="NOT_FOUND",
+                source="SIM_ORDERS_DB",
+                source_ref=f"sim_orders:unidentified:{requested_ref}",
+                source_mode="MOCK",
+                observed_at=now,
+                data={
+                    "found": False,
+                    "is_ambiguous": len(candidate_ids) > 1,
+                    "requires_identifier": True,
+                    "lookup_mode": lookup_mode,
+                    "candidate_count": len(candidate_ids),
+                    "candidate_order_ids": candidate_ids,
+                    "queried_ref": requested_ref,
+                    "message": (
+                        "Thiếu mã định danh đơn hàng đáng tin cậy (order_id hoặc customer_phone). "
+                        "Không được tự động suy đoán đơn hàng chỉ từ số tiền hoặc mô tả chung."
+                    ),
+                },
+            )
+
+        # If multiple orders matched the prefix or customer phone -> Ambiguous order!
+        if len(orders) > 1:
+            candidate_ids = [o.id for o in orders]
+            return ToolResult(
+                tool_name="get_order",
+                status="OK",
+                source="SIM_ORDERS_DB",
+                source_ref=f"sim_orders:ambiguous:{requested_ref}",
+                source_mode="MOCK",
+                observed_at=now,
+                data={
+                    "found": False,
+                    "is_ambiguous": True,
+                    "requires_identifier": True,
+                    "lookup_mode": lookup_mode,
+                    "candidate_count": len(candidate_ids),
+                    "candidate_order_ids": candidate_ids,
+                    "queried_ref": requested_ref,
+                    "message": (
+                        f"Có {len(candidate_ids)} đơn hàng cùng khớp thông tin "
+                        f"({', '.join(candidate_ids)}). Cần yêu cầu khách hàng xác nhận chính xác "
+                        "mã đơn hàng."
+                    ),
+                },
+            )
+
+        if not orders:
             return ToolResult(
                 tool_name="get_order",
                 status="NOT_FOUND",
@@ -158,11 +247,15 @@ class ReadToolRegistry:
                 observed_at=now,
                 data={
                     "found": False,
+                    "is_ambiguous": False,
+                    "requires_identifier": False,
+                    "lookup_mode": lookup_mode,
                     "queried_ref": requested_ref,
                     "message": f"Không tìm thấy đơn hàng khớp với '{requested_ref}' trong phiên.",
                 },
             )
 
+        order = orders[0]
         items_data = [
             {
                 "item_id": item.id,
@@ -188,6 +281,9 @@ class ReadToolRegistry:
             observed_at=now,
             data={
                 "found": True,
+                "is_ambiguous": False,
+                "requires_identifier": False,
+                "lookup_mode": lookup_mode,
                 "order_id": order.id,
                 "customer_name": order.customer_name,
                 "customer_phone": order.customer_phone,
@@ -211,9 +307,9 @@ class ReadToolRegistry:
         self, args: dict[str, Any], *, simulate_timeout: bool = False
     ) -> ToolResult:
         now = datetime.now(UTC)
-        order_id_arg = str(args.get("order_id") or "").strip()
-        provider_ref_arg = str(args.get("provider_ref") or "").strip()
-        amount_arg = args.get("amount")
+        order_id_arg = _safe_str(args, "order_id")
+        provider_ref_arg = _safe_str(args, "provider_ref")
+        amount_arg = _safe_pos_int(args, "amount")
 
         # QA T04: Support provider timeout simulation
         if (
@@ -239,32 +335,23 @@ class ReadToolRegistry:
                 },
             )
 
-        # Resolve order_id if a prefix like "ORD-SYNC" was passed
-        resolved_order_id = order_id_arg
+        # Resolve unique order_id if a valid order prefix was passed
+        resolved_order_id = ""
         if order_id_arg:
-            resolved_order = self._resolve_order({"order_id": order_id_arg})
+            resolved_order = self._resolve_unique_order({"order_id": order_id_arg})
             if resolved_order is not None:
                 resolved_order_id = resolved_order.id
+            else:
+                resolved_order_id = order_id_arg
 
-        conditions = []
+        payments: list[SimPayment] = []
+        cross_order_conflicts: list[dict[str, Any]] = []
+
         if resolved_order_id:
-            conditions.append(SimPayment.order_id == resolved_order_id)
-        if provider_ref_arg:
-            conditions.append(SimPayment.provider_ref == provider_ref_arg)
-            # Support suffix matching for user short refs like MOMO_TXN_888 -> MOMO_TXN_<suffix>_888
-            if "_" in provider_ref_arg:
-                parts = provider_ref_arg.split("_")
-                prefix_part = "_".join(parts[:2])
-                tail_part = parts[-1]
-                conditions.append(SimPayment.provider_ref.ilike(f"{prefix_part}%{tail_part}"))
-        if isinstance(amount_arg, int) and amount_arg > 0:
-            conditions.append(SimPayment.amount == amount_arg)
-
-        stmt = select(SimPayment).where(SimPayment.session_id == self._session_id)
-        if conditions:
-            # Prefer exact order_id match if available, otherwise OR across search criteria
-            if resolved_order_id:
-                exact_order_payments = self._db.scalars(
+            # HARD INVARIANT 1: When searching payments for a target order, NEVER include
+            # payments that belong to a DIFFERENT order (even if amounts match!).
+            payments = list(
+                self._db.scalars(
                     select(SimPayment)
                     .where(
                         SimPayment.session_id == self._session_id,
@@ -272,22 +359,70 @@ class ReadToolRegistry:
                     )
                     .order_by(SimPayment.created_at.asc())
                 ).all()
-                if exact_order_payments:
-                    payments = list(exact_order_payments)
-                else:
-                    payments = list(
-                        self._db.scalars(
-                            stmt.where(or_(*conditions)).order_by(SimPayment.created_at.asc())
-                        ).all()
+            )
+
+            # If a provider_ref was also supplied, check if that provider_ref belongs to a
+            # different order so we can explicitly flag the cross-order conflict.
+            if provider_ref_arg:
+                ref_conditions = [SimPayment.provider_ref == provider_ref_arg]
+                if "_" in provider_ref_arg:
+                    parts = provider_ref_arg.split("_")
+                    prefix_part = "_".join(parts[:2])
+                    tail_part = parts[-1]
+                    ref_conditions.append(
+                        SimPayment.provider_ref.ilike(f"{prefix_part}%{tail_part}")
                     )
-            else:
-                payments = list(
+                ref_matches = list(
                     self._db.scalars(
-                        stmt.where(or_(*conditions)).order_by(SimPayment.created_at.asc())
+                        select(SimPayment)
+                        .where(
+                            SimPayment.session_id == self._session_id,
+                            or_(*ref_conditions),
+                        )
+                        .order_by(SimPayment.created_at.asc())
                     ).all()
                 )
-        else:
-            payments = []
+                for rm in ref_matches:
+                    if rm.order_id == resolved_order_id:
+                        if all(p.id != rm.id for p in payments):
+                            payments.append(rm)
+                    else:
+                        cross_order_conflicts.append(
+                            {
+                                "payment_id": rm.id,
+                                "provider_ref": rm.provider_ref,
+                                "bound_order_id": rm.order_id,
+                                "queried_order_id": resolved_order_id,
+                            }
+                        )
+        elif provider_ref_arg:
+            ref_conditions = [SimPayment.provider_ref == provider_ref_arg]
+            if "_" in provider_ref_arg:
+                parts = provider_ref_arg.split("_")
+                prefix_part = "_".join(parts[:2])
+                tail_part = parts[-1]
+                ref_conditions.append(SimPayment.provider_ref.ilike(f"{prefix_part}%{tail_part}"))
+            payments = list(
+                self._db.scalars(
+                    select(SimPayment)
+                    .where(
+                        SimPayment.session_id == self._session_id,
+                        or_(*ref_conditions),
+                    )
+                    .order_by(SimPayment.created_at.asc())
+                ).all()
+            )
+        elif amount_arg is not None:
+            payments = list(
+                self._db.scalars(
+                    select(SimPayment)
+                    .where(
+                        SimPayment.session_id == self._session_id,
+                        SimPayment.amount == amount_arg,
+                    )
+                    .order_by(SimPayment.created_at.asc())
+                ).all()
+            )
 
         # Check if any candidate record signals a simulated gateway timeout (result_code 504)
         for p in payments:
@@ -310,6 +445,10 @@ class ReadToolRegistry:
                     },
                 )
 
+        # If queried by amount only (without order_id or provider_ref), payment candidates
+        # are not uniquely anchored to a verified customer claim -> require identifier confirmation!
+        unanchored_amount_search = not resolved_order_id and not provider_ref_arg
+
         candidates_list = [
             {
                 "payment_id": p.id,
@@ -325,16 +464,26 @@ class ReadToolRegistry:
                 "status": p.status,
                 "verified_at": p.verified_at.isoformat() if p.verified_at else None,
                 "verification_source": p.verification_source,
+                "matches_queried_order": (
+                    bool(resolved_order_id) and p.order_id == resolved_order_id
+                ),
                 "authoritative_success": (
-                    p.status == PaymentStatus.SUCCESS.value and p.verified_at is not None
+                    p.status == PaymentStatus.SUCCESS.value
+                    and p.verified_at is not None
+                    and not unanchored_amount_search
+                    and (not resolved_order_id or p.order_id == resolved_order_id)
                 ),
                 "source_mode": p.source_mode,
             }
             for p in payments
         ]
 
-        # QA T03: Two or more candidate transactions -> mark as ambiguous!
-        is_ambiguous = len(candidates_list) > 1
+        # QA T03 & Ambiguity:
+        # 1) 2+ candidate transactions -> ambiguous
+        # 2) Unanchored amount-only search -> ambiguous / requires identifier
+        is_ambiguous = len(candidates_list) > 1 or (
+            unanchored_amount_search and len(candidates_list) >= 1
+        )
         ref_label = resolved_order_id or provider_ref_arg or str(amount_arg or "candidates")
 
         return ToolResult(
@@ -347,8 +496,10 @@ class ReadToolRegistry:
             data={
                 "queried_order_id": resolved_order_id or None,
                 "queried_provider_ref": provider_ref_arg or None,
+                "unanchored_amount_search": unanchored_amount_search,
                 "candidate_count": len(candidates_list),
                 "is_ambiguous": is_ambiguous,
+                "cross_order_conflicts": cross_order_conflicts,
                 "candidates": candidates_list,
             },
         )
@@ -357,8 +508,8 @@ class ReadToolRegistry:
         self, args: dict[str, Any], *, simulate_timeout: bool = False
     ) -> ToolResult:
         now = datetime.now(UTC)
-        payment_id = str(args.get("payment_id") or "").strip()
-        provider_ref = str(args.get("provider_ref") or "").strip()
+        payment_id = _safe_str(args, "payment_id")
+        provider_ref = _safe_str(args, "provider_ref")
 
         if simulate_timeout or args.get("simulate_timeout") is True:
             return ToolResult(
@@ -459,12 +610,12 @@ class ReadToolRegistry:
         self, args: dict[str, Any], *, simulate_timeout: bool = False
     ) -> ToolResult:
         now = datetime.now(UTC)
-        payment_id = str(args.get("payment_id") or "").strip()
-        order_id_arg = str(args.get("order_id") or "").strip()
+        payment_id = _safe_str(args, "payment_id")
+        order_id_arg = _safe_str(args, "order_id")
 
         resolved_order_id = order_id_arg
         if order_id_arg:
-            resolved_order = self._resolve_order({"order_id": order_id_arg})
+            resolved_order = self._resolve_unique_order({"order_id": order_id_arg})
             if resolved_order is not None:
                 resolved_order_id = resolved_order.id
 
@@ -559,9 +710,9 @@ class ReadToolRegistry:
 
     def _get_inventory(self, args: dict[str, Any], *, simulate_timeout: bool = False) -> ToolResult:
         now = datetime.now(UTC)
-        product_id = str(args.get("product_id") or "").strip()
-        sku = str(args.get("sku") or "").strip()
-        order_id_arg = str(args.get("order_id") or "").strip()
+        product_id = _safe_str(args, "product_id")
+        sku = _safe_str(args, "sku")
+        order_id_arg = _safe_str(args, "order_id")
 
         product_ids: list[str] = []
         if product_id:
@@ -577,7 +728,7 @@ class ReadToolRegistry:
             product_ids.extend(p.id for p in prod_by_sku)
 
         if order_id_arg:
-            resolved_order = self._resolve_order({"order_id": order_id_arg})
+            resolved_order = self._resolve_unique_order({"order_id": order_id_arg})
             if resolved_order is not None:
                 items = self._db.scalars(
                     select(OrderItem).where(
@@ -660,7 +811,8 @@ class ReadToolRegistry:
                     "ORDER_SYNC": {
                         "require_verified_provider_payment": True,
                         "required_payment_status": "SUCCESS",
-                        "require_amount_and_currency_match": True,
+                        "require_payment_bound_to_same_order": True,
+                        "require_merchant_and_currency_match": True,
                         "require_unique_payment_match": True,
                         "disallow_from_customer_claim": True,
                     },
@@ -693,8 +845,8 @@ class ReadToolRegistry:
         self, args: dict[str, Any], *, simulate_timeout: bool = False
     ) -> ToolResult:
         now = datetime.now(UTC)
-        order = self._resolve_order(args)
-        order_id_ref = order.id if order else str(args.get("order_id") or "unknown")
+        order = self._resolve_unique_order(args)
+        order_id_ref = order.id if order else (_safe_str(args, "order_id") or "unknown")
 
         if order is None:
             return ToolResult(

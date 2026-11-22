@@ -6,7 +6,9 @@ Hard Domain Invariants:
 2. Honest Fallback: When no API key is configured, `DeterministicDemoAdapter` runs with
    `model_mode=ModelMode.DEMO_RULES` and `is_fallback=True`. Every summary is explicitly
    prefixed with `[DEMO_RULES]` and is NEVER represented as generative AI output.
-3. Both adapters produce a Pydantic-validated `Plan` object and cannot execute writes.
+3. No Default Order Guessing: Never defaults generic complaints without reliable identifiers
+   to `ORD-SYNC` or `ORD-REF`. Chooses `ASK_USER` when identifiers are missing or ambiguous.
+4. Strict `case_id` validation: `plan.case_id` must match the currently investigated Case.
 """
 
 from __future__ import annotations
@@ -108,11 +110,15 @@ class LLMModelAdapter:
                 client.close()
 
         parsed_obj = self._extract_json_dict(raw_json_str)
-        # Ensure case_id matches current case context
-        if isinstance(parsed_obj, dict) and "case_id" not in parsed_obj:
-            parsed_obj["case_id"] = context.case_id
-
         validated_plan = Plan.model_validate(parsed_obj)
+
+        # Hardening 3: Validate that planner.case_id matches the currently investigated Case
+        if validated_plan.case_id != context.case_id:
+            raise ValueError(
+                f"Planner output case_id '{validated_plan.case_id}' does not match "
+                f"currently investigated Case '{context.case_id}'"
+            )
+
         latency_ms = max(0, int((time.perf_counter_ns() - start_ns) / 1_000_000))
 
         return ModelInvocationResult(
@@ -252,9 +258,12 @@ class LLMModelAdapter:
 class DeterministicDemoAdapter:
     """Honest deterministic fallback planner when no LLM API key is configured.
 
-    Invariant:
-    Always reports `mode=ModelMode.DEMO_RULES` and `is_fallback=True`, and prefixes every
-    `decision_summary` with `[DEMO_RULES]` so it is never mistaken for generative AI.
+    Invariants:
+    1. Always reports `mode=ModelMode.DEMO_RULES` and `is_fallback=True`, and prefixes every
+       `decision_summary` with `[DEMO_RULES]` so it is never mistaken for generative AI.
+    2. Never defaults generic complaints without reliable identifiers to `ORD-SYNC` or `ORD-REF`.
+       Immediately requests clarification (`ASK_USER`) when target order/transaction is missing
+       or ambiguous.
     """
 
     @property
@@ -286,21 +295,140 @@ class DeterministicDemoAdapter:
         called_tools = {obs.tool_name: obs for obs in context.tool_observations}
         u = context.understanding
 
-        # Collect search hints from Vietnamese complaint extraction
+        # Collect explicit search hints from Vietnamese complaint extraction
         hint_order_id = u.extracted_order_ids[0] if u.extracted_order_ids else None
         hint_pay_ref = u.extracted_payment_refs[0] if u.extracted_payment_refs else None
         hint_phone = u.extracted_phones[0] if u.extracted_phones else None
         hint_amount = u.extracted_amounts_vnd[0] if u.extracted_amounts_vnd else None
         hint_sku = u.extracted_skus[0] if u.extracted_skus else None
 
-        # Default fallback order hint based on intent if free-text omitted explicit ID
-        if not hint_order_id and not hint_phone and not hint_amount:
-            if u.intent == IntentCategory.REFUND_DISPUTE:
-                hint_order_id = "ORD-REF"
-            elif u.intent == IntentCategory.PAYMENT_SYNC:
-                hint_order_id = "ORD-SYNC"
+        # Hardening 2: Never default generic complaints without reliable identifiers
+        # to ORD-SYNC or ORD-REF!
+        has_order_lookup_id = bool(hint_order_id or hint_phone)
+        has_payment_lookup_id = bool(hint_pay_ref)
 
-        # 1. Step 1: Always inspect order first if not yet read
+        if not has_order_lookup_id and not has_payment_lookup_id:
+            # If only an amount was mentioned, we can inspect get_order(amount=...) once
+            # so the tool observation records the ambiguity / missing identifier in Evidence,
+            # and then ask the user for a reliable identifier.
+            if hint_amount and "get_order" not in called_tools:
+                return Plan(
+                    case_id=context.case_id,
+                    goal=context.goal,
+                    known_evidence_refs=context.known_evidence_refs,
+                    unknowns=["order_id", "provider_transaction_ref"],
+                    hypotheses=[
+                        Hypothesis(
+                            label="missing_unique_order_or_payment_identifier",
+                            supporting_evidence_refs=context.known_evidence_refs[:1],
+                        )
+                    ],
+                    next_step=NextStep(
+                        kind=PlanStepKind.READ_TOOL,
+                        tool_name="get_order",
+                        args={"amount": hint_amount},
+                    ),
+                    decision_summary=(
+                        "[DEMO_RULES] Khiếu nại chỉ có số tiền mà thiếu mã đơn hàng/mã giao dịch; "
+                        "kiểm tra mức độ trùng lặp đơn hàng trước khi yêu cầu bổ sung định danh."
+                    ),
+                )
+
+            return Plan(
+                case_id=context.case_id,
+                goal=context.goal,
+                known_evidence_refs=context.known_evidence_refs,
+                unknowns=["order_id", "provider_transaction_ref"],
+                hypotheses=[
+                    Hypothesis(
+                        label="insufficient_identifiers_in_customer_claim",
+                        supporting_evidence_refs=context.known_evidence_refs,
+                    )
+                ],
+                next_step=NextStep(
+                    kind=PlanStepKind.ASK_USER,
+                    args={
+                        "question": (
+                            "Nội dung khiếu nại chưa có mã đơn hàng (order_id), số điện thoại "
+                            "hoặc mã giao dịch (provider_ref) đủ để định danh duy nhất. "
+                            "Vui lòng cung cấp mã đơn hàng và mã giao dịch thanh toán."
+                        )
+                    },
+                ),
+                decision_summary=(
+                    "[DEMO_RULES] Thiếu mã định danh đáng tin cậy (order_id / provider_ref / SĐT); "
+                    "yêu cầu khách hàng bổ sung thông tin (ASK_USER), không tự suy đoán đơn."
+                ),
+            )
+
+        # If customer provided provider_ref without order_id/phone, query payment candidates first
+        if not has_order_lookup_id and has_payment_lookup_id:
+            if "find_payment_candidates" not in called_tools:
+                return Plan(
+                    case_id=context.case_id,
+                    goal=context.goal,
+                    known_evidence_refs=context.known_evidence_refs,
+                    unknowns=["order_id", "payment_verification_status"],
+                    hypotheses=[
+                        Hypothesis(
+                            label="lookup_order_via_payment_ref",
+                            supporting_evidence_refs=context.known_evidence_refs[:1],
+                        )
+                    ],
+                    next_step=NextStep(
+                        kind=PlanStepKind.READ_TOOL,
+                        tool_name="find_payment_candidates",
+                        args={"provider_ref": hint_pay_ref},
+                    ),
+                    decision_summary=(
+                        "[DEMO_RULES] Tra cứu bản ghi thanh toán theo mã giao dịch "
+                        f"'{hint_pay_ref}' để xác định đơn hàng liên kết."
+                    ),
+                )
+
+            pay_obs_first = called_tools["find_payment_candidates"]
+            if pay_obs_first.status == "TIMEOUT" or pay_obs_first.data.get("timed_out"):
+                return Plan(
+                    case_id=context.case_id,
+                    goal=context.goal,
+                    known_evidence_refs=context.known_evidence_refs,
+                    unknowns=["provider_payment_outcome_after_timeout"],
+                    hypotheses=[],
+                    next_step=NextStep(
+                        kind=PlanStepKind.STOP,
+                        args={"reason": "PROVIDER_TIMEOUT"},
+                    ),
+                    decision_summary=(
+                        "[DEMO_RULES] Truy vấn cổng thanh toán bị quá thời gian (TIMEOUT). "
+                        "Giữ nguyên UNKNOWN_OUTCOME, không tự động ghi hoặc thử lại mù quáng."
+                    ),
+                )
+
+            cands_first = list(pay_obs_first.data.get("candidates") or [])
+            if len(cands_first) != 1 or not cands_first[0].get("order_id"):
+                return Plan(
+                    case_id=context.case_id,
+                    goal=context.goal,
+                    known_evidence_refs=context.known_evidence_refs,
+                    unknowns=["valid_order_id", "disambiguated_provider_transaction_ref"],
+                    hypotheses=[],
+                    next_step=NextStep(
+                        kind=PlanStepKind.ASK_USER,
+                        args={
+                            "question": (
+                                "Không thể xác định duy nhất đơn hàng từ mã giao dịch đã cung cấp. "
+                                "Vui lòng cung cấp chính xác mã đơn hàng (order_id)."
+                            )
+                        },
+                    ),
+                    decision_summary=(
+                        "[DEMO_RULES] Mã giao dịch không liên kết duy nhất với một đơn hàng; "
+                        "yêu cầu khách hàng cung cấp mã đơn hàng (ASK_USER)."
+                    ),
+                )
+            hint_order_id = str(cands_first[0]["order_id"])
+
+        # 1. Step 1: Inspect order using explicit order_id or customer_phone
         if "get_order" not in called_tools:
             order_args: dict[str, Any] = {}
             if hint_order_id:
@@ -309,8 +437,6 @@ class DeterministicDemoAdapter:
                 order_args["customer_phone"] = hint_phone
             if hint_amount:
                 order_args["amount"] = hint_amount
-            if not order_args:
-                order_args["order_id"] = "ORD-SYNC"
 
             return Plan(
                 case_id=context.case_id,
@@ -335,18 +461,77 @@ class DeterministicDemoAdapter:
             )
 
         order_obs = called_tools["get_order"]
+        order_is_ambiguous = bool(order_obs.data.get("is_ambiguous"))
+        order_requires_id = bool(order_obs.data.get("requires_identifier"))
         order_found = bool(order_obs.data.get("found"))
-        resolved_order_id = str(order_obs.data.get("order_id") or hint_order_id or "")
-        order_amount = int(order_obs.data.get("amount") or hint_amount or 0)
+
+        # Hardening 2: If order lookup is ambiguous or lacks reliable identifier -> ASK_USER
+        if order_is_ambiguous or order_requires_id:
+            cand_orders = list(order_obs.data.get("candidate_order_ids") or [])
+            return Plan(
+                case_id=context.case_id,
+                goal=context.goal,
+                known_evidence_refs=context.known_evidence_refs,
+                unknowns=["unambiguous_order_id"],
+                hypotheses=[
+                    Hypothesis(
+                        label="ambiguous_or_unidentified_target_order",
+                        supporting_evidence_refs=[order_obs.evidence_id],
+                    )
+                ],
+                next_step=NextStep(
+                    kind=PlanStepKind.ASK_USER,
+                    args={
+                        "question": (
+                            f"Có nhiều đơn hàng hoặc thiếu mã định danh duy nhất "
+                            f"({', '.join(cand_orders) if cand_orders else 'chưa rõ mã đơn'}). "
+                            "Vui lòng cung cấp chính xác mã đơn hàng (order_id)."
+                        ),
+                        "candidate_refs": cand_orders,
+                    },
+                ),
+                decision_summary=(
+                    "[DEMO_RULES] Đơn hàng mục tiêu bị trùng lặp hoặc chưa đủ định danh duy nhất; "
+                    "yêu cầu khách hàng xác nhận chính xác mã đơn hàng (ASK_USER)."
+                ),
+            )
+
+        if not order_found:
+            return Plan(
+                case_id=context.case_id,
+                goal=context.goal,
+                known_evidence_refs=context.known_evidence_refs,
+                unknowns=["valid_order_id"],
+                hypotheses=[
+                    Hypothesis(
+                        label="order_not_found_in_session",
+                        supporting_evidence_refs=[order_obs.evidence_id],
+                    )
+                ],
+                next_step=NextStep(
+                    kind=PlanStepKind.ASK_USER,
+                    args={
+                        "question": (
+                            "Không tìm thấy đơn hàng khớp với mã đã cung cấp. "
+                            "Vui lòng kiểm tra và gửi lại mã đơn hàng chính xác."
+                        )
+                    },
+                ),
+                decision_summary=(
+                    "[DEMO_RULES] Không tìm thấy đơn hàng trong hệ thống; "
+                    "chuyển sang WAITING_EVIDENCE để yêu cầu mã đơn hợp lệ."
+                ),
+            )
+
+        resolved_order_id = str(order_obs.data.get("order_id") or "")
+        order_amount = int(order_obs.data.get("amount") or 0)
         order_status = str(order_obs.data.get("status") or "")
         order_payment_status = str(order_obs.data.get("payment_status") or "")
         order_version = int(order_obs.data.get("version") or 1)
 
-        # 2. Step 2: Query payment candidates from provider ledger
+        # 2. Step 2: Query payment candidates bound to this resolved order
         if "find_payment_candidates" not in called_tools:
-            pay_args: dict[str, Any] = {}
-            if resolved_order_id:
-                pay_args["order_id"] = resolved_order_id
+            pay_args: dict[str, Any] = {"order_id": resolved_order_id}
             if hint_pay_ref:
                 pay_args["provider_ref"] = hint_pay_ref
             if order_amount > 0:
@@ -370,7 +555,7 @@ class DeterministicDemoAdapter:
                 ),
                 decision_summary=(
                     "[DEMO_RULES] Đã đọc trạng thái đơn hàng; tiếp tục truy vấn "
-                    "bản ghi thanh toán từ nguồn provider để xác minh giao dịch."
+                    "bản ghi thanh toán liên kết với đơn hàng từ nguồn provider."
                 ),
             )
 
@@ -433,39 +618,14 @@ class DeterministicDemoAdapter:
                 ),
             )
 
-        # If order not found AND no payment candidates exist -> ASK_USER for valid ref
-        if not order_found and not candidates:
-            return Plan(
-                case_id=context.case_id,
-                goal=context.goal,
-                known_evidence_refs=context.known_evidence_refs,
-                unknowns=["valid_order_id", "valid_provider_transaction_ref"],
-                hypotheses=[
-                    Hypothesis(
-                        label="unmatched_claim_no_records",
-                        supporting_evidence_refs=context.known_evidence_refs,
-                    )
-                ],
-                next_step=NextStep(
-                    kind=PlanStepKind.ASK_USER,
-                    args={
-                        "question": (
-                            "Không tìm thấy đơn hàng hoặc giao dịch khớp với thông tin cung cấp. "
-                            "Vui lòng gửi mã đơn hàng và mã giao dịch chính xác."
-                        )
-                    },
-                ),
-                decision_summary=(
-                    "[DEMO_RULES] Không tìm thấy đơn hàng và bản ghi thanh toán trong hệ thống; "
-                    "chuyển sang WAITING_EVIDENCE để yêu cầu thêm bằng chứng."
-                ),
-            )
-
         primary_payment = candidates[0] if len(candidates) == 1 else None
         payment_id = str(primary_payment.get("payment_id") or "") if primary_payment else ""
+        payment_order_id = str(primary_payment.get("order_id") or "") if primary_payment else ""
         payment_status = str(primary_payment.get("status") or "NONE") if primary_payment else "NONE"
         payment_verified = bool(
-            primary_payment and primary_payment.get("authoritative_success") is True
+            primary_payment
+            and primary_payment.get("authoritative_success") is True
+            and payment_order_id == resolved_order_id
         )
         payment_amount = int(primary_payment.get("amount") or 0) if primary_payment else 0
 
@@ -476,11 +636,9 @@ class DeterministicDemoAdapter:
             or order_payment_status in ("REFUNDED", "PARTIALLY_REFUNDED")
         )
         if is_refund_flow and "get_refund_history" not in called_tools:
-            ref_args: dict[str, Any] = {}
+            ref_args: dict[str, Any] = {"order_id": resolved_order_id}
             if payment_id:
                 ref_args["payment_id"] = payment_id
-            if resolved_order_id:
-                ref_args["order_id"] = resolved_order_id
 
             return Plan(
                 case_id=context.case_id,
@@ -509,10 +667,8 @@ class DeterministicDemoAdapter:
             u.intent == IntentCategory.INVENTORY_OR_FULFILLMENT
             and "get_inventory" not in called_tools
         ):
-            inv_args: dict[str, Any] = {}
-            if resolved_order_id:
-                inv_args["order_id"] = resolved_order_id
-            elif hint_sku:
+            inv_args: dict[str, Any] = {"order_id": resolved_order_id}
+            if hint_sku:
                 inv_args["sku"] = hint_sku
 
             return Plan(
@@ -705,20 +861,20 @@ class DeterministicDemoAdapter:
                     args={
                         "question": (
                             "Bản ghi từ cổng thanh toán chưa xác nhận giao dịch thành công "
-                            f"(trạng thái: {payment_status}). Vui lòng cung cấp mã giao dịch "
-                            "hợp lệ hoặc chờ cổng thanh toán hoàn tất đối soát."
+                            f"cho đơn {resolved_order_id} (trạng thái: {payment_status}). "
+                            "Vui lòng cung cấp mã giao dịch hợp lệ hoặc chờ đối soát."
                         ),
                         "observed_payment_status": payment_status,
                     },
                 ),
                 decision_summary=(
                     f"[DEMO_RULES] Khách hàng khai báo đã thanh toán (CLAIM), nhưng bản ghi "
-                    f"nhà cung cấp có trạng thái '{payment_status}' (chưa xác thực SUCCESS). "
-                    "Tuyệt đối không xác nhận thanh toán; chuyển sang WAITING_EVIDENCE."
+                    f"nhà cung cấp cho đơn {resolved_order_id} có trạng thái '{payment_status}' "
+                    "(chưa xác thực SUCCESS). Chuyển sang WAITING_EVIDENCE."
                 ),
             )
 
-        # Verified payment exists; check if order needs synchronization
+        # Verified payment bound to this exact order exists; check if order needs sync
         if order_status == "PENDING" or order_payment_status == "UNPAID":
             if payment_amount != order_amount:
                 return Plan(
@@ -776,8 +932,8 @@ class DeterministicDemoAdapter:
                 ),
                 decision_summary=(
                     f"[DEMO_RULES] Đã xác minh bản ghi thanh toán {payment_id} (SUCCESS, "
-                    f"{payment_amount} VND) khớp với đơn hàng {resolved_order_id} đang PENDING; "
-                    "đề xuất hành động đồng bộ trạng thái đơn hàng (propose_order_sync)."
+                    f"{payment_amount} VND) liên kết trực tiếp với đơn hàng {resolved_order_id} "
+                    "đang PENDING; đề xuất hành động đồng bộ trạng thái đơn (propose_order_sync)."
                 ),
             )
 

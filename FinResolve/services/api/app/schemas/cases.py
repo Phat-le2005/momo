@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -101,6 +101,8 @@ class CaseStatusResponse(BaseModel):
     model_mode: str | None = None
     latest_decision_summary: str | None = None
     pending_proposals_count: int = 0
+    active_run_id: str | None = None
+    investigation_status: Literal["IDLE", "RUNNING", "COMPLETED", "FAILED"] = "IDLE"
 
 
 class InvestigateCaseRequest(BaseModel):
@@ -109,3 +111,25 @@ class InvestigateCaseRequest(BaseModel):
         default=False,
         description="Cờ mô phỏng timeout từ cổng thanh toán để kiểm thử QA T04 (UNKNOWN_OUTCOME)",
     )
+    run_async: bool = Field(
+        default=False,
+        description="Chạy điều tra bất đồng bộ trong background worker và trả về run_id để polling",
+    )
+
+
+class InvestigationJobStatusResponse(BaseModel):
+    run_id: str
+    case_id: str
+    session_id: str
+    job_status: Literal["RUNNING", "COMPLETED", "FAILED"]
+    case_state: str
+    case_version: int
+    model_mode: str
+    steps_executed: int = 0
+    stop_reason: str | None = None
+    decision_summary: str | None = None
+    proposed_action_ids: list[str] = []
+    risk_signal_ids: list[str] = []
+    error_message: str | None = None
+    started_at: datetime
+    completed_at: datetime | None = None

@@ -5,13 +5,18 @@ Hard Domain Invariants:
    or terminal step (ASK_USER / PROPOSE_ACTION / ESCALATE / STOP) -> persist Evidence & CaseEvent
    -> observe -> replan.
 2. Enforces strict step limit (`max_steps=6`), replan limit (`max_replans=2`), wall-clock timeout,
-   token budget, and duplicate tool-call loop prevention.
+   token budget, `plan.case_id == case.id` verification, and duplicate tool-call loop prevention.
 3. Never trusts customer claims or LLM assertions as payment proof:
-   Every `PROPOSE_ACTION` is checked against authoritative `OBSERVED_FACT` records in PostgreSQL.
-4. AI only proposes actions (`ActionProposal` with `status=PROPOSED`); it NEVER executes writes
+   Every `PROPOSE_ACTION` is checked against authoritative `OBSERVED_FACT` provenance gathered
+   in the current investigation AND verified against PostgreSQL relationships:
+   - `payment.order_id == order.id` (an `ORDER_SYNC` or `REFUND_EXECUTE` can NEVER use a payment
+     belonging to another order, even if amounts match).
+   - Valid merchant relationship (`payment.merchant_id` present and verified), matching amount
+     and currency, `payment.status == "SUCCESS"`, and `payment.verified_at IS NOT NULL`.
+4. Defensive Argument Validation: Invalid model output or malformed argument types/references
+   fail safely into `PLAN_VALIDATION_FAILED` / `UNSAFE_PROPOSAL_BLOCKED`, never HTTP 500.
+5. AI only proposes actions (`ActionProposal` with `status=PROPOSED`); it NEVER executes writes
    to `SimOrder`, `SimPayment`, or `SimRefund`, and NEVER transitions a Case to `RESOLVED`.
-5. No hidden chain-of-thought is stored or exposed; only concise structured `decision_summary`,
-   `known_evidence_refs`, `unknowns`, `hypotheses`, and tool provenance metadata are persisted.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from app.ai_core.schemas import (
     InvestigationStepTrace,
     PlanStepKind,
     ToolObservationRecord,
+    is_strict_int,
 )
 from app.ai_core.understanding import analyze_vietnamese_complaint
 from app.cases.state_machine import can_transition, transition_case
@@ -87,10 +93,11 @@ class BoundedAgentRuntime:
         case_id: str,
         session_id: str,
         simulate_timeout: bool = False,
+        run_id: str | None = None,
     ) -> InvestigationRunResult:
         """Execute a bounded investigation loop for a session-scoped Case."""
         start_monotonic = time.monotonic()
-        run_id = f"RUN-{uuid.uuid4().hex[:10].upper()}"
+        effective_run_id = run_id or f"RUN-{uuid.uuid4().hex[:10].upper()}"
 
         case = self._db.scalar(
             select(Case).where(Case.id == case_id, Case.session_id == session_id)
@@ -134,9 +141,9 @@ class BoundedAgentRuntime:
                     self._db,
                     case,
                     CaseState.INVESTIGATING,
-                    reason=f"Bắt đầu phiên điều tra AI ({run_id})",
+                    reason=f"Bắt đầu phiên điều tra AI ({effective_run_id})",
                     extra_payload={
-                        "run_id": run_id,
+                        "run_id": effective_run_id,
                         "model_mode": self._adapter.mode.value,
                         "adapter_name": self._adapter.adapter_name,
                     },
@@ -170,7 +177,8 @@ class BoundedAgentRuntime:
             case=case,
             event_type="INVESTIGATION_STARTED",
             payload={
-                "run_id": run_id,
+                "run_id": effective_run_id,
+                "job_status": "RUNNING",
                 "model_mode": self._adapter.mode.value,
                 "adapter_name": self._adapter.adapter_name,
                 "is_fallback": self._adapter.mode.value == "DEMO_RULES",
@@ -185,7 +193,7 @@ class BoundedAgentRuntime:
                 case=case,
                 event_type="PROMPT_INJECTION_GUARD_TRIGGERED",
                 payload={
-                    "run_id": run_id,
+                    "run_id": effective_run_id,
                     "patterns": understanding.prompt_injection_patterns,
                     "action": "ISOLATED_AS_UNTRUSTED_DATA",
                 },
@@ -222,7 +230,7 @@ class BoundedAgentRuntime:
                     case=case,
                     event_type="BUDGET_EXHAUSTED",
                     payload={
-                        "run_id": run_id,
+                        "run_id": effective_run_id,
                         "reason": stop_reason,
                         "elapsed_seconds": round(elapsed_s, 3),
                         "max_wall_time_seconds": self._max_wall_time_seconds,
@@ -245,7 +253,7 @@ class BoundedAgentRuntime:
                     case=case,
                     event_type="BUDGET_EXHAUSTED",
                     payload={
-                        "run_id": run_id,
+                        "run_id": effective_run_id,
                         "reason": stop_reason,
                         "total_tokens_used": total_tokens_used,
                         "token_budget": self._token_budget,
@@ -268,9 +276,16 @@ class BoundedAgentRuntime:
                 validation_error_feedback=validation_feedback,
             )
 
-            # 2. Request structured Plan from ModelAdapter (QA T16)
+            # 2. Request structured Plan from ModelAdapter & verify plan.case_id (QA T16 & Req 3)
             try:
                 invocation = self._adapter.generate_plan(context)
+                if not isinstance(invocation.plan.case_id, str) or (
+                    invocation.plan.case_id != case.id
+                ):
+                    raise ValueError(
+                        f"Planner case_id mismatch: expected '{case.id}', "
+                        f"got '{invocation.plan.case_id}'"
+                    )
                 validation_feedback = None
             except Exception as exc:  # noqa: BLE001
                 replans_used += 1
@@ -280,7 +295,7 @@ class BoundedAgentRuntime:
                     case=case,
                     event_type="PLAN_VALIDATION_FAILED",
                     payload={
-                        "run_id": run_id,
+                        "run_id": effective_run_id,
                         "step": current_step_num,
                         "replan_attempt": replans_used,
                         "max_replans": self._max_replans,
@@ -312,7 +327,7 @@ class BoundedAgentRuntime:
                     case=case,
                     event_type="BUDGET_EXHAUSTED",
                     payload={
-                        "run_id": run_id,
+                        "run_id": effective_run_id,
                         "reason": stop_reason,
                         "total_tokens_used": total_tokens_used,
                         "token_budget": self._token_budget,
@@ -336,7 +351,7 @@ class BoundedAgentRuntime:
                 case=case,
                 event_type="AI_PLAN_GENERATED",
                 payload={
-                    "run_id": run_id,
+                    "run_id": effective_run_id,
                     "step": steps_executed,
                     "model_mode": invocation.model_mode.value,
                     "adapter_name": invocation.adapter_name,
@@ -362,7 +377,7 @@ class BoundedAgentRuntime:
             if step_kind == PlanStepKind.READ_TOOL:
                 tool_name = str(plan.next_step.tool_name)
                 tool_args = dict(plan.next_step.args)
-                signature = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+                signature = f"{tool_name}:{json.dumps(tool_args, sort_keys=True, default=str)}"
 
                 # Prevent duplicate tool call loops
                 if signature in executed_tool_signatures:
@@ -455,7 +470,7 @@ class BoundedAgentRuntime:
                     case=case,
                     event_type="TOOL_READ_COMPLETED",
                     payload={
-                        "run_id": run_id,
+                        "run_id": effective_run_id,
                         "step": steps_executed,
                         "tool_name": tool_name,
                         "args": tool_args,
@@ -511,7 +526,7 @@ class BoundedAgentRuntime:
                 case, stop_reason = self._handle_propose_action(
                     case=case,
                     session_id=session_id,
-                    run_id=run_id,
+                    run_id=effective_run_id,
                     action_name=str(plan.next_step.action_type or plan.next_step.tool_name),
                     args=plan.next_step.args,
                     decision_summary=plan.decision_summary,
@@ -563,7 +578,7 @@ class BoundedAgentRuntime:
                 case=case,
                 event_type="STEP_BUDGET_REACHED",
                 payload={
-                    "run_id": run_id,
+                    "run_id": effective_run_id,
                     "steps_executed": steps_executed,
                     "max_steps": self._max_steps,
                 },
@@ -587,7 +602,8 @@ class BoundedAgentRuntime:
             case=case,
             event_type="INVESTIGATION_COMPLETED",
             payload={
-                "run_id": run_id,
+                "run_id": effective_run_id,
+                "job_status": "COMPLETED",
                 "final_state": case.state,
                 "stop_reason": stop_reason,
                 "steps_executed": steps_executed,
@@ -608,7 +624,7 @@ class BoundedAgentRuntime:
         self._db.refresh(case)
 
         return InvestigationRunResult(
-            run_id=run_id,
+            run_id=effective_run_id,
             case_id=case.id,
             session_id=session_id,
             final_state=case.state,
@@ -630,6 +646,48 @@ class BoundedAgentRuntime:
             risk_signal_ids=risk_signal_ids,
         )
 
+    @staticmethod
+    def _collect_authoritative_provenance(
+        tool_observations: list[ToolObservationRecord],
+    ) -> tuple[set[str], dict[str, dict[str, Any]], list[str]]:
+        """Extract verified entity IDs and provenance from OBSERVED_FACT tool observations.
+
+        Returns `(observed_order_ids, observed_payments_by_id, authoritative_evidence_ids)`.
+        Only includes orders that were unambiguously found (`found=True, is_ambiguous=False`)
+        and payments from non-ambiguous provider queries (`is_ambiguous=False`).
+        """
+        observed_order_ids: set[str] = set()
+        observed_payments: dict[str, dict[str, Any]] = {}
+        evidence_ids: list[str] = []
+
+        for obs in tool_observations:
+            if obs.status != "OK":
+                continue
+            evidence_ids.append(obs.evidence_id)
+            if obs.tool_name == "get_order":
+                if obs.data.get("found") is True and not obs.data.get("is_ambiguous"):
+                    oid = obs.data.get("order_id")
+                    if isinstance(oid, str) and oid.strip():
+                        observed_order_ids.add(oid.strip())
+            elif obs.tool_name == "find_payment_candidates":
+                if not obs.data.get("is_ambiguous") and not obs.data.get(
+                    "unanchored_amount_search"
+                ):
+                    cands = obs.data.get("candidates")
+                    if isinstance(cands, list) and len(cands) == 1:
+                        cand = cands[0]
+                        if isinstance(cand, dict):
+                            pid = cand.get("payment_id")
+                            if isinstance(pid, str) and pid.strip():
+                                observed_payments[pid.strip()] = cand
+            elif obs.tool_name == "get_payment_record":
+                if obs.data.get("found") is True:
+                    pid = obs.data.get("payment_id")
+                    if isinstance(pid, str) and pid.strip():
+                        observed_payments[pid.strip()] = obs.data
+
+        return observed_order_ids, observed_payments, evidence_ids
+
     def _handle_propose_action(
         self,
         *,
@@ -645,12 +703,22 @@ class BoundedAgentRuntime:
     ) -> tuple[Case, str]:
         """Deterministic Backend Policy Gate before persisting any AI ActionProposal.
 
-        Invariants:
-        - Never trusts customer claims or LLM assertions.
-        - Verifies authoritative DB records and OBSERVED_FACT evidence before creating a proposal.
-        - Never executes writes directly; only creates an ActionProposal(status=PROPOSED).
+        Hard Invariants:
+        1. Never trusts customer claims or LLM assertions.
+        2. Verifies argument types defensively (never raises HTTP 500 on malformed model args).
+        3. Verifies authoritative `OBSERVED_FACT` provenance: the target `order_id` and
+           `payment_id` must have been read from authoritative tools during this Case's run.
+        4. Verifies Order / Payment / Merchant relationships in PostgreSQL:
+           - `payment.order_id == order.id` (an `ORDER_SYNC` or `REFUND_EXECUTE` can NEVER use a
+             successful payment belonging to another order).
+           - Valid merchant ID (`payment.merchant_id`), matching `amount` and `currency`,
+             `payment.status == "SUCCESS"`, and `payment.verified_at IS NOT NULL`.
+        5. Never executes writes directly; only creates an `ActionProposal(status=PROPOSED)`.
         """
-        fact_evidence_ids = [obs.evidence_id for obs in tool_observations if obs.status == "OK"]
+        observed_orders, observed_payments, fact_evidence_ids = (
+            self._collect_authoritative_provenance(tool_observations)
+        )
+
         normalized_action = (
             ActionType.ORDER_SYNC.value
             if action_name in ("propose_order_sync", "ORDER_SYNC")
@@ -659,7 +727,7 @@ class BoundedAgentRuntime:
             else ActionType.HOLD_ORDER.value
         )
 
-        # 1. Require that the planner actually read authoritative evidence first
+        # 1. Require authoritative tool observations first
         if not fact_evidence_ids:
             risk = self._create_risk_signal(
                 case=case,
@@ -688,10 +756,46 @@ class BoundedAgentRuntime:
             )
             return case, "UNVERIFIED_PROPOSAL_BLOCKED"
 
-        # 2. Validate ORDER_SYNC proposal against authoritative DB state
+        # 2. Validate ORDER_SYNC proposal
         if normalized_action == ActionType.ORDER_SYNC.value:
-            order_id = str(args.get("order_id") or "").strip()
-            payment_id = str(args.get("payment_id") or "").strip()
+            raw_order_id = args.get("order_id")
+            raw_payment_id = args.get("payment_id")
+            raw_amount = args.get("amount")
+            raw_exp_version = args.get("expected_order_version")
+
+            if (
+                not isinstance(raw_order_id, str)
+                or not raw_order_id.strip()
+                or not isinstance(raw_payment_id, str)
+                or not raw_payment_id.strip()
+                or (raw_amount is not None and (not is_strict_int(raw_amount) or raw_amount <= 0))
+                or (
+                    raw_exp_version is not None
+                    and (not is_strict_int(raw_exp_version) or raw_exp_version < 1)
+                )
+            ):
+                self._record_event(
+                    case=case,
+                    event_type="UNSAFE_PROPOSAL_BLOCKED",
+                    payload={
+                        "run_id": run_id,
+                        "attempted_action": "ORDER_SYNC",
+                        "reason": "INVALID_ACTION_ARGUMENTS",
+                    },
+                )
+                case = self._safe_transition(
+                    case,
+                    CaseState.ESCALATED,
+                    reason="Chặn đề xuất ORDER_SYNC do tham số đầu ra từ model không hợp lệ.",
+                )
+                return case, "INVALID_ACTION_ARGUMENTS_BLOCKED"
+
+            order_id = raw_order_id.strip()
+            payment_id = raw_payment_id.strip()
+
+            # Check authoritative evidence provenance: both order_id and payment_id must have
+            # been observed in this investigation's tool reads!
+            has_provenance = (order_id in observed_orders) and (payment_id in observed_payments)
 
             order = self._db.scalar(
                 select(SimOrder).where(
@@ -706,7 +810,6 @@ class BoundedAgentRuntime:
                 )
             )
 
-            # Check for ambiguous multiple payments on this order/amount
             matching_payments = list(
                 self._db.scalars(
                     select(SimPayment).where(
@@ -716,17 +819,46 @@ class BoundedAgentRuntime:
                 ).all()
             )
 
-            is_payment_verified = (
+            # HARD INVARIANT 1:
+            # - payment.order_id MUST equal order.id (never use another order's payment!)
+            # - payment.merchant_id must be valid and non-empty
+            # - authoritative evidence provenance must exist
+            # - payment must be verified SUCCESS with matching amount and currency
+            is_same_order_payment = (
+                order is not None
+                and payment is not None
+                and payment.order_id is not None
+                and payment.order_id == order.id
+            )
+            is_merchant_valid = (
                 payment is not None
+                and bool(payment.merchant_id and payment.merchant_id.strip())
+                and payment.source_mode == (order.source_mode if order else "MOCK")
+            )
+            is_payment_verified = (
+                has_provenance
+                and is_same_order_payment
+                and is_merchant_valid
+                and payment is not None
+                and order is not None
                 and payment.status == PaymentStatus.SUCCESS.value
                 and payment.verified_at is not None
-                and order is not None
+                and payment.result_code == 0
                 and payment.amount == order.amount
                 and payment.currency == order.currency
-                and len(matching_payments) <= 1
+                and (raw_amount is None or int(raw_amount) == order.amount)
+                and len(matching_payments) == 1
+                and matching_payments[0].id == payment.id
             )
 
             if not is_payment_verified or order is None or payment is None:
+                block_reason = (
+                    "MISSING_AUTHORITATIVE_EVIDENCE_PROVENANCE"
+                    if not has_provenance
+                    else "CROSS_ORDER_PAYMENT_MISMATCH"
+                    if (payment is not None and order is not None and payment.order_id != order.id)
+                    else "PAYMENT_NOT_VERIFIED_SUCCESS"
+                )
                 risk = self._create_risk_signal(
                     case=case,
                     session_id=session_id,
@@ -736,9 +868,13 @@ class BoundedAgentRuntime:
                     evidence_refs=fact_evidence_ids,
                     details={
                         "attempted_action": "ORDER_SYNC",
+                        "block_reason": block_reason,
                         "order_id": order_id,
                         "payment_id": payment_id,
+                        "payment_bound_order_id": payment.order_id if payment else None,
+                        "payment_merchant_id": payment.merchant_id if payment else None,
                         "payment_status": payment.status if payment else "MISSING",
+                        "has_provenance": has_provenance,
                         "verified_at": (
                             payment.verified_at.isoformat()
                             if (payment and payment.verified_at)
@@ -753,7 +889,7 @@ class BoundedAgentRuntime:
                     payload={
                         "run_id": run_id,
                         "attempted_action": "ORDER_SYNC",
-                        "reason": "PAYMENT_NOT_VERIFIED_SUCCESS",
+                        "reason": block_reason,
                         "risk_signal_id": risk.id,
                     },
                 )
@@ -761,8 +897,8 @@ class BoundedAgentRuntime:
                     case,
                     CaseState.WAITING_EVIDENCE,
                     reason=(
-                        "Chặn đề xuất ORDER_SYNC: Bản ghi thanh toán chưa được xác thực SUCCESS "
-                        "hoặc không khớp với đơn hàng."
+                        f"Chặn đề xuất ORDER_SYNC ({block_reason}): Bản ghi thanh toán không thuộc "
+                        "đơn hàng này, thiếu provenance hoặc chưa được xác thực SUCCESS."
                     ),
                 )
                 return case, "UNVERIFIED_PAYMENT_BLOCKED"
@@ -775,6 +911,7 @@ class BoundedAgentRuntime:
                 params_json={
                     "order_id": order.id,
                     "payment_id": payment.id,
+                    "merchant_id": payment.merchant_id,
                     "amount": payment.amount,
                     "currency": payment.currency,
                     "expected_order_version": order.version,
@@ -811,9 +948,40 @@ class BoundedAgentRuntime:
 
         # 3. Validate REFUND_EXECUTE proposal against authoritative payment & refund history
         if normalized_action == ActionType.REFUND_EXECUTE.value:
-            payment_id = str(args.get("payment_id") or "").strip()
-            order_id = str(args.get("order_id") or "").strip()
-            req_amount = int(args.get("amount") or 0)
+            raw_payment_id = args.get("payment_id")
+            raw_order_id = args.get("order_id")
+            raw_amount = args.get("amount")
+
+            if (
+                not isinstance(raw_payment_id, str)
+                or not raw_payment_id.strip()
+                or (raw_order_id is not None and not isinstance(raw_order_id, str))
+                or not is_strict_int(raw_amount)
+                or int(raw_amount) <= 0
+            ):
+                self._record_event(
+                    case=case,
+                    event_type="UNSAFE_PROPOSAL_BLOCKED",
+                    payload={
+                        "run_id": run_id,
+                        "attempted_action": "REFUND_EXECUTE",
+                        "reason": "INVALID_ACTION_ARGUMENTS",
+                    },
+                )
+                case = self._safe_transition(
+                    case,
+                    CaseState.ESCALATED,
+                    reason="Chặn đề xuất hoàn tiền do tham số đầu ra từ model không hợp lệ.",
+                )
+                return case, "INVALID_ACTION_ARGUMENTS_BLOCKED"
+
+            payment_id = raw_payment_id.strip()
+            order_id = raw_order_id.strip() if isinstance(raw_order_id, str) else ""
+            req_amount = int(raw_amount)
+
+            has_provenance = (payment_id in observed_payments) and (
+                not order_id or order_id in observed_orders
+            )
 
             payment = self._db.scalar(
                 select(SimPayment).where(
@@ -821,18 +989,16 @@ class BoundedAgentRuntime:
                     SimPayment.id == payment_id,
                 )
             )
-            if payment is None and order_id:
-                payment = self._db.scalar(
-                    select(SimPayment).where(
-                        SimPayment.session_id == session_id,
-                        SimPayment.order_id == order_id,
-                    )
-                )
+
+            is_order_match = not order_id or (payment is not None and payment.order_id == order_id)
 
             if (
-                payment is None
+                not has_provenance
+                or not is_order_match
+                or payment is None
                 or payment.status != PaymentStatus.SUCCESS.value
                 or payment.verified_at is None
+                or not (payment.merchant_id and payment.merchant_id.strip())
             ):
                 risk = self._create_risk_signal(
                     case=case,
@@ -841,13 +1007,35 @@ class BoundedAgentRuntime:
                     level=RiskLevel.HIGH.value,
                     response=RiskResponse.HOLD_ACTION.value,
                     evidence_refs=fact_evidence_ids,
-                    details={"reason": "Cannot propose refund on unverified or missing payment"},
+                    details={
+                        "reason": (
+                            "Cannot propose refund on unverified, cross-order, "
+                            "or unprovenanced payment"
+                        ),
+                        "payment_id": payment_id,
+                        "order_id": order_id,
+                        "has_provenance": has_provenance,
+                        "is_order_match": is_order_match,
+                    },
                 )
                 risk_signal_ids.append(risk.id)
+                self._record_event(
+                    case=case,
+                    event_type="UNSAFE_PROPOSAL_BLOCKED",
+                    payload={
+                        "run_id": run_id,
+                        "attempted_action": "REFUND_EXECUTE",
+                        "reason": "UNVERIFIED_OR_CROSS_ORDER_PAYMENT",
+                        "risk_signal_id": risk.id,
+                    },
+                )
                 case = self._safe_transition(
                     case,
                     CaseState.WAITING_EVIDENCE,
-                    reason="Chặn đề xuất hoàn tiền: Giao dịch gốc chưa xác thực SUCCESS.",
+                    reason=(
+                        "Chặn đề xuất hoàn tiền: Giao dịch gốc chưa xác thực SUCCESS, "
+                        "không khớp đơn hàng hoặc thiếu provenance."
+                    ),
                 )
                 return case, "UNVERIFIED_PAYMENT_BLOCKED"
 
@@ -872,7 +1060,7 @@ class BoundedAgentRuntime:
                 for r in existing_refunds
             )
             remaining_balance = payment.amount - used_balance
-            target_amount = req_amount if req_amount > 0 else payment.amount
+            target_amount = req_amount
 
             if remaining_balance <= 0 or target_amount > remaining_balance:
                 cat = (
@@ -927,6 +1115,7 @@ class BoundedAgentRuntime:
                 params_json={
                     "payment_id": payment.id,
                     "order_id": payment.order_id,
+                    "merchant_id": payment.merchant_id,
                     "amount": target_amount,
                     "currency": payment.currency,
                     "reason": str(args.get("reason") or decision_summary),

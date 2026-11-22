@@ -1,8 +1,9 @@
-"""Comprehensive tests for Prompt 02: Self-Built Bounded Agentic AI Core.
+"""Comprehensive tests for Prompt 02 & Commit 1869edf Hardening: Bounded Agentic AI Core.
 
 Covers:
 1. Pydantic Plan schema validation (rejects hallucinated tools, write tools,
-   `payment_verified` privilege escalation, and arbitrary external URLs - QA T16).
+   `payment_verified` privilege escalation, bad argument types, boolean/negative amounts,
+   and arbitrary external URLs - QA T16).
 2. Vietnamese complaint understanding & prompt-injection detection/isolation (QA T15).
 3. All 7 scoped READ-only business tools against PostgreSQL simulator tables.
 4. E2E Investigation T01: Verified provider payment + pending order -> propose_order_sync
@@ -16,6 +17,16 @@ Covers:
 9. Real LLMModelAdapter HTTPX integration (OpenAI & Gemini JSON mode + token tracking).
 10. Step limit, replan limit, token budget, duplicate tool loop prevention, session isolation,
     and per-case investigation quota enforcement (QA T16, T17, T18, T19, T22).
+11. Commit 1869edf Hardening Regressions:
+    - Cross-order payment isolation: ORDER_SYNC never uses a successful payment belonging
+      to another order even when amounts match; validates order/payment/merchant relationships
+      and authoritative evidence provenance.
+    - No default ORD-SYNC/ORD-REF selection for generic complaints without reliable identifiers.
+    - Ambiguous orders (multiple orders matching prefix or phone) -> ASK_USER / WAITING_EVIDENCE.
+    - Planner `case_id` mismatch rejection in both LLMModelAdapter and BoundedAgentRuntime.
+    - Malicious/malformed model argument types and references fail safely without HTTP 500.
+    - Async investigation background job (`run_async=True`, HTTP 202) and polling endpoint
+      (`GET /api/v1/cases/{case_id}/investigations/{run_id}`).
 """
 
 from __future__ import annotations
@@ -46,7 +57,7 @@ from app.ai_core.understanding import analyze_vietnamese_complaint
 from app.connectors.read_tools import ReadToolRegistry
 from app.core.config import ModelMode, Settings
 from app.db.session import get_sessionmaker
-from app.models.cases import Case, Evidence
+from app.models.cases import Case, CaseEvent, Evidence
 from app.models.enums import (
     CaseState,
     EvidenceKind,
@@ -148,6 +159,73 @@ def test_plan_schema_rejects_hallucinated_tools_and_privileged_fields() -> None:
             }
         )
     assert "Unauthorized action proposal" in str(exc_act.value)
+
+
+def test_plan_schema_validates_action_argument_types_and_references() -> None:
+    """Hardening 4: Reject boolean amounts, negative amounts, non-string IDs, and missing refs."""
+    # Boolean amount (in Python bool is a subclass of int, must be rejected!)
+    with pytest.raises(ValidationError) as exc_bool_amt:
+        Plan.model_validate(
+            {
+                "case_id": "CASE-001",
+                "goal": "Reject boolean amount",
+                "next_step": {
+                    "kind": "PROPOSE_ACTION",
+                    "action_type": "propose_refund",
+                    "args": {"payment_id": "PAY-001", "amount": True},
+                },
+                "decision_summary": "Boolean amount test.",
+            }
+        )
+    assert "strict integer" in str(exc_bool_amt.value)
+
+    # Negative amount
+    with pytest.raises(ValidationError) as exc_neg_amt:
+        Plan.model_validate(
+            {
+                "case_id": "CASE-001",
+                "goal": "Reject negative amount",
+                "next_step": {
+                    "kind": "PROPOSE_ACTION",
+                    "action_type": "propose_refund",
+                    "args": {"payment_id": "PAY-001", "amount": -250000},
+                },
+                "decision_summary": "Negative amount test.",
+            }
+        )
+    assert "between 1 and 100,000,000,000" in str(exc_neg_amt.value)
+
+    # Non-string order_id
+    with pytest.raises(ValidationError) as exc_bad_oid:
+        Plan.model_validate(
+            {
+                "case_id": "CASE-001",
+                "goal": "Reject non-string order_id",
+                "next_step": {
+                    "kind": "READ_TOOL",
+                    "tool_name": "get_order",
+                    "args": {"order_id": 123456},
+                },
+                "decision_summary": "Non-string order_id.",
+            }
+        )
+    assert "must be a string" in str(exc_bad_oid.value)
+
+    # Missing payment_id in ORDER_SYNC proposal
+    with pytest.raises(ValidationError) as exc_missing_pid:
+        Plan.model_validate(
+            {
+                "case_id": "CASE-001",
+                "goal": "Reject ORDER_SYNC without payment_id",
+                "next_step": {
+                    "kind": "PROPOSE_ACTION",
+                    "action_type": "propose_order_sync",
+                    "args": {"order_id": "ORD-001"},
+                },
+                "decision_summary": "Missing payment_id.",
+            }
+        )
+    assert "requires a non-empty string 'payment_id'" in str(exc_missing_pid.value)
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +334,6 @@ def test_e2e_investigation_t01_payment_sync_proposes_action_without_direct_write
     session_id = active_session["id"]
     headers = {"X-Demo-Session": token}
 
-    # Step 1: Customer creates Vietnamese complaint about paid MoMo order still pending
     create_res = client.post(
         "/api/v1/cases",
         headers=headers,
@@ -271,7 +348,6 @@ def test_e2e_investigation_t01_payment_sync_proposes_action_without_direct_write
     assert create_res.status_code == 201
     case_id = create_res.json()["id"]
 
-    # Step 2: Trigger bounded AI investigation
     inv_res = client.post(f"/api/v1/cases/{case_id}/investigate", headers=headers)
     assert inv_res.status_code == 200
     result = inv_res.json()
@@ -304,6 +380,7 @@ def test_e2e_investigation_t01_payment_sync_proposes_action_without_direct_write
     assert proposal["action_type"] == "ORDER_SYNC"
     assert proposal["status"] == "PROPOSED"
     assert proposal["params_json"]["amount"] == 250000
+    assert proposal["params_json"]["merchant_id"] == "MERCHANT_MOCK_01"
 
     # CRITICAL INVARIANT: AI only proposed the action; SimOrder in DB is still PENDING/UNPAID!
     maker = get_sessionmaker()
@@ -330,7 +407,6 @@ def test_e2e_investigation_t02_unverified_claim_transitions_to_waiting_evidence(
     token = active_session["token"]
     headers = {"X-Demo-Session": token}
 
-    # Customer claims paid for ORD-DELAY (where provider payment is PENDING, not SUCCESS)
     create_res = client.post(
         "/api/v1/cases",
         headers=headers,
@@ -396,10 +472,16 @@ def test_runtime_blocks_rogue_model_attempting_order_sync_on_unverified_payment(
                 return "RogueOrderSyncAdapter"
 
             def generate_plan(self, context: InvestigationContext) -> ModelInvocationResult:
-                if not context.tool_observations:
+                if len(context.tool_observations) == 0:
                     step = NextStep(
                         kind=PlanStepKind.READ_TOOL,
                         tool_name="get_order",
+                        args={"order_id": delay_order.id},
+                    )
+                elif len(context.tool_observations) == 1:
+                    step = NextStep(
+                        kind=PlanStepKind.READ_TOOL,
+                        tool_name="find_payment_candidates",
                         args={"order_id": delay_order.id},
                     )
                 else:
@@ -447,7 +529,6 @@ def test_e2e_investigation_t03_two_ambiguous_payment_candidates_asks_user(
     session_id = active_session["id"]
     headers = {"X-Demo-Session": token}
 
-    # Seed an order with TWO candidate payments of the same amount (320,000 VND)
     maker = get_sessionmaker()
     with maker() as db:
         ambig_order = SimOrder(
@@ -542,7 +623,6 @@ def test_e2e_investigation_t04_provider_timeout_sets_unknown_outcome(
     assert result["stop_reason"] == "PROVIDER_TIMEOUT_UNKNOWN"
     assert len(result["proposed_action_ids"]) == 0
 
-    # Verify UNKNOWN Evidence was persisted
     case_res = client.get(f"/api/v1/cases/{case_id}", headers=headers)
     evidence_kinds = [e["kind"] for e in case_res.json()["evidence"]]
     assert EvidenceKind.UNKNOWN.value in evidence_kinds
@@ -581,7 +661,6 @@ def test_e2e_investigation_t07_duplicate_refund_blocked_with_scoped_risk_signal(
     assert len(result["proposed_action_ids"]) == 0
     assert len(result["risk_signal_ids"]) == 1
 
-    # Verify RiskSignal is attached to the Case with HOLD_ACTION and no fraud accusation
     case_data = client.get(f"/api/v1/cases/{case_id}", headers=headers).json()
     assert len(case_data["risk_signals"]) == 1
     risk = case_data["risk_signals"][0]
@@ -629,7 +708,6 @@ def test_llm_model_adapter_openai_and_gemini_transport(
             req_body = json.loads(request.content.decode("utf-8"))
             assert req_body["model"] == "gpt-4o-mini"
             assert req_body["response_format"] == {"type": "json_object"}
-            # Untrusted customer message must be enclosed in <UNTRUSTED_CUSTOMER_DATA>
             user_content = req_body["messages"][1]["content"]
             assert "<UNTRUSTED_CUSTOMER_DATA>" in user_content
 
@@ -756,7 +834,6 @@ def test_runtime_handles_invalid_llm_output_and_enforces_max_replans_t16(
             return "BrokenJSONAdapter"
 
         def generate_plan(self, context: InvestigationContext) -> ModelInvocationResult:
-            # Simulate invalid tool validation error from LLM output
             Plan.model_validate({"invalid": "schema"})
             raise AssertionError("Unreachable")
 
@@ -800,7 +877,10 @@ def test_runtime_enforces_step_and_token_budgets_t17(
     res2 = client.post(
         "/api/v1/cases",
         headers={"X-Demo-Session": token},
-        json={"text": "Khiếu nại kiểm thử ngân sách token", "type": "PAYMENT_DISPUTE"},
+        json={
+            "text": "Khiếu nại đơn hàng ORD-SYNC kiểm thử ngân sách token",
+            "type": "PAYMENT_DISPUTE",
+        },
     )
     case2_id = res2.json()["id"]
 
@@ -845,7 +925,6 @@ def test_session_isolation_and_investigation_rate_limit_t18_t19(
 ) -> None:
     token_a = active_session["token"]
 
-    # Create Case in Session A
     create_res = client.post(
         "/api/v1/cases",
         headers={"X-Demo-Session": token_a},
@@ -853,7 +932,6 @@ def test_session_isolation_and_investigation_rate_limit_t18_t19(
     )
     case_id = create_res.json()["id"]
 
-    # Create Session B
     sess_b_res = client.post("/api/v1/demo/sessions")
     token_b = sess_b_res.json()["token"]
 
@@ -879,3 +957,458 @@ def test_session_isolation_and_investigation_rate_limit_t18_t19(
     )
     assert rate_limited_res.status_code == 429
     assert rate_limited_res.json()["error"]["code"] == "RATE_LIMITED"
+
+
+# ---------------------------------------------------------------------------
+# 11. Commit 1869edf Hardening Regression Tests
+# ---------------------------------------------------------------------------
+
+
+def test_hardening1_order_sync_never_uses_payment_from_another_order_with_same_amount(
+    client: TestClient, active_session: dict[str, str]
+) -> None:
+    """Requirement 1 & 5:
+    An unpaid order of 250,000 VND must NEVER be synced using a verified SUCCESS
+    payment of 250,000 VND that belongs to a different order!
+    Also validates evidence provenance (cannot propose action on an unobserved payment)."""
+    token = active_session["token"]
+    session_id = active_session["id"]
+    headers = {"X-Demo-Session": token}
+
+    maker = get_sessionmaker()
+    with maker() as db:
+        # Note: seeded session already has ORD-SYNC-<suffix> (250,000 VND) with a
+        # verified SUCCESS payment PAY-SYNC-<suffix> (250,000 VND).
+        # Now create an unrelated unpaid order ORD-UNPAID-SAME-AMT with the exact same 250,000 VND!
+        unpaid_order = SimOrder(
+            id="ORD-UNPAID-SAME-AMT",
+            session_id=session_id,
+            customer_name="Hoàng Văn Giả",
+            customer_phone="0944555666",
+            amount=250000,
+            currency="VND",
+            subtotal=250000,
+            grand_total=250000,
+            status=OrderStatus.PENDING.value,
+            payment_status=OrderPaymentStatus.UNPAID.value,
+        )
+        db.add(unpaid_order)
+        db.commit()
+
+        other_paid_payment = db.scalar(
+            select(SimPayment).where(
+                SimPayment.session_id == session_id,
+                SimPayment.amount == 250000,
+                SimPayment.status == PaymentStatus.SUCCESS.value,
+            )
+        )
+        assert other_paid_payment is not None
+        assert other_paid_payment.order_id != unpaid_order.id
+
+    # 11a. Standard investigation for ORD-UNPAID-SAME-AMT (claiming paid 250,000đ)
+    create_res = client.post(
+        "/api/v1/cases",
+        headers=headers,
+        json={
+            "text": (
+                "Tôi đã thanh toán 250.000đ cho đơn hàng ORD-UNPAID-SAME-AMT, "
+                "vui lòng xác nhận đơn ngay!"
+            ),
+            "type": "PAYMENT_DISPUTE",
+        },
+    )
+    case_id = create_res.json()["id"]
+
+    inv_res = client.post(f"/api/v1/cases/{case_id}/investigate", headers=headers)
+    assert inv_res.status_code == 200
+    inv_data = inv_res.json()
+
+    # Must NOT pick up the other order's 250,000 VND payment!
+    assert inv_data["final_state"] == "WAITING_EVIDENCE"
+    assert inv_data["stop_reason"] == "WAITING_FOR_USER_EVIDENCE"
+    assert len(inv_data["proposed_action_ids"]) == 0
+
+    # 11b. Even if a malicious/rogue LLM explicitly reads both the target order and the
+    # other order's payment and attempts to propose ORDER_SYNC pairing them together,
+    # the runtime's relationship & provenance check MUST block it!
+    create_res2 = client.post(
+        "/api/v1/cases",
+        headers=headers,
+        json={
+            "text": "Khiếu nại cố tình ghép thanh toán đơn khác cho ORD-UNPAID-SAME-AMT",
+            "type": "PAYMENT_DISPUTE",
+        },
+    )
+    case2_id = create_res2.json()["id"]
+
+    with maker() as db:
+
+        class CrossOrderHijackAdapter:
+            @property
+            def mode(self) -> ModelMode:
+                return ModelMode.LLM_API
+
+            @property
+            def adapter_name(self) -> str:
+                return "CrossOrderHijackAdapter"
+
+            def generate_plan(self, context: InvestigationContext) -> ModelInvocationResult:
+                if len(context.tool_observations) == 0:
+                    step = NextStep(
+                        kind=PlanStepKind.READ_TOOL,
+                        tool_name="get_order",
+                        args={"order_id": "ORD-UNPAID-SAME-AMT"},
+                    )
+                elif len(context.tool_observations) == 1:
+                    # Read the OTHER order's verified payment record so it is in observed_payments
+                    step = NextStep(
+                        kind=PlanStepKind.READ_TOOL,
+                        tool_name="get_payment_record",
+                        args={"payment_id": other_paid_payment.id},
+                    )
+                else:
+                    # Attempt to sync ORD-UNPAID-SAME-AMT using other_paid_payment.id!
+                    step = NextStep(
+                        kind=PlanStepKind.PROPOSE_ACTION,
+                        action_type="propose_order_sync",
+                        args={
+                            "order_id": "ORD-UNPAID-SAME-AMT",
+                            "payment_id": other_paid_payment.id,
+                            "amount": 250000,
+                        },
+                    )
+                return ModelInvocationResult(
+                    plan=Plan(
+                        case_id=context.case_id,
+                        goal=context.goal,
+                        known_evidence_refs=context.known_evidence_refs,
+                        unknowns=[],
+                        hypotheses=[],
+                        next_step=step,
+                        decision_summary="Attempt cross-order payment hijack.",
+                    ),
+                    model_mode=ModelMode.LLM_API,
+                    adapter_name=self.adapter_name,
+                    provider="mock",
+                    model_name="hijack-v1",
+                    is_fallback=False,
+                )
+
+        runtime = BoundedAgentRuntime(db, adapter=CrossOrderHijackAdapter())
+        res2 = runtime.investigate_case(case_id=case2_id, session_id=session_id)
+
+        assert res2.stop_reason == "UNVERIFIED_PAYMENT_BLOCKED"
+        assert res2.final_state == CaseState.WAITING_EVIDENCE.value
+        assert len(res2.proposed_action_ids) == 0
+        assert len(res2.risk_signal_ids) == 1
+
+        # Verify event logged CROSS_ORDER_PAYMENT_MISMATCH
+        block_evt = db.scalar(
+            select(CaseEvent).where(
+                CaseEvent.case_id == case2_id,
+                CaseEvent.type == "UNSAFE_PROPOSAL_BLOCKED",
+            )
+        )
+        assert block_evt is not None
+        assert block_evt.payload_json["reason"] == "CROSS_ORDER_PAYMENT_MISMATCH"
+
+
+def test_hardening2_generic_complaints_without_identifiers_do_not_default_to_seeded_orders(
+    client: TestClient, active_session: dict[str, str]
+) -> None:
+    """Requirement 2 & 5:
+    Generic complaints without reliable identifiers (no order_id, no payment_ref, no phone)
+    must NEVER default to ORD-SYNC or ORD-REF, and must ASK_USER -> WAITING_EVIDENCE."""
+    token = active_session["token"]
+    headers = {"X-Demo-Session": token}
+
+    for generic_text, case_type in [
+        ("Tôi đã thanh toán nhưng đơn hàng chưa xác nhận, hãy kiểm tra.", "PAYMENT_DISPUTE"),
+        ("Tôi muốn yêu cầu hoàn tiền cho đơn hàng của tôi ngay.", "REFUND_REQUEST"),
+        ("Tôi đã chuyển khoản 250.000đ nhưng đơn vẫn đang chờ xử lý.", "PAYMENT_DISPUTE"),
+    ]:
+        c_res = client.post(
+            "/api/v1/cases",
+            headers=headers,
+            json={"text": generic_text, "type": case_type},
+        )
+        assert c_res.status_code == 201
+        cid = c_res.json()["id"]
+
+        inv_res = client.post(f"/api/v1/cases/{cid}/investigate", headers=headers)
+        assert inv_res.status_code == 200
+        inv_data = inv_res.json()
+
+        assert inv_data["final_state"] == "WAITING_EVIDENCE"
+        assert inv_data["stop_reason"] == "WAITING_FOR_USER_EVIDENCE"
+        assert len(inv_data["proposed_action_ids"]) == 0
+
+
+def test_hardening2_ambiguous_orders_matching_prefix_or_phone_asks_user(
+    client: TestClient, active_session: dict[str, str]
+) -> None:
+    """Requirement 2 & 5:
+    When multiple orders match an order prefix or customer phone, get_order reports
+    is_ambiguous=True and planner chooses ASK_USER -> WAITING_EVIDENCE."""
+    token = active_session["token"]
+    session_id = active_session["id"]
+    headers = {"X-Demo-Session": token}
+
+    maker = get_sessionmaker()
+    with maker() as db:
+        o1 = SimOrder(
+            id="ORD-DUP-101",
+            session_id=session_id,
+            customer_name="Đặng Thu Thảo",
+            customer_phone="0966111222",
+            amount=150000,
+            currency="VND",
+            subtotal=150000,
+            grand_total=150000,
+            status=OrderStatus.PENDING.value,
+            payment_status=OrderPaymentStatus.UNPAID.value,
+        )
+        o2 = SimOrder(
+            id="ORD-DUP-102",
+            session_id=session_id,
+            customer_name="Đặng Thu Thảo",
+            customer_phone="0966111222",
+            amount=150000,
+            currency="VND",
+            subtotal=150000,
+            grand_total=150000,
+            status=OrderStatus.PENDING.value,
+            payment_status=OrderPaymentStatus.UNPAID.value,
+        )
+        db.add_all([o1, o2])
+        db.commit()
+
+    c_res = client.post(
+        "/api/v1/cases",
+        headers=headers,
+        json={
+            "text": "Tôi đã thanh toán đơn hàng ORD-DUP với SĐT 0966111222 nhưng chưa xác nhận.",
+            "type": "PAYMENT_DISPUTE",
+        },
+    )
+    cid = c_res.json()["id"]
+
+    inv_res = client.post(f"/api/v1/cases/{cid}/investigate", headers=headers)
+    assert inv_res.status_code == 200
+    inv_data = inv_res.json()
+
+    assert inv_data["final_state"] == "WAITING_EVIDENCE"
+    assert inv_data["stop_reason"] == "WAITING_FOR_USER_EVIDENCE"
+    assert "unambiguous_order_id" in inv_data["unknowns"]
+    assert len(inv_data["proposed_action_ids"]) == 0
+
+
+def test_hardening3_planner_case_id_mismatch_rejected_safely(
+    client: TestClient, active_session: dict[str, str]
+) -> None:
+    """Requirement 3, 4 & 5:
+    If the model outputs a Plan with a mismatched `case_id`, both LLMModelAdapter and
+    BoundedAgentRuntime reject it and escalate safely without HTTP 500."""
+    token = active_session["token"]
+    session_id = active_session["id"]
+
+    c_res = client.post(
+        "/api/v1/cases",
+        headers={"X-Demo-Session": token},
+        json={"text": "Kiểm tra đơn hàng ORD-SYNC", "type": "PAYMENT_DISPUTE"},
+    )
+    case_id = c_res.json()["id"]
+
+    class MismatchedCaseIdAdapter:
+        @property
+        def mode(self) -> ModelMode:
+            return ModelMode.LLM_API
+
+        @property
+        def adapter_name(self) -> str:
+            return "MismatchedCaseIdAdapter"
+
+        def generate_plan(self, context: InvestigationContext) -> ModelInvocationResult:
+            return ModelInvocationResult(
+                plan=Plan(
+                    case_id="CASE-SPOOFED-OTHER-999",
+                    goal=context.goal,
+                    known_evidence_refs=[],
+                    unknowns=[],
+                    hypotheses=[],
+                    next_step=NextStep(
+                        kind=PlanStepKind.READ_TOOL,
+                        tool_name="get_order",
+                        args={"order_id": "ORD-SYNC"},
+                    ),
+                    decision_summary="Plan with wrong case_id.",
+                ),
+                model_mode=ModelMode.LLM_API,
+                adapter_name=self.adapter_name,
+                provider="mock",
+                model_name="spoof-v1",
+                is_fallback=False,
+            )
+
+    maker = get_sessionmaker()
+    with maker() as db:
+        runtime = BoundedAgentRuntime(db, adapter=MismatchedCaseIdAdapter(), max_replans=1)
+        result = runtime.investigate_case(case_id=case_id, session_id=session_id)
+
+        assert result.stop_reason == "MAX_REPLANS_EXCEEDED"
+        assert result.final_state == CaseState.ESCALATED.value
+        assert result.steps_executed == 0
+        assert len(result.proposed_action_ids) == 0
+
+
+def test_hardening4_malicious_model_proposing_unprovenanced_payment_blocked_safely(
+    client: TestClient, active_session: dict[str, str]
+) -> None:
+    """Requirement 1, 4 & 5:
+    If a malicious model proposes ORDER_SYNC referencing an existing valid payment_id
+    WITHOUT first reading that payment via an authoritative read tool (missing provenance),
+    the runtime blocks the proposal safely without HTTP 500."""
+    token = active_session["token"]
+    session_id = active_session["id"]
+
+    c_res = client.post(
+        "/api/v1/cases",
+        headers={"X-Demo-Session": token},
+        json={"text": "Kiểm tra provenance đơn hàng ORD-SYNC", "type": "PAYMENT_DISPUTE"},
+    )
+    case_id = c_res.json()["id"]
+
+    maker = get_sessionmaker()
+    with maker() as db:
+        sync_order = db.scalar(
+            select(SimOrder).where(
+                SimOrder.session_id == session_id,
+                SimOrder.id.like("ORD-SYNC-%"),
+            )
+        )
+        sync_payment = db.scalar(
+            select(SimPayment).where(
+                SimPayment.session_id == session_id,
+                SimPayment.order_id == sync_order.id,
+            )
+        )
+        assert sync_order is not None and sync_payment is not None
+
+        class UnprovenancedProposalAdapter:
+            @property
+            def mode(self) -> ModelMode:
+                return ModelMode.LLM_API
+
+            @property
+            def adapter_name(self) -> str:
+                return "UnprovenancedProposalAdapter"
+
+            def generate_plan(self, context: InvestigationContext) -> ModelInvocationResult:
+                if not context.tool_observations:
+                    # Only reads get_order, NEVER reads payment tools!
+                    step = NextStep(
+                        kind=PlanStepKind.READ_TOOL,
+                        tool_name="get_order",
+                        args={"order_id": sync_order.id},
+                    )
+                else:
+                    step = NextStep(
+                        kind=PlanStepKind.PROPOSE_ACTION,
+                        action_type="propose_order_sync",
+                        args={"order_id": sync_order.id, "payment_id": sync_payment.id},
+                    )
+                return ModelInvocationResult(
+                    plan=Plan(
+                        case_id=context.case_id,
+                        goal=context.goal,
+                        known_evidence_refs=context.known_evidence_refs,
+                        unknowns=[],
+                        hypotheses=[],
+                        next_step=step,
+                        decision_summary="Propose ORDER_SYNC without reading payment tool first.",
+                    ),
+                    model_mode=ModelMode.LLM_API,
+                    adapter_name=self.adapter_name,
+                    provider="mock",
+                    model_name="no-prov-v1",
+                    is_fallback=False,
+                )
+
+        runtime = BoundedAgentRuntime(db, adapter=UnprovenancedProposalAdapter())
+        result = runtime.investigate_case(case_id=case_id, session_id=session_id)
+
+        assert result.stop_reason == "UNVERIFIED_PAYMENT_BLOCKED"
+        assert result.final_state == CaseState.WAITING_EVIDENCE.value
+        assert len(result.proposed_action_ids) == 0
+        assert len(result.risk_signal_ids) == 1
+
+        block_evt = db.scalar(
+            select(CaseEvent).where(
+                CaseEvent.case_id == case_id,
+                CaseEvent.type == "UNSAFE_PROPOSAL_BLOCKED",
+            )
+        )
+        assert block_evt is not None
+        assert block_evt.payload_json["reason"] == "MISSING_AUTHORITATIVE_EVIDENCE_PROVENANCE"
+
+
+def test_hardening6_async_investigation_job_and_polling_api(
+    client: TestClient, active_session: dict[str, str]
+) -> None:
+    """Requirement 6:
+    Test submitting an async background investigation job (`run_async=True`) and polling
+    both `GET /api/v1/cases/{case_id}/investigations/{run_id}` and
+    `GET /api/v1/cases/{case_id}/status`."""
+    token = active_session["token"]
+    headers = {"X-Demo-Session": token}
+
+    create_res = client.post(
+        "/api/v1/cases",
+        headers=headers,
+        json={
+            "text": (
+                "Tôi đã thanh toán 250.000đ qua ví MoMo mã GD MOMO_TXN_888 "
+                "cho đơn hàng ORD-SYNC nhưng đơn vẫn đang chờ."
+            ),
+            "type": "PAYMENT_DISPUTE",
+        },
+    )
+    assert create_res.status_code == 201
+    case_id = create_res.json()["id"]
+
+    # Submit async investigation job -> 202 Accepted
+    async_res = client.post(
+        f"/api/v1/cases/{case_id}/investigate",
+        headers=headers,
+        json={"run_async": True, "max_steps": 6},
+    )
+    assert async_res.status_code == 202
+    queued_data = async_res.json()
+    run_id = queued_data["run_id"]
+    assert run_id.startswith("RUN-")
+    assert queued_data["stop_reason"] == "ASYNC_JOB_QUEUED"
+
+    # Poll specific run status endpoint
+    job_res = client.get(
+        f"/api/v1/cases/{case_id}/investigations/{run_id}",
+        headers=headers,
+    )
+    assert job_res.status_code == 200
+    job_data = job_res.json()
+    assert job_data["run_id"] == run_id
+    assert job_data["case_id"] == case_id
+    assert job_data["job_status"] == "COMPLETED"
+    assert job_data["case_state"] == "WAITING_APPROVAL"
+    assert job_data["stop_reason"] == "ACTION_PROPOSED"
+    assert job_data["steps_executed"] == 4
+    assert len(job_data["proposed_action_ids"]) == 1
+    assert job_data["completed_at"] is not None
+
+    # Poll lightweight Case status endpoint
+    status_res = client.get(f"/api/v1/cases/{case_id}/status", headers=headers)
+    assert status_res.status_code == 200
+    status_data = status_res.json()
+    assert status_data["state"] == "WAITING_APPROVAL"
+    assert status_data["active_run_id"] == run_id
+    assert status_data["investigation_status"] == "COMPLETED"
+    assert status_data["pending_proposals_count"] == 1

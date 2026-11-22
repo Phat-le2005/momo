@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from datetime import UTC, datetime
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, Response, status
-from sqlalchemy import select
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Response, status
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from app.ai_core.runtime import BoundedAgentRuntime
+from app.ai_core.model_adapter import get_model_adapter
+from app.ai_core.runtime import MAX_INVESTIGATIONS_PER_CASE, BoundedAgentRuntime
 from app.ai_core.schemas import InvestigationRunResult
+from app.ai_core.understanding import analyze_vietnamese_complaint
 from app.core.config import get_settings
 from app.core.errors import AppError, ErrorCode
 from app.core.session import get_current_session
-from app.db.session import get_db
+from app.db.session import get_db, get_sessionmaker
 from app.models.actions import ActionProposal
 from app.models.cases import Case, CaseEvent, Evidence
 from app.models.enums import ActionProposalStatus, CaseState, EvidenceKind
@@ -29,8 +33,11 @@ from app.schemas.cases import (
     CreateCaseRequest,
     EvidenceResponse,
     InvestigateCaseRequest,
+    InvestigationJobStatusResponse,
     RiskSignalSummaryResponse,
 )
+
+logger = logging.getLogger("finresolve.cases")
 
 router = APIRouter(prefix="/cases", tags=["cases"])
 
@@ -38,6 +45,44 @@ router = APIRouter(prefix="/cases", tags=["cases"])
 def _compute_payload_fingerprint(payload: CreateCaseRequest) -> str:
     canonical_repr = f"{payload.type}|{payload.goal or ''}|{payload.text.strip()}"
     return hashlib.sha256(canonical_repr.encode("utf-8")).hexdigest()
+
+
+def _execute_background_investigation(
+    *,
+    case_id: str,
+    session_id: str,
+    run_id: str,
+    max_steps: int,
+    simulate_timeout: bool,
+) -> None:
+    """Execute bounded AI investigation in an isolated background DB session."""
+    maker = get_sessionmaker()
+    with maker() as bg_db:
+        try:
+            runtime = BoundedAgentRuntime(bg_db, max_steps=max_steps)
+            runtime.investigate_case(
+                case_id=case_id,
+                session_id=session_id,
+                simulate_timeout=simulate_timeout,
+                run_id=run_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Background investigation run %s failed for case %s", run_id, case_id)
+            bg_db.rollback()
+            err_evt = CaseEvent(
+                id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
+                case_id=case_id,
+                session_id=session_id,
+                type="INVESTIGATION_FAILED",
+                payload_json={
+                    "run_id": run_id,
+                    "job_status": "FAILED",
+                    "error": str(exc)[:300],
+                },
+                created_at=datetime.now(UTC),
+            )
+            bg_db.add(err_evt)
+            bg_db.commit()
 
 
 @router.post(
@@ -199,20 +244,187 @@ def create_case(
     "/{case_id}/investigate",
     response_model=InvestigationRunResult,
     status_code=status.HTTP_200_OK,
-    summary="Run bounded agentic AI investigation on a Case (read tools + proposal only)",
+    summary="Run bounded agentic AI investigation on a Case (sync or async background job)",
 )
 def investigate_case(
     case_id: str,
+    response: Response,
+    background_tasks: BackgroundTasks,
     payload: InvestigateCaseRequest | None = None,
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> InvestigationRunResult:
     req = payload or InvestigateCaseRequest()
+
+    if req.run_async:
+        # Validate Case ownership and rate limit upfront before scheduling background job
+        case_obj = db.scalar(
+            select(Case)
+            .options(selectinload(Case.evidence))
+            .where(Case.id == case_id, Case.session_id == current_session.id)
+        )
+        if case_obj is None:
+            raise AppError(ErrorCode.NOT_FOUND, f"Case '{case_id}' not found", status_code=404)
+
+        existing_runs = (
+            db.scalar(
+                select(func.count(CaseEvent.id)).where(
+                    CaseEvent.case_id == case_obj.id,
+                    CaseEvent.session_id == current_session.id,
+                    CaseEvent.type == "INVESTIGATION_STARTED",
+                )
+            )
+            or 0
+        )
+        if existing_runs >= MAX_INVESTIGATIONS_PER_CASE:
+            raise AppError(
+                ErrorCode.RATE_LIMITED,
+                f"Investigation quota exceeded for Case '{case_obj.id}' "
+                f"(maximum {MAX_INVESTIGATIONS_PER_CASE} runs per case)",
+                status_code=429,
+            )
+
+        run_id = f"RUN-{uuid.uuid4().hex[:10].upper()}"
+        adapter = get_model_adapter(get_settings())
+        queued_evt = CaseEvent(
+            id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
+            case_id=case_obj.id,
+            session_id=current_session.id,
+            type="INVESTIGATION_QUEUED",
+            payload_json={
+                "run_id": run_id,
+                "job_status": "RUNNING",
+                "model_mode": adapter.mode.value,
+                "adapter_name": adapter.adapter_name,
+                "max_steps": req.max_steps,
+            },
+            created_at=datetime.now(UTC),
+        )
+        db.add(queued_evt)
+        db.commit()
+
+        claim_text = case_obj.goal
+        for ev in case_obj.evidence:
+            if ev.kind == EvidenceKind.CLAIM.value:
+                claim_text = str(ev.payload_json.get("text") or case_obj.goal)
+                break
+        understanding = analyze_vietnamese_complaint(claim_text, case_type=case_obj.type)
+
+        background_tasks.add_task(
+            _execute_background_investigation,
+            case_id=case_obj.id,
+            session_id=current_session.id,
+            run_id=run_id,
+            max_steps=req.max_steps,
+            simulate_timeout=req.simulate_timeout,
+        )
+        response.status_code = status.HTTP_202_ACCEPTED
+        return InvestigationRunResult(
+            run_id=run_id,
+            case_id=case_obj.id,
+            session_id=current_session.id,
+            final_state=case_obj.state,
+            case_version=case_obj.version,
+            model_mode=adapter.mode,
+            adapter_name=adapter.adapter_name,
+            is_fallback=(adapter.mode.value == "DEMO_RULES"),
+            steps_executed=0,
+            replans_used=0,
+            total_tokens_used=0,
+            stop_reason="ASYNC_JOB_QUEUED",
+            decision_summary=f"Đã đưa phiên điều tra {run_id} vào hàng đợi xử lý nền.",
+            known_evidence_refs=[e.id for e in case_obj.evidence],
+            unknowns=[],
+            hypotheses=[],
+            understanding=understanding,
+            step_traces=[],
+            proposed_action_ids=[],
+            risk_signal_ids=[],
+        )
+
     runtime = BoundedAgentRuntime(db, max_steps=req.max_steps)
     return runtime.investigate_case(
         case_id=case_id,
         session_id=current_session.id,
         simulate_timeout=req.simulate_timeout,
+    )
+
+
+@router.get(
+    "/{case_id}/investigations/{run_id}",
+    response_model=InvestigationJobStatusResponse,
+    summary="Poll the status and result of a synchronous or asynchronous investigation run",
+)
+def get_investigation_job_status(
+    case_id: str,
+    run_id: str,
+    current_session: DemoSession = Depends(get_current_session),
+    db: Session = Depends(get_db),
+) -> InvestigationJobStatusResponse:
+    case_obj = db.scalar(
+        select(Case)
+        .options(selectinload(Case.events))
+        .where(Case.id == case_id, Case.session_id == current_session.id)
+    )
+    if case_obj is None:
+        raise AppError(ErrorCode.NOT_FOUND, f"Case '{case_id}' not found", status_code=404)
+
+    run_events = [e for e in case_obj.events if str(e.payload_json.get("run_id") or "") == run_id]
+    if not run_events:
+        raise AppError(
+            ErrorCode.NOT_FOUND,
+            f"Investigation run '{run_id}' not found for Case '{case_id}'",
+            status_code=404,
+        )
+
+    started_at = run_events[0].created_at
+    completed_at: datetime | None = None
+    job_status: Literal["RUNNING", "COMPLETED", "FAILED"] = "RUNNING"
+    model_mode = get_settings().model_mode.value
+    steps_executed = 0
+    stop_reason: str | None = None
+    decision_summary: str | None = None
+    proposed_action_ids: list[str] = []
+    risk_signal_ids: list[str] = []
+    error_message: str | None = None
+
+    for evt in run_events:
+        if evt.payload_json.get("model_mode"):
+            model_mode = str(evt.payload_json["model_mode"])
+        if evt.type == "AI_PLAN_GENERATED":
+            steps_executed = max(steps_executed, int(evt.payload_json.get("step") or 0))
+            decision_summary = str(evt.payload_json.get("decision_summary") or "")
+        elif evt.type == "INVESTIGATION_COMPLETED":
+            job_status = "COMPLETED"
+            completed_at = evt.created_at
+            steps_executed = int(evt.payload_json.get("steps_executed") or steps_executed)
+            stop_reason = str(evt.payload_json.get("stop_reason") or "")
+            decision_summary = str(evt.payload_json.get("decision_summary") or "")
+            proposed_action_ids = [
+                str(x) for x in (evt.payload_json.get("proposed_action_ids") or [])
+            ]
+            risk_signal_ids = [str(x) for x in (evt.payload_json.get("risk_signal_ids") or [])]
+        elif evt.type == "INVESTIGATION_FAILED":
+            job_status = "FAILED"
+            completed_at = evt.created_at
+            error_message = str(evt.payload_json.get("error") or "Investigation failed")
+
+    return InvestigationJobStatusResponse(
+        run_id=run_id,
+        case_id=case_obj.id,
+        session_id=case_obj.session_id,
+        job_status=job_status,
+        case_state=case_obj.state,
+        case_version=case_obj.version,
+        model_mode=model_mode,
+        steps_executed=steps_executed,
+        stop_reason=stop_reason,
+        decision_summary=decision_summary,
+        proposed_action_ids=proposed_action_ids,
+        risk_signal_ids=risk_signal_ids,
+        error_message=error_message,
+        started_at=started_at,
+        completed_at=completed_at,
     )
 
 
@@ -300,6 +512,7 @@ def get_case_status(
         raise AppError(ErrorCode.NOT_FOUND, f"Case '{case_id}' not found", status_code=404)
 
     latest_summary, model_mode, _ = _extract_latest_investigation_meta(case_obj.events)
+    active_run_id, inv_status = _extract_run_job_status(case_obj.events)
     pending_proposals = sum(
         1 for p in case_obj.action_proposals if p.status == ActionProposalStatus.PROPOSED.value
     )
@@ -312,7 +525,24 @@ def get_case_status(
         model_mode=model_mode or get_settings().model_mode.value,
         latest_decision_summary=latest_summary,
         pending_proposals_count=pending_proposals,
+        active_run_id=active_run_id,
+        investigation_status=inv_status,
     )
+
+
+def _extract_run_job_status(
+    events: list[CaseEvent] | None,
+) -> tuple[str | None, Literal["IDLE", "RUNNING", "COMPLETED", "FAILED"]]:
+    if not events:
+        return None, "IDLE"
+    for evt in reversed(events):
+        if evt.type == "INVESTIGATION_COMPLETED":
+            return str(evt.payload_json.get("run_id") or ""), "COMPLETED"
+        if evt.type == "INVESTIGATION_FAILED":
+            return str(evt.payload_json.get("run_id") or ""), "FAILED"
+        if evt.type in ("INVESTIGATION_STARTED", "INVESTIGATION_QUEUED"):
+            return str(evt.payload_json.get("run_id") or ""), "RUNNING"
+    return None, "IDLE"
 
 
 def _extract_latest_investigation_meta(
