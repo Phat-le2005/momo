@@ -98,7 +98,12 @@ class ActionExecution(Base):
 
 
 class Verification(Base):
-    """Authoritative read-back verification record for Case and Action effects."""
+    """Authoritative read-back verification record for Case and Action effects.
+
+    Hard Invariant:
+    A Verification record is bound to a specific case_version. Stale verification records
+    cannot authorize transitioning a Case to RESOLVED if the Case version has changed.
+    """
 
     __tablename__ = "verifications"
 
@@ -112,6 +117,7 @@ class Verification(Base):
         nullable=True,
         index=True,
     )
+    case_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     postconditions_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     verdict: Mapped[str] = mapped_column(String(32), nullable=False)
     checked_at: Mapped[datetime] = mapped_column(

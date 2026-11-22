@@ -9,9 +9,14 @@ from app.models.enums import (
     ApprovalDecision,
     CaseState,
     EvidenceKind,
+    FulfillmentStatus,
+    MovementReason,
+    OrderPaymentStatus,
     OrderStatus,
+    PaymentEventType,
     PaymentStatus,
     RefundStatus,
+    ReservationStatus,
     RiskCategory,
     RiskLevel,
     RiskResponse,
@@ -20,7 +25,18 @@ from app.models.enums import (
 )
 from app.models.risk import RiskSignal
 from app.models.session import DemoSession
-from app.models.simulator import SimOrder, SimPayment, SimRefund
+from app.models.simulator import (
+    InventoryLevel,
+    InventoryMovement,
+    InventoryReservation,
+    OrderItem,
+    Product,
+    SimOrder,
+    SimPayment,
+    SimPaymentEvent,
+    SimRefund,
+    Warehouse,
+)
 
 __all__ = [
     "ActionExecution",
@@ -36,9 +52,19 @@ __all__ = [
     "DemoSession",
     "Evidence",
     "EvidenceKind",
+    "FulfillmentStatus",
+    "InventoryLevel",
+    "InventoryMovement",
+    "InventoryReservation",
+    "MovementReason",
+    "OrderItem",
+    "OrderPaymentStatus",
     "OrderStatus",
+    "PaymentEventType",
     "PaymentStatus",
+    "Product",
     "RefundStatus",
+    "ReservationStatus",
     "RiskCategory",
     "RiskLevel",
     "RiskResponse",
@@ -46,7 +72,9 @@ __all__ = [
     "SessionStatus",
     "SimOrder",
     "SimPayment",
+    "SimPaymentEvent",
     "SimRefund",
     "Verification",
     "VerificationVerdict",
+    "Warehouse",
 ]

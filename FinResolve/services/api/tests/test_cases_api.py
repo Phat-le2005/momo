@@ -71,11 +71,11 @@ def test_idempotent_client_retry_deduplication(
     assert res1.status_code == 201
     case1 = res1.json()
 
-    # Second request with exact same idempotency key
+    # Second request with exact same idempotency key and same text
     res2 = client.post(
         "/api/v1/cases",
         headers={"X-Demo-Session": token, "X-Idempotency-Key": idempotency_key},
-        json={"text": "Yêu cầu khiếu nại kiểm tra hoàn tiền (retry gửi lại)"},
+        json={"text": "Yêu cầu khiếu nại kiểm tra hoàn tiền"},
     )
     assert res2.status_code == 200  # Replay existing case
     case2 = res2.json()
@@ -83,6 +83,15 @@ def test_idempotent_client_retry_deduplication(
     # Must return the same Case without duplicate creation
     assert case1["id"] == case2["id"]
     assert case1["version"] == case2["version"]
+
+    # Third request with same idempotency key but DIFFERENT payload -> MUST return 409
+    res3 = client.post(
+        "/api/v1/cases",
+        headers={"X-Demo-Session": token, "X-Idempotency-Key": idempotency_key},
+        json={"text": "Nội dung khiếu nại đã bị thay đổi hoàn toàn"},
+    )
+    assert res3.status_code == 409
+    assert res3.json()["error"]["code"] == "CONFLICT"
 
     # Check session case_count was only incremented once
     read_case = client.get(f"/api/v1/cases/{case1['id']}", headers={"X-Demo-Session": token})

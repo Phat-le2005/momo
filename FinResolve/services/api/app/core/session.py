@@ -21,6 +21,7 @@ def get_current_session(
     """Extract and validate demo session from X-Demo-Session header.
 
     Invariants:
+    - Only accepts the secret session token (never public session ID).
     - Rejects unauthenticated requests with 401 UNAUTHORIZED.
     - Rejects expired sessions with 401 UNAUTHORIZED.
     - Rejects revoked/inactive sessions with 403 FORBIDDEN.
@@ -40,7 +41,8 @@ def get_current_session(
             status_code=401,
         )
 
-    stmt = select(DemoSession).where((DemoSession.token == token) | (DemoSession.id == token))
+    # Hardening: Only accept secret session token. Never accept public session ID.
+    stmt = select(DemoSession).where(DemoSession.token == token)
     session = db.scalar(stmt)
     if session is None:
         raise AppError(

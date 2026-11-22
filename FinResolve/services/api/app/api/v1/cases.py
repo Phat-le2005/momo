@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import UTC, datetime
 
@@ -26,6 +27,11 @@ from app.schemas.cases import (
 router = APIRouter(prefix="/cases", tags=["cases"])
 
 
+def _compute_payload_fingerprint(payload: CreateCaseRequest) -> str:
+    canonical_repr = f"{payload.type}|{payload.goal or ''}|{payload.text.strip()}"
+    return hashlib.sha256(canonical_repr.encode("utf-8")).hexdigest()
+
+
 @router.post(
     "",
     response_model=CaseResponse,
@@ -40,8 +46,11 @@ def create_case(
     db: Session = Depends(get_db),
 ) -> CaseResponse:
     idempotency_key = idempotency_header or payload.idempotency_key
+    payload_fingerprint = _compute_payload_fingerprint(payload)
 
-    # Idempotent deduplication check within this session
+    # Strengthened Idempotency check:
+    # Same key + same payload -> 200 Replay
+    # Same key + different payload -> 409 Conflict
     if idempotency_key:
         stmt = (
             select(Case)
@@ -53,19 +62,33 @@ def create_case(
         )
         existing = db.scalar(stmt)
         if existing is not None:
+            if (
+                existing.idempotency_payload_hash
+                and existing.idempotency_payload_hash != payload_fingerprint
+            ):
+                raise AppError(
+                    ErrorCode.CONFLICT,
+                    f"Idempotency key '{idempotency_key}' was previously used "
+                    f"with a different request payload",
+                    status_code=409,
+                    details={"idempotency_key": idempotency_key},
+                )
             # Replay existing case without re-incrementing quota or duplicating records
             response.status_code = status.HTTP_200_OK
             return _to_case_response(existing)
 
-    # Check session quota
-    if current_session.case_count >= current_session.max_cases:
+    # Acquire row-level lock on DemoSession to prevent race conditions on quota under concurrency
+    db.refresh(current_session, with_for_update=True)
+    session_obj = current_session
+
+    if session_obj.case_count >= session_obj.max_cases:
         raise AppError(
             ErrorCode.RATE_LIMITED,
-            f"Session quota exceeded: maximum of {current_session.max_cases} cases reached",
+            f"Session quota exceeded: maximum of {session_obj.max_cases} cases reached",
             status_code=429,
             details={
-                "max_cases": current_session.max_cases,
-                "case_count": current_session.case_count,
+                "max_cases": session_obj.max_cases,
+                "case_count": session_obj.case_count,
             },
         )
 
@@ -75,13 +98,14 @@ def create_case(
 
     new_case = Case(
         id=case_id,
-        session_id=current_session.id,
+        session_id=session_obj.id,
         type=payload.type,
         goal=goal,
         state=CaseState.NEW.value,
         version=1,
         owner="guest",
         idempotency_key=idempotency_key,
+        idempotency_payload_hash=payload_fingerprint if idempotency_key else None,
         created_at=now,
         updated_at=now,
     )
@@ -92,7 +116,7 @@ def create_case(
     initial_evidence = Evidence(
         id=f"EVD-{uuid.uuid4().hex[:10].upper()}",
         case_id=case_id,
-        session_id=current_session.id,
+        session_id=session_obj.id,
         kind=EvidenceKind.CLAIM.value,
         source="CUSTOMER_MESSAGE",
         source_ref="intake_text",
@@ -106,7 +130,7 @@ def create_case(
     initial_event = CaseEvent(
         id=f"EVT-{uuid.uuid4().hex[:10].upper()}",
         case_id=case_id,
-        session_id=current_session.id,
+        session_id=session_obj.id,
         type="CASE_CREATED",
         payload_json={
             "initial_state": CaseState.NEW.value,
@@ -117,8 +141,8 @@ def create_case(
     )
     db.add(initial_event)
 
-    current_session.case_count += 1
-    current_session.updated_at = now
+    session_obj.case_count += 1
+    session_obj.updated_at = now
     db.commit()
     db.refresh(new_case)
 
@@ -162,7 +186,6 @@ def get_case_events(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> list[CaseEventResponse]:
-    # Check Case belongs to current session
     stmt_case = select(Case.id).where(Case.id == case_id, Case.session_id == current_session.id)
     if db.scalar(stmt_case) is None:
         raise AppError(ErrorCode.NOT_FOUND, f"Case '{case_id}' not found", status_code=404)

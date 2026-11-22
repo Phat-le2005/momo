@@ -44,7 +44,9 @@ def clean_database() -> Iterator[None]:
                     text(
                         "TRUNCATE demo_sessions, cases, evidence, case_events, "
                         "action_proposals, approvals, action_executions, verifications, "
-                        "risk_signals, sim_orders, sim_payments, sim_refunds CASCADE"
+                        "risk_signals, sim_orders, sim_payments, sim_refunds, "
+                        "products, warehouses, inventory_levels, order_items, "
+                        "inventory_reservations, inventory_movements, sim_payment_events CASCADE"
                     )
                 )
         except Exception:

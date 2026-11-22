@@ -83,11 +83,12 @@ def test_valid_transition_pipeline_to_resolved(db_session: Session, test_case: C
     assert test_case.state == CaseState.VERIFYING.value
     assert test_case.version == 4
 
-    # 4. Attach PASSED verification record
+    # 4. Attach PASSED verification record matching current case version
     verif = Verification(
         id="VRF-001",
         case_id=test_case.id,
         action_execution_id=None,
+        case_version=test_case.version,
         postconditions_json={"order_status": "PAID"},
         verdict=VerificationVerdict.PASSED.value,
     )

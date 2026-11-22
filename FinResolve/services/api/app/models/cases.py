@@ -41,6 +41,10 @@ class Case(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     owner: Mapped[str] = mapped_column(String(64), nullable=False, default="guest")
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    idempotency_payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    idempotency_payload_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
@@ -94,7 +98,9 @@ class Evidence(Base):
     session_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("demo_sessions.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    kind: Mapped[str] = mapped_column(String(32), nullable=False, default=EvidenceKind.CLAIM.value)
+    kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=EvidenceKind.CLAIM.value
+    )
     source: Mapped[str] = mapped_column(String(64), nullable=False)
     source_ref: Mapped[str] = mapped_column(String(128), nullable=False)
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)

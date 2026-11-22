@@ -77,14 +77,17 @@ def transition_case(
     target_state: CaseState,
     *,
     reason: str,
+    expected_version: int | None = None,
     verification: Verification | None = None,
     extra_payload: dict[str, Any] | None = None,
 ) -> Case:
-    """Transition a Case to target_state with validation, optimistic lock bump, and audit event.
+    """Transition a Case to target_state with optimistic concurrency, validation, and audit event.
 
-    Hard Domain Invariant:
-    No transition to RESOLVED is allowed without an authoritative Verification record
-    having verdict == PASSED.
+    Hard Domain Invariants:
+    1. Optimistic Concurrency: If expected_version is provided, current case.version must match.
+    2. Verification Relevance: No transition to RESOLVED is allowed without a fresh relevant
+       authoritative Verification record where verdict == PASSED and case_version == case.version.
+       A stale verification from an earlier version cannot authorize RESOLVED.
     """
     try:
         current_enum = CaseState(case.state)
@@ -94,6 +97,20 @@ def transition_case(
             f"Case has corrupt state value: {case.state}",
             status_code=500,
         ) from err
+
+    # Optimistic concurrency check
+    if expected_version is not None and case.version != expected_version:
+        raise AppError(
+            ErrorCode.CONFLICT,
+            f"Optimistic concurrency conflict: expected case version {expected_version}, "
+            f"but current version is {case.version}",
+            status_code=409,
+            details={
+                "case_id": case.id,
+                "current_version": case.version,
+                "expected_version": expected_version,
+            },
+        )
 
     if not can_transition(current_enum, target_state):
         raise AppError(
@@ -108,31 +125,39 @@ def transition_case(
         )
 
     if target_state == CaseState.RESOLVED:
-        # Must verify postcondition from authoritative record
-        has_passed_verification = False
-        if verification and verification.verdict == VerificationVerdict.PASSED.value:
-            has_passed_verification = True
+        # Require fresh, relevant PASSED verification tied to this exact case version
+        valid_passed_verification = False
+        if verification:
+            if (
+                verification.case_id == case.id
+                and verification.verdict == VerificationVerdict.PASSED.value
+                and verification.case_version == case.version
+            ):
+                valid_passed_verification = True
         else:
             stmt = (
                 select(Verification)
                 .where(
                     Verification.case_id == case.id,
                     Verification.verdict == VerificationVerdict.PASSED.value,
+                    Verification.case_version == case.version,
                 )
+                .order_by(Verification.checked_at.desc())
                 .limit(1)
             )
-            existing_passed = db.scalar(stmt)
-            if existing_passed is not None:
-                has_passed_verification = True
+            existing_fresh = db.scalar(stmt)
+            if existing_fresh is not None:
+                valid_passed_verification = True
 
-        if not has_passed_verification:
+        if not valid_passed_verification:
             raise AppError(
                 ErrorCode.CONFLICT,
-                "Cannot mark Case as RESOLVED without a verified postcondition "
-                "(Verification verdict must be PASSED)",
+                f"Cannot mark Case as RESOLVED without a verified postcondition: "
+                f"requires a fresh relevant PASSED verification for case version {case.version}",
                 status_code=409,
                 details={
                     "case_id": case.id,
+                    "case_version": case.version,
                     "target_state": CaseState.RESOLVED.value,
                     "verification_present": verification is not None,
                 },
