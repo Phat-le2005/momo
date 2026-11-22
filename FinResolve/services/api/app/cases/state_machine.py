@@ -81,14 +81,23 @@ def transition_case(
     verification: Verification | None = None,
     extra_payload: dict[str, Any] | None = None,
 ) -> Case:
-    """Transition a Case to target_state with optimistic concurrency, validation, and audit event.
+    """Transition a Case to target_state with database-level concurrency control and validation.
 
     Hard Domain Invariants:
-    1. Optimistic Concurrency: If expected_version is provided, current case.version must match.
-    2. Verification Relevance: No transition to RESOLVED is allowed without a fresh relevant
+    1. Database-Level Concurrency Control: Acquires exclusive row lock (SELECT FOR UPDATE)
+       on the Case row to serialize concurrent transitions.
+    2. Optimistic Concurrency: If expected_version is provided, locked case.version must match.
+    3. Verification Relevance: No transition to RESOLVED is allowed without a fresh relevant
        authoritative Verification record where verdict == PASSED and case_version == case.version.
        A stale verification from an earlier version cannot authorize RESOLVED.
     """
+    # 1. Acquire DB-level exclusive row lock to serialize concurrent transitions
+    stmt_lock = select(Case).where(Case.id == case.id).with_for_update()
+    locked_case = db.scalar(stmt_lock)
+    if locked_case is None:
+        raise AppError(ErrorCode.NOT_FOUND, f"Case '{case.id}' not found", status_code=404)
+    case = locked_case
+
     try:
         current_enum = CaseState(case.state)
     except ValueError as err:
@@ -98,7 +107,7 @@ def transition_case(
             status_code=500,
         ) from err
 
-    # Optimistic concurrency check
+    # 2. Optimistic concurrency check under DB row lock
     if expected_version is not None and case.version != expected_version:
         raise AppError(
             ErrorCode.CONFLICT,

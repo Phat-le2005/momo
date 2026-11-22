@@ -42,9 +42,6 @@ class Case(Base):
     owner: Mapped[str] = mapped_column(String(64), nullable=False, default="guest")
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     idempotency_payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    idempotency_payload_hash: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )

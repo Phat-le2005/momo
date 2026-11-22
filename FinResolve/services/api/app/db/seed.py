@@ -9,6 +9,7 @@ Scenarios:
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import select
@@ -39,7 +40,8 @@ def seed_demo_session(db: Session, session_id: str) -> None:
         return
 
     now = datetime.now(UTC)
-    suffix = session_id[:8].upper()
+    # Collision-resistant unique identifier for seeded entity IDs and references
+    suffix = uuid.uuid4().hex[:12].upper()
 
     # 1. Warehouse
     wh = Warehouse(

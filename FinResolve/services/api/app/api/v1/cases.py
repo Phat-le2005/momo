@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Header, Response, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.errors import AppError, ErrorCode
@@ -141,12 +142,40 @@ def create_case(
     )
     db.add(initial_event)
 
-    session_obj.case_count += 1
-    session_obj.updated_at = now
-    db.commit()
-    db.refresh(new_case)
-
-    return _to_case_response(new_case, [initial_evidence])
+    try:
+        session_obj.case_count += 1
+        session_obj.updated_at = now
+        db.commit()
+        db.refresh(new_case)
+        return _to_case_response(new_case, [initial_evidence])
+    except IntegrityError:
+        db.rollback()
+        # Atomic recovery under concurrent retries with the same idempotency key
+        if idempotency_key:
+            stmt = (
+                select(Case)
+                .options(selectinload(Case.evidence))
+                .where(
+                    Case.session_id == current_session.id,
+                    Case.idempotency_key == idempotency_key,
+                )
+            )
+            existing = db.scalar(stmt)
+            if existing is not None:
+                if (
+                    existing.idempotency_payload_hash
+                    and existing.idempotency_payload_hash != payload_fingerprint
+                ):
+                    raise AppError(
+                        ErrorCode.CONFLICT,
+                        f"Idempotency key '{idempotency_key}' was previously used "
+                        f"with a different request payload",
+                        status_code=409,
+                        details={"idempotency_key": idempotency_key},
+                    ) from None
+                response.status_code = status.HTTP_200_OK
+                return _to_case_response(existing)
+        raise
 
 
 @router.get(
