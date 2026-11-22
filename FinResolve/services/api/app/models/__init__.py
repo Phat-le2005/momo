@@ -6,10 +6,12 @@ from app.models.enums import (
     ActionExecutionState,
     ActionProposalStatus,
     ActionType,
+    AgentTaskState,
     ApprovalDecision,
     CaseState,
     EvidenceKind,
     FulfillmentStatus,
+    IncidentStatus,
     MovementReason,
     OrderPaymentStatus,
     OrderStatus,
@@ -21,8 +23,10 @@ from app.models.enums import (
     RiskLevel,
     RiskResponse,
     SessionStatus,
+    TaskforceRole,
     VerificationVerdict,
 )
+from app.models.incidents import AgentTask, Incident, IncidentCase
 from app.models.risk import RiskSignal
 from app.models.session import DemoSession
 from app.models.simulator import (
@@ -44,6 +48,8 @@ __all__ = [
     "ActionProposal",
     "ActionProposalStatus",
     "ActionType",
+    "AgentTask",
+    "AgentTaskState",
     "Approval",
     "ApprovalDecision",
     "Case",
@@ -53,6 +59,9 @@ __all__ = [
     "Evidence",
     "EvidenceKind",
     "FulfillmentStatus",
+    "Incident",
+    "IncidentCase",
+    "IncidentStatus",
     "InventoryLevel",
     "InventoryMovement",
     "InventoryReservation",
@@ -74,6 +83,7 @@ __all__ = [
     "SimPayment",
     "SimPaymentEvent",
     "SimRefund",
+    "TaskforceRole",
     "Verification",
     "VerificationVerdict",
     "Warehouse",

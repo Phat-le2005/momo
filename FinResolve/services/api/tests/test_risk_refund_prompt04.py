@@ -569,10 +569,11 @@ def test_tenant_isolation_rejects_cross_session_and_nonexistent_case_ids(
 
 def test_docker_and_production_secret_validation() -> None:
     """Hardening 1 (P0 Blocker 1):
-    - APP_ENV=docker or production requires a strong random external DEMO_APPROVAL_SECRET (>= 32 chars).
-    - Rejects all known repository example/default keys, including the former hardcoded Docker Compose
-      fallback key ('finresolve_docker_hmac_signing_key_v1_9f8e7d6c5b4a3f2e') and .env.example
-      placeholder ('replace_with_strong_random_32_plus_char_hmac_secret_key').
+    - APP_ENV=docker or production requires a strong random external DEMO_APPROVAL_SECRET
+      (>= 32 chars).
+    - Rejects all known repository example/default keys, including the former hardcoded
+      Docker Compose fallback key ('finresolve_docker_hmac_signing_key_v1_9f8e7d6c5b4a3f2e')
+      and .env.example placeholder ('replace_with_strong_random_32_plus_char_hmac_secret_key').
     - Verifies infra/docker-compose.yml has no hardcoded fallback for DEMO_APPROVAL_SECRET."""
     import secrets
     from pathlib import Path
