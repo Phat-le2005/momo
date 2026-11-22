@@ -1,0 +1,77 @@
+# FinResolve AI — local development stack (synthetic MOCK data only).
+# Usage (from repo root):  docker compose -f infra/docker-compose.yml up --build
+# Optional overrides: copy infra/.env.example to infra/.env (never commit .env).
+name: finresolve
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-finresolve}
+      POSTGRES_USER: ${POSTGRES_USER:-finresolve}
+      # Local-only sample password. Override via infra/.env for anything shared.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-local-only}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - finresolve_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ../services/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: docker
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-finresolve}:${POSTGRES_PASSWORD:-change-me-local-only}@db:5432/${POSTGRES_DB:-finresolve}
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
+      SOURCE_MODE: MOCK
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-}
+      MODEL_NAME: ${MODEL_NAME:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MODEL_TIMEOUT_SECONDS: ${MODEL_TIMEOUT_SECONDS:-20}
+      MODEL_BUDGET_TOKENS: ${MODEL_BUDGET_TOKENS:-20000}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=4).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+
+  web:
+    build:
+      context: ../apps/web
+      dockerfile: Dockerfile
+      args:
+        # Browser-visible API URL (the browser runs on the host, not inside the network).
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/demo > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+
+volumes:
+  finresolve_pgdata:

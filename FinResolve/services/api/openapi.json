@@ -1,0 +1,865 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "FinResolve AI API",
+    "description": "AI-native payment & commerce exception operations MVP. Synthetic MOCK data only; no real-money operations.",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Liveness + dependency status",
+        "description": "Always 200 while the process is alive; `status=degraded` if the DB is unreachable.",
+        "operationId": "healthz_healthz_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Readiness: 503 until the database is reachable",
+        "operationId": "readyz_readyz_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/demo/sessions": {
+      "post": {
+        "tags": [
+          "demo"
+        ],
+        "summary": "Create a new isolated guest demo session",
+        "operationId": "create_demo_session_api_v1_demo_sessions_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/CreateSessionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemoSessionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cases": {
+      "post": {
+        "tags": [
+          "cases"
+        ],
+        "summary": "Create a Case from Vietnamese free-text intake (treated strictly as CLAIM)",
+        "operationId": "create_case_api_v1_cases_post",
+        "parameters": [
+          {
+            "name": "X-Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCaseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaseResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cases/{case_id}": {
+      "get": {
+        "tags": [
+          "cases"
+        ],
+        "summary": "Get Case detail and evidence (scoped to session)",
+        "operationId": "get_case_api_v1_cases__case_id__get",
+        "parameters": [
+          {
+            "name": "case_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Case Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaseResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cases/{case_id}/events": {
+      "get": {
+        "tags": [
+          "cases"
+        ],
+        "summary": "Get Case decision trace / audit timeline (scoped to session)",
+        "operationId": "get_case_events_api_v1_cases__case_id__events_get",
+        "parameters": [
+          {
+            "name": "case_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Case Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CaseEventResponse"
+                  },
+                  "title": "Response Get Case Events Api V1 Cases  Case Id  Events Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cases/{case_id}/status": {
+      "get": {
+        "tags": [
+          "cases"
+        ],
+        "summary": "Get lightweight Case status and version",
+        "operationId": "get_case_status_api_v1_cases__case_id__status_get",
+        "parameters": [
+          {
+            "name": "case_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Case Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaseStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "summary": "API metadata",
+        "operationId": "api_meta_api_v1_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiMeta"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiMeta": {
+        "properties": {
+          "api_version": {
+            "type": "string",
+            "title": "Api Version"
+          },
+          "service_version": {
+            "type": "string",
+            "title": "Service Version"
+          },
+          "source_mode": {
+            "$ref": "#/components/schemas/SourceMode"
+          },
+          "model_mode": {
+            "$ref": "#/components/schemas/ModelMode"
+          },
+          "synthetic_data_only": {
+            "type": "boolean",
+            "title": "Synthetic Data Only"
+          },
+          "notice": {
+            "type": "string",
+            "title": "Notice"
+          }
+        },
+        "type": "object",
+        "required": [
+          "api_version",
+          "service_version",
+          "source_mode",
+          "model_mode",
+          "synthetic_data_only",
+          "notice"
+        ],
+        "title": "ApiMeta"
+      },
+      "CaseEventResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "case_id": {
+            "type": "string",
+            "title": "Case Id"
+          },
+          "type": {
+            "type": "string",
+            "title": "Type"
+          },
+          "payload_json": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Payload Json"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "case_id",
+          "type",
+          "payload_json",
+          "created_at"
+        ],
+        "title": "CaseEventResponse"
+      },
+      "CaseResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "type": {
+            "type": "string",
+            "title": "Type"
+          },
+          "goal": {
+            "type": "string",
+            "title": "Goal"
+          },
+          "state": {
+            "type": "string",
+            "title": "State"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version"
+          },
+          "owner": {
+            "type": "string",
+            "title": "Owner"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/EvidenceResponse"
+            },
+            "type": "array",
+            "title": "Evidence",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "session_id",
+          "type",
+          "goal",
+          "state",
+          "version",
+          "owner",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "CaseResponse"
+      },
+      "CaseStatusResponse": {
+        "properties": {
+          "case_id": {
+            "type": "string",
+            "title": "Case Id"
+          },
+          "state": {
+            "type": "string",
+            "title": "State"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "case_id",
+          "state",
+          "version",
+          "updated_at"
+        ],
+        "title": "CaseStatusResponse"
+      },
+      "CreateCaseRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 3,
+            "title": "Text",
+            "description": "Nội dung khiếu nại tiếng Việt từ khách hàng hoặc sự kiện kinh doanh (CLAIM)"
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal",
+            "description": "Mục tiêu điều tra nếu được chỉ định trước"
+          },
+          "type": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Type",
+            "description": "Loại sự cố (PAYMENT_DISPUTE, REFUND_REQUEST, ORDER_SYNC)",
+            "default": "PAYMENT_DISPUTE"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key",
+            "description": "Khóa chống trùng lặp từ client khi gửi lại request"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "CreateCaseRequest"
+      },
+      "CreateSessionRequest": {
+        "properties": {
+          "ttl_minutes": {
+            "type": "integer",
+            "maximum": 1440.0,
+            "minimum": 5.0,
+            "title": "Ttl Minutes",
+            "description": "Session TTL in minutes",
+            "default": 60
+          },
+          "max_cases": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Max Cases",
+            "description": "Max cases quota for this guest session",
+            "default": 20
+          },
+          "seed_fixtures": {
+            "type": "boolean",
+            "title": "Seed Fixtures",
+            "description": "Seed synthetic MOCK orders/payments",
+            "default": true
+          }
+        },
+        "type": "object",
+        "title": "CreateSessionRequest"
+      },
+      "DatabaseHealth": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ],
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "DatabaseHealth"
+      },
+      "DemoSessionResponse": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "max_cases": {
+            "type": "integer",
+            "title": "Max Cases"
+          },
+          "case_count": {
+            "type": "integer",
+            "title": "Case Count"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id",
+          "token",
+          "status",
+          "max_cases",
+          "case_count",
+          "expires_at",
+          "created_at"
+        ],
+        "title": "DemoSessionResponse"
+      },
+      "ErrorBody": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "details": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Details"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ErrorBody"
+      },
+      "ErrorEnvelope": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorBody"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "title": "ErrorEnvelope"
+      },
+      "EvidenceResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "case_id": {
+            "type": "string",
+            "title": "Case Id"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "source_ref": {
+            "type": "string",
+            "title": "Source Ref"
+          },
+          "payload_json": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Payload Json"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Observed At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "case_id",
+          "kind",
+          "source",
+          "source_ref",
+          "payload_json",
+          "observed_at"
+        ],
+        "title": "EvidenceResponse"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded"
+            ],
+            "title": "Status"
+          },
+          "service": {
+            "type": "string",
+            "title": "Service"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version"
+          },
+          "environment": {
+            "type": "string",
+            "title": "Environment"
+          },
+          "source_mode": {
+            "$ref": "#/components/schemas/SourceMode"
+          },
+          "model_mode": {
+            "$ref": "#/components/schemas/ModelMode"
+          },
+          "database": {
+            "$ref": "#/components/schemas/DatabaseHealth"
+          },
+          "checked_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Checked At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "service",
+          "version",
+          "environment",
+          "source_mode",
+          "model_mode",
+          "database",
+          "checked_at"
+        ],
+        "title": "HealthResponse"
+      },
+      "ModelMode": {
+        "type": "string",
+        "enum": [
+          "DEMO_RULES",
+          "LLM_API"
+        ],
+        "title": "ModelMode",
+        "description": "Effective reasoning mode reported to the UI.\n\nDEMO_RULES = deterministic fallback, must never be presented as generative AI.\nLLM_API = an external model provider is configured (adapter lands in Prompt 02)."
+      },
+      "SourceMode": {
+        "type": "string",
+        "enum": [
+          "MOCK",
+          "MOMO_SANDBOX"
+        ],
+        "title": "SourceMode",
+        "description": "Where business/payment data comes from. Only MOCK is implemented in the MVP."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}
