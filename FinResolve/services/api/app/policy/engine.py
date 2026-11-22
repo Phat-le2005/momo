@@ -392,9 +392,12 @@ class PolicyEngine:
         checked: list[str],
         lock_rows: bool,
         for_execution: bool = False,
+        case_id: str | None = None,
+        evidence_refs: list[str] | None = None,
     ) -> PolicyEvaluationResult:
         """Strictly validate all payment, order, merchant, currency, result_code, source_mode,
-        and refund balance invariants, and enforce proposal-only gate before Prompt 04."""
+        in-flight pending/unknown refund locks, and deterministic RiskEngine ledger invariants
+        under database lock immediately before REFUND_EXECUTE."""
         stmt_pay = select(SimPayment).where(
             SimPayment.id == params.payment_id,
             SimPayment.session_id == self._session_id,
@@ -511,11 +514,75 @@ class PolicyEngine:
             stmt_refunds = stmt_refunds.with_for_update()
         existing_refunds = list(self._db.scalars(stmt_refunds).all())
 
-        used_balance = sum(
-            r.completed_amount if r.status == RefundStatus.COMPLETED.value else r.requested_amount
-            for r in existing_refunds
+        settled_balance = sum(
+            r.completed_amount for r in existing_refunds if r.status == RefundStatus.COMPLETED.value
         )
+        in_flight_refunds = [
+            r
+            for r in existing_refunds
+            if r.status in (RefundStatus.PENDING.value, RefundStatus.UNKNOWN.value)
+        ]
+        pending_or_unknown_balance = sum(r.requested_amount for r in in_flight_refunds)
+        used_balance = settled_balance + pending_or_unknown_balance
         remaining_balance = payment.amount - used_balance
+
+        # Hardening 2 (Prompt 04): Enforce RiskEngine safety inside PolicyEngine/ActionExecutor
+        # under database lock. Reject any new refund when the payment has PENDING or UNKNOWN
+        # refunds, even if available numeric balance remains! Never rely on frontend having
+        # called /risks/evaluate-refund first.
+        from app.risk.engine import RiskEngine
+
+        risk_engine = RiskEngine(self._db, self._session_id)
+        risk_eval = risk_engine.evaluate_refund_request(
+            requested_amount=params.amount,
+            payment_id=payment.id,
+            order_id=target_order_id,
+            expected_merchant_id=params.merchant_id,
+            expected_currency=params.currency,
+            case_id=case_id,
+            evidence_refs=evidence_refs,
+            persist_signals=False,
+            lock_rows=lock_rows,
+        )
+
+        if in_flight_refunds:
+            in_flight_statuses = sorted({r.status for r in in_flight_refunds})
+            return self._deny(
+                contract,
+                "IN_FLIGHT_PENDING_REFUND",
+                f"Payment '{payment.id}' has in-flight refund(s) with status "
+                f"{in_flight_statuses} ({pending_or_unknown_balance} {payment.currency}). "
+                "New refunds are rejected under lock until in-flight refunds are reconciled, "
+                "even if numeric balance remains.",
+                checked,
+                snapshot={
+                    "payment_id": payment.id,
+                    "payment_amount": payment.amount,
+                    "settled_refunds": settled_balance,
+                    "pending_or_held_refunds": pending_or_unknown_balance,
+                    "remaining_balance": remaining_balance,
+                    "in_flight_refund_ids": [r.id for r in in_flight_refunds],
+                    "in_flight_statuses": in_flight_statuses,
+                    "requested_amount": params.amount,
+                },
+            )
+        checked.append("no_in_flight_pending_or_unknown_refunds")
+
+        if settled_balance >= payment.amount:
+            return self._deny(
+                contract,
+                "ALREADY_REFUNDED_PAYMENT",
+                f"Payment '{payment.id}' is already fully refunded "
+                f"({settled_balance}/{payment.amount} {payment.currency})",
+                checked,
+                snapshot={
+                    "payment_id": payment.id,
+                    "payment_amount": payment.amount,
+                    "settled_refunds": settled_balance,
+                    "remaining_balance": 0,
+                    "requested_amount": params.amount,
+                },
+            )
 
         if remaining_balance <= 0 or params.amount > remaining_balance:
             return self._deny(
@@ -532,13 +599,29 @@ class PolicyEngine:
                     "requested_amount": params.amount,
                 },
             )
+
+        if not risk_eval.allowed:
+            primary_rule = (
+                risk_eval.signals[0].rule_code if risk_eval.signals else "RISK_ENGINE_HOLD_ACTION"
+            )
+            return self._deny(
+                contract,
+                primary_rule,
+                f"RiskEngine blocked refund ({primary_rule}): {risk_eval.explanation_vi}",
+                checked,
+                snapshot={
+                    "payment_id": payment.id,
+                    "recommended_response": risk_eval.recommended_response,
+                    "remaining_balance": risk_eval.ledger.refundable_remainder,
+                    "requested_amount": params.amount,
+                },
+            )
+
         checked.append(
             "refund_amount_within_remaining_eligible_balance_across_completed_pending_unknown"
         )
+        checked.append("risk_engine_pre_execution_check_passed")
 
-        # Hardening 3 & Prompt 04: Valid conditional/partial refunds that pass all
-        # merchant, currency, result_code, source_mode, and remaining balance invariants
-        # are allowed to proceed under approval in MOCK mode.
         return PolicyEvaluationResult(
             allowed=True,
             policy_version=POLICY_VERSION,

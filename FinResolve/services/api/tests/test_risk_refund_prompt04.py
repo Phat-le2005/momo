@@ -469,7 +469,7 @@ def test_refund_execute_rejected_under_lock_when_pending_or_unknown_refund_exist
     assert exec_unknown.status_code == 409
     assert exec_unknown.json()["error"]["details"]["violation_code"] == "IN_FLIGHT_PENDING_REFUND"
 
-    # Verify no additional SimRefund was created
+    # Verify no additional SimRefund was created while PENDING or UNKNOWN refund existed
     with maker() as db:
         all_refs = list(
             db.scalars(
@@ -477,6 +477,34 @@ def test_refund_execute_rejected_under_lock_when_pending_or_unknown_refund_exist
             ).all()
         )
         assert len(all_refs) == 1
+
+    # 4. Once the in-flight refund is reconciled as FAILED (no longer PENDING/UNKNOWN),
+    #    the approved 100,000 VND partial refund executes cleanly under lock, and
+    #    idempotent replay of the already completed execution returns 200 OK without duplicating.
+    with maker() as db:
+        ref_row = db.get(SimRefund, "REF-INFLIGHT-LOCK-01")
+        assert ref_row is not None
+        ref_row.status = RefundStatus.FAILED.value
+        db.commit()
+
+    exec_after_reconcile = client.post(
+        "/api/v1/actions/PROP-LOCK-INFLIGHT-01/execute",
+        headers={**finance_headers, "X-Idempotency-Key": "EXEC-INFLIGHT-CLEARED-01"},
+    )
+    assert exec_after_reconcile.status_code == 200
+    assert exec_after_reconcile.json()["execution_state"] == "EXECUTED"
+    assert exec_after_reconcile.json()["idempotent_replay"] is False
+    assert exec_after_reconcile.json()["case_state"] == CaseState.RESOLVED.value
+
+    # Idempotent replay of the already completed execution succeeds even though a COMPLETED
+    # refund now exists on the payment
+    exec_idemp_replay = client.post(
+        "/api/v1/actions/PROP-LOCK-INFLIGHT-01/execute",
+        headers={**finance_headers, "X-Idempotency-Key": "EXEC-INFLIGHT-CLEARED-01"},
+    )
+    assert exec_idemp_replay.status_code == 200
+    assert exec_idemp_replay.json()["idempotent_replay"] is True
+    assert exec_idemp_replay.json()["execution_id"] == exec_after_reconcile.json()["execution_id"]
 
 
 def test_tenant_isolation_rejects_cross_session_and_nonexistent_case_ids(
@@ -540,29 +568,54 @@ def test_tenant_isolation_rejects_cross_session_and_nonexistent_case_ids(
 
 
 def test_docker_and_production_secret_validation() -> None:
-    """Hardening 1: APP_ENV=docker or production requires a strong >= 32-char DEMO_APPROVAL_SECRET
-    and rejects empty, short, or known insecure default secrets."""
-    with pytest.raises(ValidationError, match="DEMO_APPROVAL_SECRET"):
-        Settings(
-            app_env="docker",
-            demo_approval_secret="finresolve-dev-only-hmac-approval-secret-2026-change-me",
-        )
+    """Hardening 1 (P0 Blocker 1):
+    - APP_ENV=docker or production requires a strong random external DEMO_APPROVAL_SECRET (>= 32 chars).
+    - Rejects all known repository example/default keys, including the former hardcoded Docker Compose
+      fallback key ('finresolve_docker_hmac_signing_key_v1_9f8e7d6c5b4a3f2e') and .env.example
+      placeholder ('replace_with_strong_random_32_plus_char_hmac_secret_key').
+    - Verifies infra/docker-compose.yml has no hardcoded fallback for DEMO_APPROVAL_SECRET."""
+    import secrets
+    from pathlib import Path
 
-    with pytest.raises(ValidationError, match="DEMO_APPROVAL_SECRET"):
-        Settings(
-            app_env="docker",
-            demo_approval_secret="too-short-secret",
-        )
+    # 1. Former hardcoded Docker Compose key MUST be rejected in docker, production, and local
+    hardcoded_docker_key = "finresolve_docker_hmac_signing_key_v1_9f8e7d6c5b4a3f2e"
+    for env_name in ("docker", "production", "local"):
+        with pytest.raises(ValidationError, match="DEMO_APPROVAL_SECRET"):
+            Settings(
+                app_env=env_name,
+                demo_approval_secret=hardcoded_docker_key,  # type: ignore[arg-type]
+            )
 
-    with pytest.raises(ValidationError, match="DEMO_APPROVAL_SECRET"):
-        Settings(
-            app_env="production",
-            demo_approval_secret="",
-        )
+    # 2. All repository example/default keys MUST be rejected in docker & production
+    repo_example_and_default_keys = (
+        "",
+        "too-short-secret",
+        "finresolve-demo-manager-hmac-signing-key-local-only",
+        "finresolve-dev-only-hmac-approval-secret-2026-change-me",
+        "replace_with_strong_random_32_plus_char_hmac_secret_key",
+        "replace-with-strong-random-32-plus-char-hmac-secret-key",
+        "finresolve_docker_hmac_signing_key_v1_9f8e7d6c5b4a3f2e",
+    )
+    for env_name in ("docker", "production"):
+        for bad_key in repo_example_and_default_keys:
+            with pytest.raises(ValidationError, match="DEMO_APPROVAL_SECRET"):
+                Settings(
+                    app_env=env_name,
+                    demo_approval_secret=bad_key,  # type: ignore[arg-type]
+                )
 
+    # 3. Verify infra/docker-compose.yml has no hardcoded fallback for DEMO_APPROVAL_SECRET
+    compose_path = Path(__file__).resolve().parents[3] / "infra" / "docker-compose.yml"
+    compose_text = compose_path.read_text(encoding="utf-8")
+    assert hardcoded_docker_key not in compose_text
+    assert "${DEMO_APPROVAL_SECRET:?" in compose_text
+    assert "${DEMO_APPROVAL_SECRET:-" not in compose_text
+
+    # 4. A strong random external secret (>= 32 chars) succeeds in docker & production
+    random_external_secret = secrets.token_urlsafe(36)
     valid_docker_settings = Settings(
         app_env="docker",
-        demo_approval_secret="finresolve_docker_hmac_signing_key_v1_9f8e7d6c5b4a3f2e",
+        demo_approval_secret=random_external_secret,  # type: ignore[arg-type]
     )
     assert valid_docker_settings.app_env == "docker"
 

@@ -12,6 +12,10 @@ INSECURE_DEFAULT_SECRETS: frozenset[str] = frozenset(
     {
         "",
         "finresolve-demo-manager-hmac-signing-key-local-only",
+        "finresolve-dev-only-hmac-approval-secret-2026-change-me",
+        "finresolve_docker_hmac_signing_key_v1_9f8e7d6c5b4a3f2e",
+        "replace_with_strong_random_32_plus_char_hmac_secret_key",
+        "replace-with-strong-random-32-plus-char-hmac-secret-key",
         "change-me",
         "change-me-local-only",
         "default",
@@ -19,6 +23,14 @@ INSECURE_DEFAULT_SECRETS: frozenset[str] = frozenset(
         "password",
         "123456",
         "demo-secret",
+    }
+)
+FORBIDDEN_REPO_EXAMPLE_SECRETS: frozenset[str] = frozenset(
+    {
+        "finresolve_docker_hmac_signing_key_v1_9f8e7d6c5b4a3f2e",
+        "replace_with_strong_random_32_plus_char_hmac_secret_key",
+        "replace-with-strong-random-32-plus-char-hmac-secret-key",
+        "finresolve-dev-only-hmac-approval-secret-2026-change-me",
     }
 )
 LOCAL_DEV_ENVIRONMENTS: frozenset[str] = frozenset({"local", "test", "dev", "development"})
@@ -91,24 +103,36 @@ class Settings(BaseSettings):
     def _validate_demo_approval_secret(self) -> Settings:
         env_norm = self.app_env.strip().lower()
         secret_val = self.demo_approval_secret.get_secret_value().strip()
+        secret_lower = secret_val.lower()
 
-        # Always reject trivial weak placeholder values even in local/test if explicitly set
-        if secret_val.lower() in {"change-me", "default", "secret", "password", "123456", ""}:
+        # Always reject trivial weak placeholder values or known repository example/docker keys
+        if (
+            secret_lower in {"change-me", "default", "secret", "password", "123456", ""}
+            or secret_val in FORBIDDEN_REPO_EXAMPLE_SECRETS
+            or secret_lower in FORBIDDEN_REPO_EXAMPLE_SECRETS
+            or "replace_with_" in secret_lower
+            or "replace-with-" in secret_lower
+        ):
             raise ValueError(
-                "DEMO_APPROVAL_SECRET cannot be empty or an insecure placeholder value"
+                "DEMO_APPROVAL_SECRET cannot be empty, a known repository example/default key, "
+                "or an insecure placeholder value"
             )
 
-        # In deployed environments (non-local/test), strictly require an explicit strong secret
+        # In deployed environments (docker, production, staging, etc.), strictly require
+        # an external strong random secret and reject all known defaults/examples.
         if env_norm not in LOCAL_DEV_ENVIRONMENTS:
             if (
                 secret_val in INSECURE_DEFAULT_SECRETS
-                or "local-only" in secret_val.lower()
-                or "change-me" in secret_val.lower()
+                or secret_lower in INSECURE_DEFAULT_SECRETS
+                or "local-only" in secret_lower
+                or "change-me" in secret_lower
+                or "example" in secret_lower
+                or "placeholder" in secret_lower
                 or len(secret_val) < 32
             ):
                 raise ValueError(
                     f"Deployed environment (APP_ENV='{self.app_env}') requires an explicit, "
-                    "strong DEMO_APPROVAL_SECRET (>= 32 chars, not the local default)"
+                    "strong DEMO_APPROVAL_SECRET (>= 32 chars, not a repository example or default)"
                 )
         return self
 
