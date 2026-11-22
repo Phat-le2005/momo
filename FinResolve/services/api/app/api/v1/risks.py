@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Body, Depends, Header, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.session import get_current_session
+from app.core.session import (
+    ApproverPrincipal,
+    get_current_approver_principal,
+    get_current_session,
+)
 from app.db.session import get_db
 from app.models.enums import RiskResponse
 from app.models.risk import RiskSignal
@@ -17,13 +21,36 @@ from app.schemas.risk import (
     EvaluateRefundRiskRequest,
     RefundBalanceLedgerResponse,
     RefundRiskEvaluationResponse,
+    ResolveRiskSignalRequest,
     RiskCenterListResponse,
     RiskRuleDocResponse,
     RiskSignalDetailResponse,
     SeededRiskScenariosResponse,
+    SeedRiskScenariosRequest,
 )
 
 router = APIRouter(prefix="/risks", tags=["risks"])
+
+
+def _to_signal_detail_response(s: RiskSignal) -> RiskSignalDetailResponse:
+    lifecycle = str(s.details_json.get("lifecycle_status") or "ACTIVE").upper()
+    return RiskSignalDetailResponse(
+        id=s.id,
+        case_id=s.case_id,
+        session_id=s.session_id,
+        category=s.category,
+        level=s.level,
+        response=s.response,
+        lifecycle_status=lifecycle,
+        rule_code=str(s.details_json.get("rule_code")) if s.details_json.get("rule_code") else None,
+        explanation_vi=str(s.details_json.get("explanation_vi"))
+        if s.details_json.get("explanation_vi")
+        else None,
+        evidence_refs=s.evidence_refs,
+        source_refs=[str(r) for r in (s.details_json.get("source_refs") or [])],
+        details_json=s.details_json,
+        created_at=s.created_at,
+    )
 
 
 @router.get(
@@ -38,6 +65,10 @@ def list_risk_signals(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> RiskCenterListResponse:
+    if case_id:
+        # Strict tenant isolation: reject cross-session or nonexistent case_id with 404
+        RiskEngine(db, current_session.id).validate_session_case(case_id)
+
     stmt = (
         select(RiskSignal)
         .where(RiskSignal.session_id == current_session.id)
@@ -51,32 +82,17 @@ def list_risk_signals(
         stmt = stmt.where(RiskSignal.response == response.strip().upper())
 
     signals = list(db.scalars(stmt).all())
+    items = [_to_signal_detail_response(s) for s in signals]
 
-    items = [
-        RiskSignalDetailResponse(
-            id=s.id,
-            case_id=s.case_id,
-            session_id=s.session_id,
-            category=s.category,
-            level=s.level,
-            response=s.response,
-            rule_code=str(s.details_json.get("rule_code"))
-            if s.details_json.get("rule_code")
-            else None,
-            explanation_vi=str(s.details_json.get("explanation_vi"))
-            if s.details_json.get("explanation_vi")
-            else None,
-            evidence_refs=s.evidence_refs,
-            source_refs=[str(r) for r in (s.details_json.get("source_refs") or [])],
-            details_json=s.details_json,
-            created_at=s.created_at,
-        )
-        for s in signals
-    ]
-
-    hold_count = sum(1 for s in signals if s.response == RiskResponse.HOLD_ACTION.value)
-    review_count = sum(1 for s in signals if s.response == RiskResponse.REVIEW.value)
-    observe_count = sum(1 for s in signals if s.response == RiskResponse.OBSERVE.value)
+    hold_count = sum(1 for s in items if s.response == RiskResponse.HOLD_ACTION.value)
+    active_hold_count = sum(
+        1
+        for s in items
+        if s.response == RiskResponse.HOLD_ACTION.value and s.lifecycle_status == "ACTIVE"
+    )
+    cleared_count = sum(1 for s in items if s.lifecycle_status == "CLEARED")
+    review_count = sum(1 for s in items if s.response == RiskResponse.REVIEW.value)
+    observe_count = sum(1 for s in items if s.response == RiskResponse.OBSERVE.value)
 
     return RiskCenterListResponse(
         session_id=current_session.id,
@@ -84,6 +100,8 @@ def list_risk_signals(
         policy_version=POLICY_VERSION,
         total_count=len(items),
         hold_action_count=hold_count,
+        active_hold_action_count=active_hold_count,
+        cleared_count=cleared_count,
         review_count=review_count,
         observe_count=observe_count,
         items=items,
@@ -152,16 +170,52 @@ def evaluate_refund_risk(
 
 
 @router.post(
+    "/{signal_id}/resolve",
+    response_model=RiskSignalDetailResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Resolve/clear an active HOLD_ACTION RiskSignal after manager review",
+)
+def resolve_risk_signal(
+    signal_id: str,
+    payload: ResolveRiskSignalRequest,
+    principal: ApproverPrincipal = Depends(get_current_approver_principal),
+    current_session: DemoSession = Depends(get_current_session),
+    db: Session = Depends(get_db),
+) -> RiskSignalDetailResponse:
+    engine = RiskEngine(db, current_session.id)
+    signal = engine.resolve_risk_signal(
+        signal_id=signal_id,
+        principal=principal,
+        new_response=payload.new_response,
+        resolution_note=payload.resolution_note,
+    )
+    db.commit()
+    db.refresh(signal)
+    return _to_signal_detail_response(signal)
+
+
+@router.post(
     "/scenarios/seed",
     response_model=SeededRiskScenariosResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Seed the two Prompt 04 refund scenarios (valid partial & blocked duplicate refund)",
 )
 def seed_refund_risk_scenarios(
+    response: Response,
+    payload: SeedRiskScenariosRequest | None = Body(default=None),
+    x_idempotency_key: str | None = Header(default=None, alias="X-Idempotency-Key"),
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> SeededRiskScenariosResponse:
-    seeded = seed_risk_refund_cases(db, current_session.id)
+    force_new = payload.force_new if payload is not None else False
+    seeded = seed_risk_refund_cases(
+        db,
+        current_session.id,
+        idempotency_key=x_idempotency_key,
+        force_new=force_new,
+    )
+    if seeded.get("idempotent_replay"):
+        response.status_code = status.HTTP_200_OK
     return SeededRiskScenariosResponse(
         session_id=current_session.id,
         source_mode="MOCK",

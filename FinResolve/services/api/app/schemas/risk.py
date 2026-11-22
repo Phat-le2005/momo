@@ -15,6 +15,7 @@ class RiskSignalDetailResponse(BaseModel):
     category: str
     level: str
     response: str
+    lifecycle_status: str = "ACTIVE"
     rule_code: str | None = None
     explanation_vi: str | None = None
     evidence_refs: list[str]
@@ -38,10 +39,33 @@ class RiskCenterListResponse(BaseModel):
     policy_version: str = "FinResolve-Policy-v1.2"
     total_count: int
     hold_action_count: int
+    active_hold_action_count: int = 0
+    cleared_count: int = 0
     review_count: int
     observe_count: int
     items: list[RiskSignalDetailResponse]
     rules_catalog: list[RiskRuleDocResponse]
+
+
+class ResolveRiskSignalRequest(BaseModel):
+    new_response: str = Field(
+        default="REVIEW",
+        pattern=r"^(REVIEW|OBSERVE)$",
+        description="Target non-blocking response after manager review (REVIEW or OBSERVE)",
+    )
+    resolution_note: str = Field(
+        ...,
+        min_length=5,
+        max_length=1000,
+        description="Mandatory audit justification for clearing HOLD_ACTION",
+    )
+
+
+class SeedRiskScenariosRequest(BaseModel):
+    force_new: bool = Field(
+        default=False,
+        description="If false (default), replays existing seeded scenario pair for the session",
+    )
 
 
 class EvaluateRefundRiskRequest(BaseModel):
@@ -81,6 +105,7 @@ class RefundRiskEvaluationResponse(BaseModel):
 class SeededRiskScenariosResponse(BaseModel):
     session_id: str
     source_mode: str = "MOCK"
+    idempotent_replay: bool = False
     valid_partial_refund_case_id: str
     valid_partial_refund_proposal_id: str
     valid_partial_refund_order_id: str

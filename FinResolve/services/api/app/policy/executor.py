@@ -35,6 +35,7 @@ Hard Domain Invariants:
 
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -68,6 +69,20 @@ from app.policy.contracts import (
     get_action_contract,
 )
 from app.policy.engine import PolicyEngine
+
+_LOCKS_GUARD = threading.Lock()
+_PROPOSAL_EXEC_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _get_proposal_exec_lock(proposal_id: str) -> threading.Lock:
+    """Return a per-proposal mutex so concurrent callers serialize across the Phase 1 commit
+    and Phase 2 independent post-commit PostgreSQL verification session."""
+    with _LOCKS_GUARD:
+        lock = _PROPOSAL_EXEC_LOCKS.get(proposal_id)
+        if lock is None:
+            lock = threading.Lock()
+            _PROPOSAL_EXEC_LOCKS[proposal_id] = lock
+        return lock
 
 
 @dataclass
@@ -295,6 +310,14 @@ class ActionExecutor:
     ) -> ExecutionOutcome:
         """Recover verification for a committed ActionExecution that remained in VERIFYING
         without a Verification record. Never repeats the business side effect."""
+        with _get_proposal_exec_lock(proposal_id):
+            return self._recover_verification_locked(proposal_id=proposal_id)
+
+    def _recover_verification_locked(
+        self,
+        *,
+        proposal_id: str,
+    ) -> ExecutionOutcome:
         proposal = self._db.scalar(
             select(ActionProposal)
             .where(
@@ -363,6 +386,22 @@ class ActionExecutor:
         )
 
     def execute_proposal(
+        self,
+        *,
+        proposal_id: str,
+        idempotency_key: str,
+        simulate_timeout: bool = False,
+        simulate_verification_failure: bool = False,
+    ) -> ExecutionOutcome:
+        with _get_proposal_exec_lock(proposal_id):
+            return self._execute_proposal_locked(
+                proposal_id=proposal_id,
+                idempotency_key=idempotency_key,
+                simulate_timeout=simulate_timeout,
+                simulate_verification_failure=simulate_verification_failure,
+            )
+
+    def _execute_proposal_locked(
         self,
         *,
         proposal_id: str,
@@ -725,8 +764,16 @@ class ActionExecutor:
                     extra_payload={"execution_id": execution.id},
                 )
 
-        # 8. Transactional verification under the active row lock, followed by durable commit
-        #    and an independent post-commit read-back check in a separate DB session (Req 5).
+        # 8. Commit Phase 1 (durable mock write, ActionExecution(EXECUTED), and Case(VERIFYING))
+        #    to PostgreSQL BEFORE independent verification runs!
+        self._db.commit()
+        self._db.refresh(execution)
+        self._db.refresh(proposal)
+        if case_obj is not None:
+            self._db.refresh(case_obj)
+
+        # 9. Phase 2: Use a fresh independent PostgreSQL session to re-read committed Order,
+        #    Payment, and Refund rows and verify postconditions before marking Case RESOLVED.
         return self._run_post_commit_verification_phase(
             execution=execution,
             proposal=proposal,
@@ -742,14 +789,15 @@ class ActionExecutor:
         case_obj: Case | None,
         is_recovery: bool,
     ) -> ExecutionOutcome:
-        """Complete verification under the row lock, commit to PostgreSQL, and confirm durable
-        post-commit state via a separate independent database session."""
+        """Open a fresh independent PostgreSQL session after Phase 1 commit to re-read the
+        actual committed SimOrder, SimPayment, and SimRefund rows, verify all postconditions,
+        and only then transition Case from VERIFYING to RESOLVED (or FAILED)."""
         verifier = Verifier(self._db, self._session_id)
         verification = verifier.verify_execution(
             execution=execution,
             proposal=proposal,
             case=case_obj,
-            use_separate_readback_session=is_recovery,
+            use_separate_readback_session=True,
         )
 
         if case_obj is not None:
@@ -819,17 +867,8 @@ class ActionExecutor:
                     },
                 )
 
-        # Commit atomic transaction (releasing row locks after Verification & Case state persist)
+        # Commit Phase 2 (Verification record and VERIFYING -> RESOLVED/FAILED transition)
         self._db.commit()
-
-        # Perform separate post-commit durable read-back check in a fresh independent DB session!
-        with get_sessionmaker()() as durable_db:
-            durable_verif = durable_db.get(Verification, verification.id)
-            if durable_verif is not None:
-                durable_post = dict(durable_verif.postconditions_json)
-                durable_post["post_commit_durable_read_back"] = True
-                durable_verif.postconditions_json = durable_post
-                durable_db.commit()
 
         self._db.refresh(execution)
         self._db.refresh(proposal)

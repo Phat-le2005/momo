@@ -30,6 +30,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.cases.state_machine import can_transition, transition_case
+from app.core.errors import AppError, ErrorCode
+from app.core.session import ApproverPrincipal
 from app.models.actions import ActionProposal
 from app.models.cases import Case, CaseEvent, Evidence
 from app.models.enums import (
@@ -47,7 +49,10 @@ from app.models.enums import (
     RiskResponse,
 )
 from app.models.risk import RiskSignal
+from app.models.session import DemoSession
 from app.models.simulator import SimOrder, SimPayment, SimRefund
+
+MAX_RISK_SCENARIO_SEEDS_PER_SESSION = 3
 
 
 @dataclass(frozen=True)
@@ -206,6 +211,30 @@ class RiskEngine:
         self._db = db
         self._session_id = session_id
 
+    def validate_session_case(self, case_id: str) -> Case:
+        """Strictly verify that `case_id` exists and belongs to the authenticated session.
+        Rejects cross-session and nonexistent Case IDs with 404 NOT_FOUND before any read/write."""
+        clean_id = case_id.strip()
+        if not clean_id:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                "Case ID cannot be empty",
+                status_code=404,
+            )
+        case_obj = self._db.scalar(
+            select(Case).where(
+                Case.id == clean_id,
+                Case.session_id == self._session_id,
+            )
+        )
+        if case_obj is None:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                f"Case '{clean_id}' not found in current session",
+                status_code=404,
+            )
+        return case_obj
+
     def compute_refundable_balance(
         self,
         *,
@@ -341,6 +370,10 @@ class RiskEngine:
         lock_rows: bool = False,
     ) -> RefundRiskEvaluation:
         """Deterministically evaluate a refund request against ledger state and policy rules."""
+        validated_case: Case | None = None
+        if case_id is not None:
+            validated_case = self.validate_session_case(case_id)
+
         ev_refs = list(evidence_refs or [])
         ledger, payment, order = self.compute_refundable_balance(
             payment_id=payment_id,
@@ -535,9 +568,9 @@ class RiskEngine:
                 )
             )
 
-        if persist_signals and detected and case_id is not None:
+        if persist_signals and detected and validated_case is not None:
             for item in detected:
-                sig = self._persist_risk_signal_and_event(case_id=case_id, item=item)
+                sig = self._persist_risk_signal_and_event(case_id=validated_case.id, item=item)
                 item.persisted_signal_id = sig.id
 
         has_hold = any(d.response == RiskResponse.HOLD_ACTION.value for d in detected)
@@ -585,6 +618,7 @@ class RiskEngine:
         """Record a governance/execution RiskSignal (e.g. expired approval or stale version)."""
         if case_id is None:
             return None
+        validated_case = self.validate_session_case(case_id)
         item = DetectedRiskItem(
             category=category.value,
             level=level.value,
@@ -595,7 +629,89 @@ class RiskEngine:
             source_refs=source_refs,
             details=details or {},
         )
-        return self._persist_risk_signal_and_event(case_id=case_id, item=item)
+        return self._persist_risk_signal_and_event(case_id=validated_case.id, item=item)
+
+    def resolve_risk_signal(
+        self,
+        *,
+        signal_id: str,
+        principal: ApproverPrincipal,
+        new_response: str = RiskResponse.REVIEW.value,
+        resolution_note: str,
+    ) -> RiskSignal:
+        """Authenticated manager lifecycle resolution for an active HOLD_ACTION RiskSignal.
+        Transitions the signal's lifecycle_status from ACTIVE to CLEARED and downgrades
+        its response from HOLD_ACTION to REVIEW or OBSERVE with full audit trail."""
+        target_resp = new_response.strip().upper()
+        if target_resp not in (RiskResponse.REVIEW.value, RiskResponse.OBSERVE.value):
+            raise AppError(
+                ErrorCode.BAD_REQUEST,
+                f"Resolved RiskSignal response must be REVIEW or OBSERVE, got '{new_response}'",
+                status_code=400,
+            )
+        clean_note = resolution_note.strip()
+        if len(clean_note) < 5:
+            raise AppError(
+                ErrorCode.BAD_REQUEST,
+                "resolution_note must be at least 5 characters",
+                status_code=400,
+            )
+
+        signal = self._db.scalar(
+            select(RiskSignal)
+            .where(
+                RiskSignal.id == signal_id.strip(),
+                RiskSignal.session_id == self._session_id,
+            )
+            .with_for_update()
+        )
+        if signal is None:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                f"RiskSignal '{signal_id}' not found in current session",
+                status_code=404,
+            )
+
+        validated_case = self.validate_session_case(signal.case_id)
+        now = datetime.now(UTC)
+        previous_response = signal.response
+        updated_details = dict(signal.details_json or {})
+        updated_details.update(
+            {
+                "lifecycle_status": "CLEARED",
+                "previous_response": previous_response,
+                "cleared_to_response": target_resp,
+                "cleared_by_role": principal.role,
+                "cleared_by_id": principal.principal_id,
+                "cleared_by_source_mode": principal.source_mode,
+                "cleared_at": now.isoformat(),
+                "resolution_note": clean_note,
+            }
+        )
+        signal.response = target_resp
+        signal.details_json = updated_details
+
+        evt = CaseEvent(
+            id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
+            case_id=validated_case.id,
+            session_id=self._session_id,
+            type="RISK_SIGNAL_CLEARED",
+            payload_json={
+                "risk_signal_id": signal.id,
+                "previous_response": previous_response,
+                "new_response": target_resp,
+                "lifecycle_status": "CLEARED",
+                "rule_code": updated_details.get("rule_code"),
+                "cleared_by_role": principal.role,
+                "cleared_by_id": principal.principal_id,
+                "source_mode": principal.source_mode,
+                "resolution_note": clean_note,
+            },
+            created_at=now,
+        )
+        self._db.add(evt)
+        self._db.flush()
+        return signal
 
     def _persist_risk_signal_and_event(
         self,
@@ -603,10 +719,11 @@ class RiskEngine:
         case_id: str,
         item: DetectedRiskItem,
     ) -> RiskSignal:
+        validated_case = self.validate_session_case(case_id)
         now = datetime.now(UTC)
         signal = RiskSignal(
             id=f"RSK-{uuid.uuid4().hex[:10].upper()}",
-            case_id=case_id,
+            case_id=validated_case.id,
             session_id=self._session_id,
             category=item.category,
             level=item.level,
@@ -614,6 +731,7 @@ class RiskEngine:
             response=item.response,
             details_json={
                 "rule_code": item.rule_code,
+                "lifecycle_status": "ACTIVE",
                 "explanation_vi": item.explanation_vi,
                 "source_refs": item.source_refs,
                 "non_accusatory_notice": (
@@ -627,7 +745,7 @@ class RiskEngine:
 
         evt = CaseEvent(
             id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
-            case_id=case_id,
+            case_id=validated_case.id,
             session_id=self._session_id,
             type="RISK_SIGNAL_DETECTED",
             payload_json={
@@ -635,6 +753,7 @@ class RiskEngine:
                 "category": item.category,
                 "level": item.level,
                 "response": item.response,
+                "lifecycle_status": "ACTIVE",
                 "rule_code": item.rule_code,
                 "explanation_vi": item.explanation_vi,
                 "evidence_refs": item.evidence_refs,
@@ -647,14 +766,144 @@ class RiskEngine:
         return signal
 
 
-def seed_risk_refund_cases(db: Session, session_id: str) -> dict[str, Any]:
+def seed_risk_refund_cases(
+    db: Session,
+    session_id: str,
+    *,
+    idempotency_key: str | None = None,
+    force_new: bool = False,
+) -> dict[str, Any]:
     """Seed the two distinct Prompt 04 refund demonstration Cases in `session_id`:
     1. `valid_partial_refund`: Paid 500,000 VND order with 0 prior refunds and an eligible
        200,000 VND partial refund proposal ready for approval & execution in MOCK.
     2. `blocked_duplicate_refund`: Already-refunded 500,000 VND order (`ORD-REF-...`) where a
        repeat 500,000 VND refund complaint is deterministically blocked by RiskEngine with
        `CONFIRMED_POLICY_VIOLATION` and `HOLD_ACTION`.
+
+    Enforces session row lock, idempotent replay by default (or via idempotency_key),
+    per-session scenario seed rate limit (`MAX_RISK_SCENARIO_SEEDS_PER_SESSION`), and
+    session `max_cases` quota.
     """
+    demo_session = db.scalar(
+        select(DemoSession).where(DemoSession.id == session_id).with_for_update()
+    )
+    if demo_session is None:
+        raise AppError(
+            ErrorCode.NOT_FOUND,
+            f"DemoSession '{session_id}' not found",
+            status_code=404,
+        )
+
+    existing_valid_cases = list(
+        db.scalars(
+            select(Case)
+            .where(
+                Case.session_id == session_id,
+                Case.id.like("CASE-REF-VALID-%"),
+            )
+            .order_by(Case.created_at.desc())
+        ).all()
+    )
+    existing_blocked_cases = list(
+        db.scalars(
+            select(Case)
+            .where(
+                Case.session_id == session_id,
+                Case.id.like("CASE-REF-BLOCK-%"),
+            )
+            .order_by(Case.created_at.desc())
+        ).all()
+    )
+
+    clean_key = idempotency_key.strip() if idempotency_key else None
+    if clean_key:
+        seed_events = list(
+            db.scalars(
+                select(CaseEvent)
+                .where(
+                    CaseEvent.session_id == session_id,
+                    CaseEvent.type == "RISK_SCENARIO_SEEDED",
+                )
+                .order_by(CaseEvent.created_at.desc())
+            ).all()
+        )
+        for ev in seed_events:
+            if ev.payload_json.get("idempotency_key") == clean_key:
+                cached = dict(ev.payload_json.get("seeded_payload") or {})
+                if cached:
+                    cached["idempotent_replay"] = True
+                    return cached
+
+    if not force_new and existing_valid_cases and existing_blocked_cases:
+        latest_valid = existing_valid_cases[0]
+        latest_blocked = existing_blocked_cases[0]
+        latest_prop = db.scalar(
+            select(ActionProposal)
+            .where(
+                ActionProposal.session_id == session_id,
+                ActionProposal.case_id == latest_valid.id,
+            )
+            .order_by(ActionProposal.created_at.desc())
+            .limit(1)
+        )
+        blocked_sigs = list(
+            db.scalars(
+                select(RiskSignal)
+                .where(
+                    RiskSignal.session_id == session_id,
+                    RiskSignal.case_id == latest_blocked.id,
+                )
+                .order_by(RiskSignal.created_at.asc())
+            ).all()
+        )
+        if latest_prop is not None:
+            already_ref_ord = db.scalar(
+                select(SimOrder).where(
+                    SimOrder.session_id == session_id,
+                    SimOrder.id.like("ORD-REF-%"),
+                )
+            )
+            return {
+                "idempotent_replay": True,
+                "valid_partial_refund_case_id": latest_valid.id,
+                "valid_partial_refund_proposal_id": latest_prop.id,
+                "valid_partial_refund_order_id": str(latest_prop.params_json.get("order_id") or ""),
+                "valid_partial_refund_payment_id": str(
+                    latest_prop.params_json.get("payment_id") or ""
+                ),
+                "blocked_duplicate_refund_case_id": latest_blocked.id,
+                "blocked_duplicate_refund_order_id": (
+                    already_ref_ord.id
+                    if already_ref_ord is not None
+                    else str(latest_prop.params_json.get("order_id") or "")
+                ),
+                "blocked_risk_signal_ids": [s.id for s in blocked_sigs],
+            }
+
+    if len(existing_valid_cases) >= MAX_RISK_SCENARIO_SEEDS_PER_SESSION:
+        raise AppError(
+            ErrorCode.RATE_LIMITED,
+            f"Risk scenario seed rate limit exceeded ({MAX_RISK_SCENARIO_SEEDS_PER_SESSION} "
+            "seed batches per session).",
+            status_code=429,
+            details={
+                "session_id": session_id,
+                "max_seed_batches": MAX_RISK_SCENARIO_SEEDS_PER_SESSION,
+            },
+        )
+
+    if demo_session.case_count + 2 > demo_session.max_cases:
+        raise AppError(
+            ErrorCode.RATE_LIMITED,
+            f"Session case quota exceeded ({demo_session.case_count} + 2 > "
+            f"{demo_session.max_cases})",
+            status_code=429,
+            details={
+                "case_count": demo_session.case_count,
+                "max_cases": demo_session.max_cases,
+            },
+        )
+
     now = datetime.now(UTC)
     suffix = uuid.uuid4().hex[:8].upper()
 
@@ -885,8 +1134,9 @@ def seed_risk_refund_cases(db: Session, session_id: str) -> dict[str, Any]:
             reason=eval_blocked.explanation_vi,
         )
 
-    db.commit()
-    return {
+    demo_session.case_count += 2
+    seeded_payload: dict[str, Any] = {
+        "idempotent_replay": False,
         "valid_partial_refund_case_id": valid_case.id,
         "valid_partial_refund_proposal_id": valid_proposal.id,
         "valid_partial_refund_order_id": elig_order.id,
@@ -897,3 +1147,20 @@ def seed_risk_refund_cases(db: Session, session_id: str) -> dict[str, Any]:
             s.persisted_signal_id for s in eval_blocked.signals if s.persisted_signal_id
         ],
     }
+    if clean_key:
+        db.add(
+            CaseEvent(
+                id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
+                case_id=valid_case.id,
+                session_id=session_id,
+                type="RISK_SCENARIO_SEEDED",
+                payload_json={
+                    "idempotency_key": clean_key,
+                    "seeded_payload": seeded_payload,
+                },
+                created_at=now,
+            )
+        )
+
+    db.commit()
+    return seeded_payload

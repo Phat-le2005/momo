@@ -149,7 +149,7 @@ class PolicyEngine:
                     checked,
                 )
 
-            # Check for any active HOLD_ACTION RiskSignal on this Case
+            # Check for any active (non-cleared) HOLD_ACTION RiskSignal on this Case
             hold_signals = list(
                 self._db.scalars(
                     select(RiskSignal).where(
@@ -159,8 +159,13 @@ class PolicyEngine:
                     )
                 ).all()
             )
-            if hold_signals:
-                categories = [s.category for s in hold_signals]
+            active_holds = [
+                s
+                for s in hold_signals
+                if str(s.details_json.get("lifecycle_status") or "ACTIVE").upper() == "ACTIVE"
+            ]
+            if active_holds:
+                categories = [s.category for s in active_holds]
                 return self._deny(
                     contract,
                     "RISK_HOLD_ACTION_ACTIVE",
@@ -216,6 +221,8 @@ class PolicyEngine:
                 checked=checked,
                 lock_rows=lock_rows,
                 for_execution=for_execution,
+                case_id=proposal.case_id,
+                evidence_refs=proposal.evidence_refs,
             )
         if isinstance(validated_params, HoldOrderActionParams):
             return self._evaluate_hold_order(
