@@ -64,6 +64,13 @@ def _to_task_response(task: AgentTask) -> AgentTaskItemResponse:
     )
 
 
+def _active_incident_tasks(tasks: list[AgentTask] | None) -> list[AgentTask]:
+    """Return latest non-superseded tasks for an Incident (falling back to all if none active)."""
+    all_tasks = list(tasks or [])
+    active = [t for t in all_tasks if not (t.handoff_json or {}).get("superseded")]
+    return active if active else all_tasks
+
+
 def _to_incident_detail_response(db: Session, incident: Incident) -> IncidentDetailResponse:
     settings = get_settings()
     case_ids = [ic.case_id for ic in (incident.incident_cases or [])]
@@ -117,7 +124,7 @@ def _to_incident_detail_response(db: Session, incident: Incident) -> IncidentDet
         shared_factors_json=safe_factors,
         evidence_refs=list(incident.evidence_refs or []),
         linked_cases=linked_items,
-        assigned_tasks=[_to_task_response(t) for t in (incident.tasks or [])],
+        assigned_tasks=[_to_task_response(t) for t in _active_incident_tasks(incident.tasks)],
         rejected_lookalikes=rejected,
         created_at=incident.created_at,
         updated_at=incident.updated_at,
@@ -156,7 +163,7 @@ def list_incidents(
             correlation_key=inc.correlation_key,
             correlation_trace=inc.correlation_trace,
             linked_cases_count=len(inc.incident_cases or []),
-            assigned_tasks_count=len(inc.tasks or []),
+            assigned_tasks_count=len(_active_incident_tasks(inc.tasks)),
             confidence=inc.confidence,
             shared_factors_json=sanitize_no_oracle_leak(dict(inc.shared_factors_json or {})),
             evidence_refs=list(inc.evidence_refs or []),
@@ -228,6 +235,7 @@ def get_incident_detail(
 )
 def list_incident_tasks(
     incident_id: str,
+    include_superseded: bool = False,
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> list[AgentTaskItemResponse]:
@@ -245,7 +253,10 @@ def list_incident_tasks(
             f"Incident '{incident_id}' not found in current session",
             status_code=404,
         )
-    return [_to_task_response(t) for t in (incident.tasks or [])]
+    tasks = (
+        list(incident.tasks or []) if include_superseded else _active_incident_tasks(incident.tasks)
+    )
+    return [_to_task_response(t) for t in tasks]
 
 
 @router.post(

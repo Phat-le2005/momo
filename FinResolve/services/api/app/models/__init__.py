@@ -28,6 +28,7 @@ from app.models.enums import (
 )
 from app.models.incidents import AgentTask, Incident, IncidentCase
 from app.models.risk import RiskSignal
+from app.models.scenario_runs import SimScenarioRun
 from app.models.session import DemoSession
 from app.models.simulator import (
     InventoryLevel,
@@ -83,6 +84,7 @@ __all__ = [
     "SimPayment",
     "SimPaymentEvent",
     "SimRefund",
+    "SimScenarioRun",
     "TaskforceRole",
     "Verification",
     "VerificationVerdict",

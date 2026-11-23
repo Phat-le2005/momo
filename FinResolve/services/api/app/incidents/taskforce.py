@@ -227,9 +227,18 @@ class TaskforceManager:
         )
         if existing_tasks and not force_rerun:
             return existing_tasks
+
+        now = datetime.now(UTC)
         if existing_tasks and force_rerun:
+            # Preserve AgentTask history: NEVER delete audit handoffs referenced by CaseEvent.
+            # Mark prior active tasks as superseded in handoff_json and append new tasks.
             for old_t in existing_tasks:
-                self._db.delete(old_t)
+                old_hj = dict(old_t.handoff_json or {})
+                if not old_hj.get("superseded"):
+                    old_hj["superseded"] = True
+                    old_hj["superseded_at"] = now.isoformat()
+                    old_t.handoff_json = old_hj
+                    old_t.updated_at = now
             self._db.flush()
 
         inc_loaded = self._db.scalar(
@@ -277,7 +286,6 @@ class TaskforceManager:
         # Honest model-mode reporting: TaskforceManager uses deterministic rule orchestration
         # and does not invoke an external LLM.
         effective_runtime_mode = "DEMO_RULES"
-        now = datetime.now(UTC)
 
         created_tasks: list[AgentTask] = []
 

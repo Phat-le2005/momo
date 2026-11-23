@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from app import __version__
 from app.api.v1.actions import router as actions_router
 from app.api.v1.cases import router as cases_router
+from app.api.v1.demo_scenarios import router as demo_scenarios_router
 from app.api.v1.incidents import router as incidents_router
 from app.api.v1.risks import router as risks_router
 from app.api.v1.sessions import router as sessions_router
@@ -15,6 +16,7 @@ from app.core.config import ModelMode, SourceMode, get_settings
 
 api_v1_router = APIRouter(prefix="/api/v1")
 api_v1_router.include_router(sessions_router)
+api_v1_router.include_router(demo_scenarios_router)
 api_v1_router.include_router(cases_router)
 api_v1_router.include_router(actions_router)
 api_v1_router.include_router(risks_router)

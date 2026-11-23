@@ -107,6 +107,195 @@
         }
       }
     },
+    "/api/v1/demo/scenarios": {
+      "get": {
+        "tags": [
+          "demo-scenarios"
+        ],
+        "summary": "List deterministic synthetic scenarios (payment_sync, refund_risk, mega_live)",
+        "operationId": "list_demo_scenarios_api_v1_demo_scenarios_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ScenarioCatalogItemResponse"
+                  },
+                  "type": "array",
+                  "title": "Response List Demo Scenarios Api V1 Demo Scenarios Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/demo/scenarios/{scenario_id}/run": {
+      "post": {
+        "tags": [
+          "demo-scenarios"
+        ],
+        "summary": "Run a deterministic synthetic scenario synchronously or asynchronously (MOCK only)",
+        "operationId": "run_demo_scenario_api_v1_demo_scenarios__scenario_id__run_post",
+        "parameters": [
+          {
+            "name": "scenario_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Scenario Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/RunScenarioRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScenarioRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/demo/runs/{run_id}/status": {
+      "get": {
+        "tags": [
+          "demo-scenarios"
+        ],
+        "summary": "Poll status and progress of a synthetic scenario run",
+        "operationId": "get_scenario_run_status_api_v1_demo_runs__run_id__status_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScenarioRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/demo/runs/{run_id}/report": {
+      "get": {
+        "tags": [
+          "demo-scenarios"
+        ],
+        "summary": "Get honest verified outcome report from test-only Oracle scorer (labeled MOCK)",
+        "operationId": "get_scenario_run_report_api_v1_demo_runs__run_id__report_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScenarioOracleReportResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/demo/sessions/reset": {
+      "post": {
+        "tags": [
+          "demo-scenarios"
+        ],
+        "summary": "Reset current guest DemoSession synthetic world for repeatable deterministic runs",
+        "operationId": "reset_current_demo_session_api_v1_demo_sessions_reset_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResetResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/cases": {
       "post": {
         "tags": [
@@ -1032,6 +1221,16 @@
             "schema": {
               "type": "string",
               "title": "Incident Id"
+            }
+          },
+          {
+            "name": "include_superseded",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Include Superseded"
             }
           }
         ],
@@ -3723,6 +3922,297 @@
         ],
         "title": "RoleCapabilityResponse"
       },
+      "RunScenarioRequest": {
+        "properties": {
+          "seed": {
+            "type": "integer",
+            "maximum": 2147483647.0,
+            "minimum": 1.0,
+            "title": "Seed",
+            "default": 20261122
+          },
+          "order_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Count",
+            "description": "Number of synthetic orders for mega_live (50-100; default 60)"
+          },
+          "run_async": {
+            "type": "boolean",
+            "title": "Run Async",
+            "description": "Run batch scenario asynchronously in background and poll /status",
+            "default": false
+          },
+          "reset_before_run": {
+            "type": "boolean",
+            "title": "Reset Before Run",
+            "description": "Reset current DemoSession synthetic world before running scenario",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "RunScenarioRequest"
+      },
+      "ScenarioCatalogItemResponse": {
+        "properties": {
+          "scenario_id": {
+            "type": "string",
+            "title": "Scenario Id"
+          },
+          "control_label": {
+            "type": "string",
+            "title": "Control Label"
+          },
+          "title_vi": {
+            "type": "string",
+            "title": "Title Vi"
+          },
+          "description_vi": {
+            "type": "string",
+            "title": "Description Vi"
+          },
+          "default_order_count": {
+            "type": "integer",
+            "title": "Default Order Count"
+          },
+          "min_order_count": {
+            "type": "integer",
+            "title": "Min Order Count"
+          },
+          "max_order_count": {
+            "type": "integer",
+            "title": "Max Order Count"
+          },
+          "source_mode": {
+            "type": "string",
+            "title": "Source Mode",
+            "default": "MOCK"
+          }
+        },
+        "type": "object",
+        "required": [
+          "scenario_id",
+          "control_label",
+          "title_vi",
+          "description_vi",
+          "default_order_count",
+          "min_order_count",
+          "max_order_count"
+        ],
+        "title": "ScenarioCatalogItemResponse"
+      },
+      "ScenarioOracleReportResponse": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "scenario_id": {
+            "type": "string",
+            "title": "Scenario Id"
+          },
+          "seed": {
+            "type": "integer",
+            "title": "Seed"
+          },
+          "source_mode": {
+            "type": "string",
+            "title": "Source Mode",
+            "default": "MOCK"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "verdict": {
+            "type": "string",
+            "title": "Verdict"
+          },
+          "unsafe_effects_count": {
+            "type": "integer",
+            "title": "Unsafe Effects Count"
+          },
+          "verified_resolved_count": {
+            "type": "integer",
+            "title": "Verified Resolved Count"
+          },
+          "pending_unverified_count": {
+            "type": "integer",
+            "title": "Pending Unverified Count"
+          },
+          "mismatched_count": {
+            "type": "integer",
+            "title": "Mismatched Count"
+          },
+          "blocked_risk_count": {
+            "type": "integer",
+            "title": "Blocked Risk Count"
+          },
+          "correlated_incident_count": {
+            "type": "integer",
+            "title": "Correlated Incident Count"
+          },
+          "false_merges_count": {
+            "type": "integer",
+            "title": "False Merges Count"
+          },
+          "stock_oversell_detected": {
+            "type": "boolean",
+            "title": "Stock Oversell Detected"
+          },
+          "duplicate_ipn_deduplicated": {
+            "type": "boolean",
+            "title": "Duplicate Ipn Deduplicated"
+          },
+          "oracle_leak_detected": {
+            "type": "boolean",
+            "title": "Oracle Leak Detected"
+          },
+          "performance_metrics": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Performance Metrics"
+          },
+          "unsafe_effect_details": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Unsafe Effect Details"
+          },
+          "known_limitations": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Known Limitations"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "session_id",
+          "scenario_id",
+          "seed",
+          "status",
+          "verdict",
+          "unsafe_effects_count",
+          "verified_resolved_count",
+          "pending_unverified_count",
+          "mismatched_count",
+          "blocked_risk_count",
+          "correlated_incident_count",
+          "false_merges_count",
+          "stock_oversell_detected",
+          "duplicate_ipn_deduplicated",
+          "oracle_leak_detected"
+        ],
+        "title": "ScenarioOracleReportResponse"
+      },
+      "ScenarioRunResponse": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "scenario_id": {
+            "type": "string",
+            "title": "Scenario Id"
+          },
+          "seed": {
+            "type": "integer",
+            "title": "Seed"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "progress_pct": {
+            "type": "integer",
+            "title": "Progress Pct"
+          },
+          "orders_generated": {
+            "type": "integer",
+            "title": "Orders Generated"
+          },
+          "case_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Case Ids"
+          },
+          "incident_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Incident Ids"
+          },
+          "source_mode": {
+            "type": "string",
+            "title": "Source Mode",
+            "default": "MOCK"
+          },
+          "metrics": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metrics"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "session_id",
+          "scenario_id",
+          "seed",
+          "status",
+          "progress_pct",
+          "orders_generated",
+          "case_ids",
+          "incident_ids",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "ScenarioRunResponse"
+      },
       "SeedIncidentScenarioRequest": {
         "properties": {
           "force_new": {
@@ -3884,6 +4374,37 @@
           "blocked_risk_signal_ids"
         ],
         "title": "SeededRiskScenariosResponse"
+      },
+      "SessionResetResponse": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "source_mode": {
+            "type": "string",
+            "title": "Source Mode",
+            "default": "MOCK"
+          },
+          "reset_completed": {
+            "type": "boolean",
+            "title": "Reset Completed",
+            "default": true
+          },
+          "deleted_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Deleted Counts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id",
+          "deleted_counts"
+        ],
+        "title": "SessionResetResponse"
       },
       "SimulateDemoApprovalRequest": {
         "properties": {

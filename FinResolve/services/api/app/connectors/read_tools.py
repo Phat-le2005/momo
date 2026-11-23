@@ -656,17 +656,57 @@ class ReadToolRegistry:
         payment_found = payment is not None
         order_found = resolved_order is not None
 
-        conditions = []
-        if payment is not None:
-            conditions.append(SimRefund.payment_id == payment.id)
-        if resolved_order is not None:
-            conditions.append(SimRefund.order_id == resolved_order.id)
+        # Validate payment_id / order_id relationship to prevent cross-payment or cross-order
+        # refund mixing!
+        if payment is not None and order_id_arg:
+            expected_oid = resolved_order.id if resolved_order is not None else order_id_arg
+            if payment.order_id != expected_oid:
+                return ToolResult(
+                    tool_name="get_refund_history",
+                    status="ERROR",
+                    source="SIM_REFUNDS_DB",
+                    source_ref=f"sim_refunds:mismatch:{payment.id}:{expected_oid}",
+                    source_mode="MOCK",
+                    observed_at=now,
+                    data={
+                        "cross_order_payment_mismatch": True,
+                        "authority_status": "CONFLICT_CROSS_ORDER_PAYMENT_MISMATCH",
+                        "outcome": "UNKNOWN",
+                        "payment_found": True,
+                        "order_found": order_found,
+                        "payment_id": payment.id,
+                        "payment_order_id": payment.order_id,
+                        "queried_order_id": expected_oid,
+                        "refund_count": 0,
+                        "refunds": [],
+                        "message": (
+                            f"Payment '{payment.id}' belongs to order '{payment.order_id}', "
+                            f"not queried order '{expected_oid}'. Refusing to mix refund histories."
+                        ),
+                    },
+                )
 
-        if conditions:
+        # Scope strictly by payment.id when payment is resolved so refunds from another payment
+        # on the same order are NEVER mixed into this payment's history.
+        if payment is not None:
             refunds = list(
                 self._db.scalars(
                     select(SimRefund)
-                    .where(SimRefund.session_id == self._session_id, or_(*conditions))
+                    .where(
+                        SimRefund.session_id == self._session_id,
+                        SimRefund.payment_id == payment.id,
+                    )
+                    .order_by(SimRefund.created_at.asc())
+                ).all()
+            )
+        elif resolved_order is not None:
+            refunds = list(
+                self._db.scalars(
+                    select(SimRefund)
+                    .where(
+                        SimRefund.session_id == self._session_id,
+                        SimRefund.order_id == resolved_order.id,
+                    )
                     .order_by(SimRefund.created_at.asc())
                 ).all()
             )

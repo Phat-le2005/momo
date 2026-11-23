@@ -1172,3 +1172,205 @@ def test_prompt05_1_checked_case_ids_computed_from_actual_tool_invocations_only(
         assert handoff.per_case_verification_status["CASE-NO-TOOL-01"] == "UNKNOWN"
         # CASE-HAS-ORD-02 had an executable case read tool -> IS in checked_case_ids!
         assert "CASE-HAS-ORD-02" in handoff.checked_case_ids
+
+
+def test_a5c9c48_preserves_agent_task_history_referenced_by_case_events_on_recorrelation(
+    client: TestClient, active_session: dict[str, str]
+) -> None:
+    """Review a5c9c48 Item 1:
+    - Re-correlating an Incident MUST NOT delete prior `AgentTask` rows referenced by
+      `CaseEvent(type='INCIDENT_TASKFORCE_HANDOFF')`.
+    - Prior tasks are marked `superseded=True` in `handoff_json` and remain queryable in DB and
+      via `GET /api/v1/incidents/{incident_id}/tasks?include_superseded=true`."""
+    from app.models.incidents import AgentTask
+
+    token = active_session["token"]
+    headers = {"X-Demo-Session": token}
+
+    seed_res = client.post("/api/v1/incidents/scenarios/seed", headers=headers)
+    assert seed_res.status_code == 201
+    seeded = seed_res.json()
+    incident_id = seeded["incident_id"]
+    first_case_id = seeded["correlated_case_ids"][0]
+    initial_task_ids = set(seeded["assigned_task_ids"])
+    assert len(initial_task_ids) == 3
+
+    # Trigger re-correlation (which runs TaskforceManager with force_rerun=True)
+    recorr_res = client.post("/api/v1/incidents/correlate", headers=headers)
+    assert recorr_res.status_code == 200
+
+    # Active tasks endpoint returns the 3 latest non-superseded tasks
+    active_tasks = client.get(f"/api/v1/incidents/{incident_id}/tasks", headers=headers).json()
+    assert len(active_tasks) == 3
+    active_task_ids = {t["id"] for t in active_tasks}
+    assert active_task_ids.isdisjoint(initial_task_ids)
+
+    # Full history endpoint returns all 6 tasks (3 superseded + 3 active)
+    all_tasks = client.get(
+        f"/api/v1/incidents/{incident_id}/tasks?include_superseded=true",
+        headers=headers,
+    ).json()
+    assert len(all_tasks) == 6
+    all_task_ids = {t["id"] for t in all_tasks}
+    assert initial_task_ids.issubset(all_task_ids)
+    assert active_task_ids.issubset(all_task_ids)
+
+    # Every task_id referenced by CaseEvent(INCIDENT_TASKFORCE_HANDOFF) MUST still exist in DB!
+    evts = client.get(f"/api/v1/cases/{first_case_id}/events", headers=headers).json()
+    handoff_evts = [e for e in evts if e["type"] == "INCIDENT_TASKFORCE_HANDOFF"]
+    assert len(handoff_evts) == 2
+    referenced_ids = {
+        tid for e in handoff_evts for tid in (e["payload_json"].get("task_ids") or [])
+    }
+    assert initial_task_ids.issubset(referenced_ids)
+    assert active_task_ids.issubset(referenced_ids)
+
+    maker = get_sessionmaker()
+    with maker() as db:
+        db_tasks = list(db.scalars(select(AgentTask).where(AgentTask.id.in_(referenced_ids))).all())
+        assert {t.id for t in db_tasks} == referenced_ids
+        for t in db_tasks:
+            if t.id in initial_task_ids:
+                assert t.handoff_json.get("superseded") is True
+
+
+def test_a5c9c48_get_refund_history_validates_payment_order_relationship_prevents_cross_mixing(
+    active_session: dict[str, str],
+) -> None:
+    """Review a5c9c48 Item 2:
+    - `get_refund_history` with mismatched `(payment_id, order_id)` MUST return `status='ERROR'`
+      with `cross_order_payment_mismatch=True` and `outcome='UNKNOWN'` instead of mixing refunds.
+    - When an order has two payments (`PAY-A1` and `PAY-A2`) and only `PAY-A2` has a refund,
+      querying `get_refund_history(payment_id='PAY-A1', order_id='ORD-A')` MUST return 0 refunds
+      for `PAY-A1` (never mixing `PAY-A2`'s refund into `PAY-A1`)."""
+    session_id = active_session["id"]
+    now = datetime.now(UTC)
+    maker = get_sessionmaker()
+
+    with maker() as db:
+        ord_a = SimOrder(
+            id="ORD-XMIX-A",
+            session_id=session_id,
+            customer_name="Khách A",
+            customer_phone="0966111111",
+            amount=300000,
+            currency="VND",
+            subtotal=300000,
+            grand_total=300000,
+            status=OrderStatus.PAID.value,
+            payment_status=OrderPaymentStatus.PAID.value,
+        )
+        ord_b = SimOrder(
+            id="ORD-XMIX-B",
+            session_id=session_id,
+            customer_name="Khách B",
+            customer_phone="0966222222",
+            amount=300000,
+            currency="VND",
+            subtotal=300000,
+            grand_total=300000,
+            status=OrderStatus.PAID.value,
+            payment_status=OrderPaymentStatus.PAID.value,
+        )
+        pay_a1 = SimPayment(
+            id="PAY-XMIX-A1",
+            session_id=session_id,
+            order_id=ord_a.id,
+            merchant_id="MERCHANT_MOCK_01",
+            provider="MOCK_MOMO",
+            provider_ref="MOMO_XMIX_A1",
+            result_code=0,
+            amount=300000,
+            currency="VND",
+            status=PaymentStatus.SUCCESS.value,
+            verified_at=now,
+        )
+        pay_a2 = SimPayment(
+            id="PAY-XMIX-A2",
+            session_id=session_id,
+            order_id=ord_a.id,
+            merchant_id="MERCHANT_MOCK_01",
+            provider="MOCK_MOMO",
+            provider_ref="MOMO_XMIX_A2",
+            result_code=0,
+            amount=300000,
+            currency="VND",
+            status=PaymentStatus.SUCCESS.value,
+            verified_at=now,
+        )
+        pay_b = SimPayment(
+            id="PAY-XMIX-B1",
+            session_id=session_id,
+            order_id=ord_b.id,
+            merchant_id="MERCHANT_MOCK_01",
+            provider="MOCK_MOMO",
+            provider_ref="MOMO_XMIX_B1",
+            result_code=0,
+            amount=300000,
+            currency="VND",
+            status=PaymentStatus.SUCCESS.value,
+            verified_at=now,
+        )
+        ref_a2 = SimRefund(
+            id="REF-XMIX-A2",
+            session_id=session_id,
+            order_id=ord_a.id,
+            payment_id=pay_a2.id,
+            amount=100000,
+            requested_amount=100000,
+            approved_amount=100000,
+            completed_amount=100000,
+            currency="VND",
+            request_id="REQ-XMIX-A2",
+            status=RefundStatus.COMPLETED.value,
+            reason="Refund on PAY-A2 only",
+        )
+        ref_b = SimRefund(
+            id="REF-XMIX-B1",
+            session_id=session_id,
+            order_id=ord_b.id,
+            payment_id=pay_b.id,
+            amount=300000,
+            requested_amount=300000,
+            approved_amount=300000,
+            completed_amount=300000,
+            currency="VND",
+            request_id="REQ-XMIX-B1",
+            status=RefundStatus.COMPLETED.value,
+            reason="Refund on ORD-B",
+        )
+        db.add_all([ord_a, ord_b, pay_a1, pay_a2, pay_b, ref_a2, ref_b])
+        db.commit()
+
+        reg = ReadToolRegistry(db, session_id)
+
+        # 1. Cross-order mismatch: PAY-XMIX-A1 (belongs to ORD-XMIX-A) queried with ORD-XMIX-B
+        res_mismatch = reg.execute(
+            "get_refund_history",
+            {"payment_id": "PAY-XMIX-A1", "order_id": "ORD-XMIX-B"},
+        )
+        assert res_mismatch.status == "ERROR"
+        assert res_mismatch.data["cross_order_payment_mismatch"] is True
+        assert res_mismatch.data["outcome"] == "UNKNOWN"
+        assert res_mismatch.data["refunds"] == []
+
+        # 2. Same order (ORD-XMIX-A) with two payments: querying PAY-XMIX-A1 MUST NOT return
+        #    REF-XMIX-A2 (which belongs to PAY-XMIX-A2)!
+        res_a1 = reg.execute(
+            "get_refund_history",
+            {"payment_id": "PAY-XMIX-A1", "order_id": "ORD-XMIX-A"},
+        )
+        assert res_a1.status == "OK"
+        assert res_a1.data["payment_found"] is True
+        assert res_a1.data["refund_count"] == 0
+        assert res_a1.data["refunds"] == []
+        assert res_a1.data["authority_status"] == "VERIFIED_EMPTY_REFUND_HISTORY"
+
+        # 3. Querying PAY-XMIX-A2 returns ONLY REF-XMIX-A2
+        res_a2 = reg.execute(
+            "get_refund_history",
+            {"payment_id": "PAY-XMIX-A2", "order_id": "ORD-XMIX-A"},
+        )
+        assert res_a2.status == "OK"
+        assert res_a2.data["refund_count"] == 1
+        assert res_a2.data["refunds"][0]["refund_id"] == "REF-XMIX-A2"
