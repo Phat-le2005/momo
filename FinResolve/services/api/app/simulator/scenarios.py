@@ -504,7 +504,7 @@ class ScenarioRegistry:
                 db.commit()
 
                 tf_manager = TaskforceManager(db, session_id, adapter=adapter)
-                taskforce_mode = "DETERMINISTIC_TASKFORCE_RULES"
+                taskforce_mode = "DETERMINISTIC_TASKFORCE"
                 incident_ids = []
                 for inc in outcome.incidents:
                     linked_ids = set(
@@ -521,8 +521,13 @@ class ScenarioRegistry:
                         refreshed_inc = db.get(Incident, inc.id)
                         if refreshed_inc is not None:
                             sf = refreshed_inc.shared_factors_json or {}
-                            if isinstance(sf.get("taskforce_execution_mode"), str):
-                                taskforce_mode = str(sf["taskforce_execution_mode"])
+                            if sf.get("llm_output_validated") is True:
+                                taskforce_mode = str(
+                                    sf.get("taskforce_execution_mode")
+                                    or "LLM_API_ADAPTIVE_TASKFORCE"
+                                )
+                            else:
+                                taskforce_mode = "DETERMINISTIC_TASKFORCE"
                         elif tf_tasks:
                             first_mode = (tf_tasks[0].handoff_json or {}).get("reasoning_mode")
                             if isinstance(first_mode, str) and first_mode:
