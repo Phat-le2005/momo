@@ -290,6 +290,12 @@ def investigate_case(
     req = payload or InvestigateCaseRequest()
 
     if req.run_async:
+        # Recover any stale crashed worker before checking overlapping investigation lock
+        recover_stale_investigation(
+            db,
+            case_id=case_id,
+            session_id=current_session.id,
+        )
         # Validate Case ownership, non-overlapping lock, and rate limit before scheduling
         try:
             case_obj = db.scalar(
@@ -577,6 +583,12 @@ def get_case_status(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> CaseStatusResponse:
+    # Idempotently recover any stale crashed worker run on status poll (short txn when stale)
+    recover_stale_investigation(
+        db,
+        case_id=case_id,
+        session_id=current_session.id,
+    )
     stmt_case = (
         select(Case)
         .options(selectinload(Case.events), selectinload(Case.action_proposals))

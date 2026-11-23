@@ -56,6 +56,17 @@ export type Investigation = {
   decision_summary: string | null; error_message: string | null;
   proposed_action_ids: string[]; risk_signal_ids: string[];
 };
+export type CaseStatus = {
+  case_id: string;
+  state: string;
+  version: number;
+  updated_at: string;
+  model_mode: string | null;
+  latest_decision_summary: string | null;
+  pending_proposals_count: number;
+  active_run_id: string | null;
+  investigation_status: "IDLE" | "RUNNING" | "COMPLETED" | "FAILED" | "INTERRUPTED";
+};
 export type ActionApproval = { proposal_id: string; approval_mode: string; decision: string; case_state: string | null };
 export type ActionExecution = {
   proposal_id: string; execution_state: string; case_state: string | null;

@@ -4,6 +4,7 @@ import {
   clearSessionRunId,
   loadSessionRunId,
   resolveCaseAiModeLabel,
+  resolveRestoredInvestigationJob,
   resolveSelectedCaseId,
   resolveTaskforceModeLabel,
   saveSessionRunId,
@@ -76,4 +77,50 @@ test("STEP 2C: honest AI labels distinguish uninvestigated, DEMO_RULES, LLM_API,
 
   const llmTf = resolveTaskforceModeLabel("LLM_API", true);
   assert.equal(llmTf.isLlm, true);
+});
+
+test("Prompt 08.3.2 Scenario A: RUNNING investigation with active_run_id restores polling", () => {
+  const res = resolveRestoredInvestigationJob({
+    investigation_status: "RUNNING",
+    active_run_id: "RUN-ACTIVE-42",
+  });
+  assert.equal(res.jobId, "RUN-ACTIVE-42");
+  assert.equal(res.shouldPoll, true);
+  assert.ok(res.notice && res.notice.includes("RUN-ACTIVE-42"));
+});
+
+test("Prompt 08.3.2 Scenario E: terminal/idle/missing statuses never poll or auto-start investigation", () => {
+  for (const status of ["IDLE", "COMPLETED", "FAILED"] as const) {
+    const res = resolveRestoredInvestigationJob({
+      investigation_status: status,
+      active_run_id: "RUN-STALE-IGNORED",
+    });
+    assert.equal(res.jobId, null);
+    assert.equal(res.shouldPoll, false);
+    assert.equal(res.notice, null);
+  }
+
+  // INTERRUPTED shows safe recovery notice and never polls
+  const interrupted = resolveRestoredInvestigationJob({
+    investigation_status: "INTERRUPTED",
+    active_run_id: null,
+  });
+  assert.equal(interrupted.jobId, null);
+  assert.equal(interrupted.shouldPoll, false);
+  assert.ok(interrupted.notice && interrupted.notice.includes("INTERRUPTED"));
+
+  // RUNNING without an active_run_id must not start polling
+  const noRunId = resolveRestoredInvestigationJob({
+    investigation_status: "RUNNING",
+    active_run_id: "   ",
+  });
+  assert.equal(noRunId.jobId, null);
+  assert.equal(noRunId.shouldPoll, false);
+
+  // Null/undefined status never polls
+  assert.deepEqual(resolveRestoredInvestigationJob(null), {
+    jobId: null,
+    shouldPoll: false,
+    notice: null,
+  });
 });

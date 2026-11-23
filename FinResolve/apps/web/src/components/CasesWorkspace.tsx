@@ -11,9 +11,14 @@ import {
   type CaseEvent,
   type CaseProposal,
   type CaseRecord,
+  type CaseStatus,
   type Investigation,
 } from "@/lib/api";
-import { resolveCaseAiModeLabel, resolveSelectedCaseId } from "@/lib/session-state";
+import {
+  resolveCaseAiModeLabel,
+  resolveRestoredInvestigationJob,
+  resolveSelectedCaseId,
+} from "@/lib/session-state";
 import { useDemoSession } from "@/lib/useDemoSession";
 
 const KINDS = ["CLAIM", "OBSERVED_FACT", "HYPOTHESIS", "UNKNOWN"];
@@ -60,13 +65,24 @@ export function CasesWorkspace() {
     async (caseId: string) => {
       if (!session || !sessionId) return;
       const reqSessionId = sessionId;
-      const [caseData, timeline] = await Promise.all([
+      const [caseData, timeline, caseStatus] = await Promise.all([
         apiRequest<CaseRecord>(`/api/v1/cases/${encodeURIComponent(caseId)}`, { session }),
         apiRequest<CaseEvent[]>(`/api/v1/cases/${encodeURIComponent(caseId)}/events`, { session }),
+        apiRequest<CaseStatus>(`/api/v1/cases/${encodeURIComponent(caseId)}/status`, { session }),
       ]);
       if (activeSessionIdRef.current === reqSessionId && selectedIdRef.current === caseId) {
         setDetail(caseData);
         setEvents(timeline);
+        const restored = resolveRestoredInvestigationJob(caseStatus);
+        if (restored.shouldPoll && restored.jobId) {
+          setJobId((current) => (current === restored.jobId ? current : restored.jobId));
+          setNotice((current) => current || restored.notice);
+        } else {
+          setJobId((current) => (current ? null : current));
+          if (restored.notice) {
+            setNotice((current) => current || restored.notice);
+          }
+        }
       }
     },
     [session, sessionId],

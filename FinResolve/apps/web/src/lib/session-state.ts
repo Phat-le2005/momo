@@ -134,3 +134,43 @@ export function resolveTaskforceModeLabel(
     isLlm: false,
   };
 }
+
+export type RestoredInvestigationDecision = {
+  jobId: string | null;
+  shouldPoll: boolean;
+  notice: string | null;
+};
+
+/** Decide whether to restore active investigation polling after page refresh or Case switch.
+ * Never starts a new investigation automatically and never polls terminal statuses.
+ */
+export function resolveRestoredInvestigationJob(
+  status:
+    | {
+        active_run_id?: string | null;
+        investigation_status?: string | null;
+      }
+    | null
+    | undefined,
+): RestoredInvestigationDecision {
+  if (!status) return { jobId: null, shouldPoll: false, notice: null };
+  const invStatus = (status.investigation_status || "IDLE").toUpperCase();
+  const runId = typeof status.active_run_id === "string" ? status.active_run_id.trim() : "";
+
+  if (invStatus === "RUNNING" && runId.length > 0) {
+    return {
+      jobId: runId,
+      shouldPoll: true,
+      notice: `Đang khôi phục theo dõi phiên điều tra đang chạy (${runId})…`,
+    };
+  }
+  if (invStatus === "INTERRUPTED") {
+    return {
+      jobId: null,
+      shouldPoll: false,
+      notice:
+        "Phiên điều tra trước đó bị gián đoạn (INTERRUPTED) và Case đã được khôi phục an toàn. Bạn có thể xem chi tiết hoặc chạy lại điều tra nếu được phép.",
+    };
+  }
+  return { jobId: null, shouldPoll: false, notice: null };
+}
