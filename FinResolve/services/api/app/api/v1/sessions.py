@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
+from app.core.rate_limit import enforce_session_creation_rate_limit
 from app.db.seed import seed_demo_session
 from app.db.session import get_db
 from app.models.enums import SessionStatus
@@ -26,6 +27,7 @@ router = APIRouter(prefix="/demo", tags=["demo"])
 )
 def create_demo_session(
     payload: CreateSessionRequest | None = None,
+    _rate_limit: None = Depends(enforce_session_creation_rate_limit),
     db: Session = Depends(get_db),
 ) -> DemoSessionResponse:
     if payload is None:

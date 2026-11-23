@@ -19,6 +19,7 @@ from app.ai_core.schemas import InvestigationRunResult
 from app.ai_core.understanding import analyze_vietnamese_complaint
 from app.core.config import get_settings
 from app.core.errors import AppError, ErrorCode
+from app.core.rate_limit import enforce_ai_investigation_rate_limit
 from app.core.session import get_current_session
 from app.db.session import get_db, get_sessionmaker
 from app.models.actions import ActionProposal
@@ -278,6 +279,7 @@ def investigate_case(
     response: Response,
     background_tasks: BackgroundTasks,
     payload: InvestigateCaseRequest | None = None,
+    _rate_limit: None = Depends(enforce_ai_investigation_rate_limit),
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> InvestigationRunResult:
@@ -581,7 +583,7 @@ def get_case_status(
 
 def _extract_run_job_status(
     events: list[CaseEvent] | None,
-) -> tuple[str | None, Literal["IDLE", "RUNNING", "COMPLETED", "FAILED"]]:
+) -> tuple[str | None, Literal["IDLE", "RUNNING", "COMPLETED", "FAILED", "INTERRUPTED"]]:
     if not events:
         return None, "IDLE"
     for evt in reversed(events):
@@ -589,6 +591,8 @@ def _extract_run_job_status(
             return str(evt.payload_json.get("run_id") or ""), "COMPLETED"
         if evt.type == "INVESTIGATION_FAILED":
             return str(evt.payload_json.get("run_id") or ""), "FAILED"
+        if evt.type == "INVESTIGATION_INTERRUPTED":
+            return str(evt.payload_json.get("run_id") or ""), "INTERRUPTED"
         if evt.type in ("INVESTIGATION_STARTED", "INVESTIGATION_QUEUED"):
             return str(evt.payload_json.get("run_id") or ""), "RUNNING"
     return None, "IDLE"

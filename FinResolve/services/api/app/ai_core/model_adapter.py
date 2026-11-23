@@ -46,6 +46,21 @@ class ModelInvocationResult(BaseModel):
     latency_ms: int = 0
 
 
+class StructuredJsonInvocationResult(BaseModel):
+    """Validated structured JSON LLM invocation result for Taskforce and Correlation."""
+
+    data: dict[str, Any]
+    model_mode: ModelMode
+    adapter_name: str
+    provider: str
+    model_name: str
+    is_fallback: bool
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    latency_ms: int = 0
+
+
 class ModelAdapter(Protocol):
     """Protocol implemented by both live LLM adapters and deterministic fallback adapters."""
 
@@ -56,6 +71,10 @@ class ModelAdapter(Protocol):
     def adapter_name(self) -> str: ...
 
     def generate_plan(self, context: InvestigationContext) -> ModelInvocationResult: ...
+
+    def generate_structured_json(
+        self, system_prompt: str, user_message: str
+    ) -> StructuredJsonInvocationResult | None: ...
 
 
 class LLMModelAdapter:
@@ -123,6 +142,47 @@ class LLMModelAdapter:
 
         return ModelInvocationResult(
             plan=validated_plan,
+            model_mode=ModelMode.LLM_API,
+            adapter_name=self.adapter_name,
+            provider=self._provider,
+            model_name=self._model_name,
+            is_fallback=False,
+            prompt_tokens=p_tok,
+            completion_tokens=c_tok,
+            total_tokens=t_tok,
+            latency_ms=latency_ms,
+        )
+
+    def generate_structured_json(
+        self,
+        system_prompt: str,
+        user_message: str,
+    ) -> StructuredJsonInvocationResult:
+        """Invoke the configured external LLM and return a parsed JSON object with usage."""
+        start_ns = time.perf_counter_ns()
+        client = self._http_client or httpx.Client(timeout=self._timeout)
+        close_client = self._http_client is None
+        try:
+            if self._provider in ("gemini", "google", "google_gemini"):
+                raw_json_str, p_tok, c_tok, t_tok = self._call_gemini(
+                    client, system_prompt, user_message
+                )
+            elif self._provider == "anthropic":
+                raw_json_str, p_tok, c_tok, t_tok = self._call_anthropic(
+                    client, system_prompt, user_message
+                )
+            else:
+                raw_json_str, p_tok, c_tok, t_tok = self._call_openai_compatible(
+                    client, system_prompt, user_message
+                )
+        finally:
+            if close_client:
+                client.close()
+
+        parsed_obj = self._extract_json_dict(raw_json_str)
+        latency_ms = max(0, int((time.perf_counter_ns() - start_ns) / 1_000_000))
+        return StructuredJsonInvocationResult(
+            data=parsed_obj,
             model_mode=ModelMode.LLM_API,
             adapter_name=self.adapter_name,
             provider=self._provider,
@@ -290,6 +350,15 @@ class DeterministicDemoAdapter:
             total_tokens=0,
             latency_ms=latency_ms,
         )
+
+    def generate_structured_json(
+        self,
+        system_prompt: str,
+        user_message: str,
+    ) -> StructuredJsonInvocationResult | None:
+        """Deterministic fallback never pretends to invoke an external LLM."""
+        _ = (system_prompt, user_message)
+        return None
 
     def _build_deterministic_plan(self, context: InvestigationContext) -> Plan:
         called_tools = {obs.tool_name: obs for obs in context.tool_observations}

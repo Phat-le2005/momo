@@ -2184,7 +2184,8 @@
               "IDLE",
               "RUNNING",
               "COMPLETED",
-              "FAILED"
+              "FAILED",
+              "INTERRUPTED"
             ],
             "title": "Investigation Status",
             "default": "IDLE"
@@ -3124,7 +3125,8 @@
             "enum": [
               "RUNNING",
               "COMPLETED",
-              "FAILED"
+              "FAILED",
+              "INTERRUPTED"
             ],
             "title": "Job Status"
           },

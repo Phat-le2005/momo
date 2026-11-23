@@ -456,7 +456,9 @@ class ScenarioRegistry:
             if investigate_selected_exception and recommended_ids:
                 selected_case_id = recommended_ids[0]
                 db.flush()
-                runtime = BoundedAgentRuntime(db, max_steps=6)
+                # Pass manage_transactions=False so BoundedAgentRuntime never prematurely commits
+                # uncommitted simulator rows before execute_run finalizes atomically.
+                runtime = BoundedAgentRuntime(db, max_steps=6, manage_transactions=False)
                 inv_result = runtime.investigate_case(
                     case_id=selected_case_id,
                     session_id=session_id,

@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, select
@@ -77,6 +77,8 @@ class BoundedAgentRuntime:
         max_replans: int = 2,
         max_wall_time_seconds: float = 15.0,
         token_budget: int | None = None,
+        manage_transactions: bool = True,
+        stale_investigation_timeout_seconds: int = 120,
     ) -> None:
         settings = get_settings()
         self._db = db
@@ -87,6 +89,74 @@ class BoundedAgentRuntime:
         self._token_budget = (
             token_budget if token_budget is not None else settings.model_budget_tokens
         )
+        self._manage_transactions = manage_transactions
+        self._stale_investigation_timeout_seconds = max(1, stale_investigation_timeout_seconds)
+
+    def _maybe_commit(self) -> None:
+        """Commit the current short transaction unless an outer caller owns transaction scope."""
+        if self._manage_transactions:
+            self._db.commit()
+
+    def _reacquire_investigating_case(
+        self,
+        *,
+        case_id: str,
+        session_id: str,
+        expected_version: int,
+        run_id: str,
+    ) -> Case:
+        """Re-lock Case in a short write transaction after LLM I/O and verify optimistic version."""
+        try:
+            fresh = self._db.scalar(
+                select(Case)
+                .where(Case.id == case_id, Case.session_id == session_id)
+                .with_for_update(nowait=True)
+            )
+        except OperationalError as err:
+            self._db.rollback()
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"CONCURRENT_CASE_MODIFICATION: Case '{case_id}' is locked by another writer",
+                status_code=409,
+                details={"case_id": case_id, "run_id": run_id},
+            ) from err
+
+        if fresh is None:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                f"Case '{case_id}' no longer exists in session '{session_id}'",
+                status_code=404,
+            )
+
+        if fresh.state != CaseState.INVESTIGATING.value or fresh.version != expected_version:
+            self._record_event(
+                case=fresh,
+                event_type="INVESTIGATION_INTERRUPTED",
+                payload={
+                    "run_id": run_id,
+                    "job_status": "INTERRUPTED",
+                    "reason": "CONCURRENT_CASE_STATE_OR_VERSION_CHANGE",
+                    "expected_version": expected_version,
+                    "actual_version": fresh.version,
+                    "actual_state": fresh.state,
+                },
+            )
+            self._maybe_commit()
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"INVESTIGATION_INTERRUPTED: Case '{case_id}' changed concurrently "
+                f"(expected version {expected_version}/INVESTIGATING, got "
+                f"{fresh.version}/{fresh.state})",
+                status_code=409,
+                details={
+                    "case_id": case_id,
+                    "run_id": run_id,
+                    "expected_version": expected_version,
+                    "actual_version": fresh.version,
+                    "actual_state": fresh.state,
+                },
+            )
+        return fresh
 
     def investigate_case(
         self,
@@ -136,27 +206,57 @@ class BoundedAgentRuntime:
                             "INVESTIGATION_STARTED",
                             "INVESTIGATION_COMPLETED",
                             "INVESTIGATION_FAILED",
+                            "INVESTIGATION_INTERRUPTED",
                         ]
                     ),
                 )
             ).all()
         )
-        started_run_ids: set[str] = set()
-        queued_run_ids: set[str] = set()
+        now_utc = datetime.now(UTC)
+        stale_cutoff = now_utc - timedelta(seconds=self._stale_investigation_timeout_seconds)
+        started_runs_ts: dict[str, datetime] = {}
+        queued_runs_ts: dict[str, datetime] = {}
         finished_run_ids: set[str] = set()
         for l_evt in lifecycle_evts:
             r_id = str(l_evt.payload_json.get("run_id") or "")
             if not r_id:
                 continue
+            ev_ts = (
+                l_evt.created_at
+                if l_evt.created_at.tzinfo
+                else l_evt.created_at.replace(tzinfo=UTC)
+            )
             if l_evt.type == "INVESTIGATION_STARTED":
-                started_run_ids.add(r_id)
+                started_runs_ts[r_id] = ev_ts
             elif l_evt.type == "INVESTIGATION_QUEUED":
-                queued_run_ids.add(r_id)
-            elif l_evt.type in ("INVESTIGATION_COMPLETED", "INVESTIGATION_FAILED"):
+                queued_runs_ts[r_id] = ev_ts
+            elif l_evt.type in (
+                "INVESTIGATION_COMPLETED",
+                "INVESTIGATION_FAILED",
+                "INVESTIGATION_INTERRUPTED",
+            ):
                 finished_run_ids.add(r_id)
 
-        unfinished_started = started_run_ids - finished_run_ids
-        unfinished_queued = (queued_run_ids - finished_run_ids) - {effective_run_id}
+        # Auto-recover stale/interrupted worker runs so a crashed worker never wedges a Case
+        stale_recovered: set[str] = set()
+        for cand_run_id, cand_ts in {**queued_runs_ts, **started_runs_ts}.items():
+            if cand_run_id in finished_run_ids or cand_run_id == effective_run_id:
+                continue
+            if cand_ts <= stale_cutoff:
+                self._record_event(
+                    case=case,
+                    event_type="INVESTIGATION_INTERRUPTED",
+                    payload={
+                        "run_id": cand_run_id,
+                        "job_status": "INTERRUPTED",
+                        "reason": "STALE_WORKER_INTERRUPTED_RECOVERED",
+                    },
+                )
+                stale_recovered.add(cand_run_id)
+                finished_run_ids.add(cand_run_id)
+
+        unfinished_started = set(started_runs_ts.keys()) - finished_run_ids
+        unfinished_queued = (set(queued_runs_ts.keys()) - finished_run_ids) - {effective_run_id}
         active_unfinished = unfinished_started | unfinished_queued
         if active_unfinished:
             active_evt_run_id = sorted(active_unfinished)[0]
@@ -194,7 +294,11 @@ class BoundedAgentRuntime:
 
         # Transition Case to INVESTIGATING if not already there
         current_state = CaseState(case.state)
-        if current_state == CaseState.INVESTIGATING and existing_runs_count > 0:
+        if (
+            current_state == CaseState.INVESTIGATING
+            and existing_runs_count > 0
+            and not stale_recovered
+        ):
             raise AppError(
                 ErrorCode.CONFLICT,
                 f"OVERLAPPING_INVESTIGATION_BLOCKED: Case '{case.id}' is already in "
@@ -266,6 +370,11 @@ class BoundedAgentRuntime:
                 },
             )
 
+        # Prompt 08.2: Commit short claim transaction IMMEDIATELY so NO PostgreSQL row lock
+        # is held while waiting for external LLM API calls!
+        expected_case_version = case.version
+        self._maybe_commit()
+
         context_builder = ContextBuilder(self._db, session_id)
         tool_registry = ReadToolRegistry(self._db, session_id)
 
@@ -334,29 +443,55 @@ class BoundedAgentRuntime:
                 break
 
             current_step_num = steps_executed + 1
+            case_snapshot = self._db.scalar(
+                select(Case).where(Case.id == case_id, Case.session_id == session_id)
+            )
+            if case_snapshot is None:
+                raise AppError(
+                    ErrorCode.NOT_FOUND,
+                    f"Case '{case_id}' no longer exists",
+                    status_code=404,
+                )
             context = context_builder.build(
-                case,
+                case_snapshot,
                 step_number=current_step_num,
                 max_steps=self._max_steps,
                 tool_observations=tool_observations,
                 understanding=understanding,
                 validation_error_feedback=validation_feedback,
             )
+            # Release any read transaction BEFORE calling external LLM so zero DB locks/txns
+            # are held across network I/O.
+            if self._manage_transactions:
+                self._db.rollback()
 
             # 2. Request structured Plan from ModelAdapter & verify plan.case_id (QA T16 & Req 3)
+            plan_error: str | None = None
+            invocation = None
             try:
                 invocation = self._adapter.generate_plan(context)
                 if not isinstance(invocation.plan.case_id, str) or (
-                    invocation.plan.case_id != case.id
+                    invocation.plan.case_id != case_id
                 ):
                     raise ValueError(
-                        f"Planner case_id mismatch: expected '{case.id}', "
+                        f"Planner case_id mismatch: expected '{case_id}', "
                         f"got '{invocation.plan.case_id}'"
                     )
                 validation_feedback = None
             except Exception as exc:  # noqa: BLE001
+                plan_error = str(exc)[:300]
+
+            # Re-acquire Case in a short write transaction and validate optimistic version
+            case = self._reacquire_investigating_case(
+                case_id=case_id,
+                session_id=session_id,
+                expected_version=expected_case_version,
+                run_id=effective_run_id,
+            )
+
+            if plan_error is not None or invocation is None:
                 replans_used += 1
-                err_msg = str(exc)[:300]
+                err_msg = plan_error or "Unknown planner validation error"
                 validation_feedback = f"Previous plan output was rejected: {err_msg}"
                 self._record_event(
                     case=case,
@@ -380,7 +515,10 @@ class BoundedAgentRuntime:
                         CaseState.ESCALATED,
                         reason=last_decision_summary,
                     )
+                    expected_case_version = case.version
+                    self._maybe_commit()
                     break
+                self._maybe_commit()
                 continue
 
             total_tokens_used += invocation.total_tokens
@@ -563,8 +701,14 @@ class BoundedAgentRuntime:
                         CaseState.UNKNOWN_OUTCOME,
                         reason=last_decision_summary,
                     )
+                    expected_case_version = case.version
+                    self._maybe_commit()
                     break
 
+                # Commit short step transaction so Evidence & Trace are durable and row lock is
+                # released before the next LLM step.
+                expected_case_version = case.version
+                self._maybe_commit()
                 continue
 
             # Record non-tool step trace
@@ -687,8 +831,9 @@ class BoundedAgentRuntime:
             },
         )
 
-        self._db.commit()
-        self._db.refresh(case)
+        self._maybe_commit()
+        if self._manage_transactions:
+            self._db.refresh(case)
 
         return InvestigationRunResult(
             run_id=effective_run_id,

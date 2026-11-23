@@ -28,16 +28,18 @@ Hard Domain Invariants (Prompt 05 & Prompt 05.1 Hardening):
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.ai_core.model_adapter import ModelAdapter, get_model_adapter
 from app.connectors.read_tools import ReadToolRegistry
-from app.core.config import get_settings
+from app.core.config import ModelMode, get_settings
 from app.incidents.capabilities import CapabilityRegistry, ScopedRoleToolExecutor
 from app.incidents.correlator import sanitize_no_oracle_leak
 from app.models.cases import Case, CaseEvent
@@ -76,12 +78,56 @@ class TaskHandoffPayload(BaseModel):
     requires_per_case_approval_and_verification: bool = True
 
 
-class TaskforceManager:
-    """Conditionally selects and executes 2-3 bounded role tasks for an Incident."""
+class TaskforcePlanOutput(BaseModel):
+    """Pydantic-validated LLM role & objective plan for Adaptive Taskforce (Prompt 08.2)."""
 
-    def __init__(self, db: Session, session_id: str) -> None:
+    model_config = ConfigDict(extra="forbid")
+
+    selected_roles: list[str] = Field(..., min_length=2, max_length=3)
+    role_objectives: dict[str, str] = Field(default_factory=dict)
+    initial_hypothesis: str = Field(..., min_length=5, max_length=1000)
+
+
+class RoleHandoffSynthesis(BaseModel):
+    """Pydantic-validated per-role LLM synthesis grounded in observed tool outputs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    findings_vi: str = Field(..., min_length=5, max_length=1500)
+    contradictions: list[str] = Field(default_factory=list)
+    unknowns: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    recommended_per_case_action: str = Field(..., min_length=3, max_length=500)
+    request_replan: bool = False
+    suggested_next_role: str | None = None
+
+
+class TaskforceManager:
+    """Conditionally selects and executes 2-3 bounded role tasks for an Incident.
+
+    When `MODEL_MODE=LLM_API`, uses `ModelAdapter.generate_structured_json` for dynamic role
+    selection, evidence-grounded per-role synthesis, and bounded replanning (max 1 replan),
+    while enforcing strict `CapabilityRegistry` read-tool allowlists and zero auto-resolution.
+    When no LLM key is configured, runs deterministic `DETERMINISTIC_TASKFORCE_RULES` honestly.
+    """
+
+    def __init__(
+        self,
+        db: Session,
+        session_id: str,
+        *,
+        adapter: ModelAdapter | None = None,
+        max_llm_calls: int = 5,
+        token_budget: int | None = None,
+    ) -> None:
+        settings = get_settings()
         self._db = db
         self._session_id = session_id
+        self._adapter = adapter or get_model_adapter(settings)
+        self._max_llm_calls = max(1, min(max_llm_calls, 8))
+        self._token_budget = (
+            token_budget if token_budget is not None else settings.model_budget_tokens
+        )
 
     def select_roles_for_incident(
         self,
@@ -261,6 +307,63 @@ class TaskforceManager:
 
         all_case_ids = [ic.case_id for ic in inc_cases]
         selected_roles, role_rationale = self.select_roles_for_incident(target_inc, inc_cases)
+        role_objectives_override: dict[str, str] = {}
+
+        llm_calls_used = 0
+        llm_calls_succeeded = 0
+        llm_prompt_tokens = 0
+        llm_completion_tokens = 0
+        llm_total_tokens = 0
+        llm_fallback_reasons: list[str] = []
+        valid_role_values = {r.value for r in TaskforceRole}
+
+        # Prompt 08.2: When adapter is LLM_API, let LLM plan role selection & objectives
+        # within the strict backend whitelist (2-3 roles, read-only scopes).
+        if self._adapter.mode == ModelMode.LLM_API and llm_calls_used < self._max_llm_calls:
+            llm_calls_used += 1
+            plan_sys = (
+                "You are the FinResolve Adaptive Taskforce Coordinator. "
+                "Select 2 to 3 roles from [FINANCE, OPERATIONS, RISK, SUPPORT] based ONLY on "
+                "observed incident evidence. Return strict JSON matching: "
+                '{"selected_roles": [...], "role_objectives": {"ROLE": "..."}, '
+                '"initial_hypothesis": "..."}. Never invent payment proofs or auto-resolve cases.'
+            )
+            plan_payload = sanitize_no_oracle_leak(
+                {
+                    "incident_id": target_inc.id,
+                    "title": target_inc.title,
+                    "hypothesis": target_inc.hypothesis,
+                    "linked_cases_count": len(inc_cases),
+                    "shared_factors": target_inc.shared_factors_json,
+                    "deterministic_rationale": role_rationale,
+                }
+            )
+            try:
+                plan_inv = self._adapter.generate_structured_json(
+                    plan_sys, json.dumps(plan_payload, ensure_ascii=False, default=str)
+                )
+                if plan_inv is not None:
+                    llm_prompt_tokens += plan_inv.prompt_tokens
+                    llm_completion_tokens += plan_inv.completion_tokens
+                    llm_total_tokens += plan_inv.total_tokens
+                    parsed_plan = TaskforcePlanOutput.model_validate(plan_inv.data)
+                    filtered_roles: list[str] = []
+                    for r_name in parsed_plan.selected_roles:
+                        rn = r_name.strip().upper()
+                        if rn in valid_role_values and rn not in filtered_roles:
+                            filtered_roles.append(rn)
+                    if len(filtered_roles) >= 2:
+                        selected_roles = filtered_roles[:3]
+                        role_objectives_override = {
+                            k.strip().upper(): v.strip()
+                            for k, v in parsed_plan.role_objectives.items()
+                            if k.strip().upper() in valid_role_values and v.strip()
+                        }
+                        role_rationale["llm_planned_roles"] = selected_roles
+                        role_rationale["llm_initial_hypothesis"] = parsed_plan.initial_hypothesis
+                        llm_calls_succeeded += 1
+            except Exception as exc:  # noqa: BLE001
+                llm_fallback_reasons.append(f"role_plan_fallback:{str(exc)[:180]}")
 
         all_pay_ids = [
             str(ic.causal_factors_json.get("payment_id"))
@@ -282,17 +385,22 @@ class TaskforceManager:
         sampled_ics = self._select_sample_incident_cases(inc_cases, pay_ids_with_refunds)
 
         read_registry = ReadToolRegistry(self._db, self._session_id)
-        configured_mode = get_settings().model_mode.value
-        # Honest model-mode reporting: TaskforceManager uses deterministic rule orchestration
-        # and does not invoke an external LLM.
+        configured_mode = self._adapter.mode.value
+        # Base deterministic task handoff starts as DEMO_RULES; upgraded to LLM_API ONLY
+        # after an actual LLM synthesis call succeeds and passes Pydantic validation.
         effective_runtime_mode = "DEMO_RULES"
 
         created_tasks: list[AgentTask] = []
+        prior_handoffs_summary: list[dict[str, Any]] = []
+        replans_used = 0
+        role_queue = list(selected_roles)
+        idx = 0
 
-        for idx, role_name in enumerate(selected_roles):
+        while idx < len(role_queue):
+            role_name = role_queue[idx]
             next_role = (
-                selected_roles[idx + 1]
-                if idx + 1 < len(selected_roles)
+                role_queue[idx + 1]
+                if idx + 1 < len(role_queue)
                 else "HUMAN_OPERATOR_PER_CASE_APPROVAL"
             )
             if role_name == TaskforceRole.FINANCE.value:
@@ -339,13 +447,114 @@ class TaskforceManager:
                     configured_mode=configured_mode,
                     now=now,
                 )
+
+            if role_name in role_objectives_override:
+                task.objective = role_objectives_override[role_name]
+
+            # Per-role LLM synthesis grounded strictly in observed read-tool outputs
+            within_budget = (
+                self._adapter.mode == ModelMode.LLM_API
+                and llm_calls_used < self._max_llm_calls
+                and (self._token_budget <= 0 or llm_total_tokens < self._token_budget)
+            )
+            if within_budget:
+                llm_calls_used += 1
+                role_sys = (
+                    f"You are the {role_name} Agent in FinResolve Taskforce. "
+                    "Synthesize findings ONLY from the provided tool_observations and "
+                    "prior_handoffs. Return strict JSON: "
+                    '{"findings_vi": "...", "contradictions": [...], "unknowns": [...], '
+                    '"evidence_refs": [...], "recommended_per_case_action": "...", '
+                    '"request_replan": false, "suggested_next_role": null}. '
+                    "Never mark child cases RESOLVED."
+                )
+                role_input = sanitize_no_oracle_leak(
+                    {
+                        "role": role_name,
+                        "objective": task.objective,
+                        "checked_case_ids": task.handoff_json.get("checked_case_ids", []),
+                        "unchecked_case_ids": task.handoff_json.get("unchecked_case_ids", []),
+                        "tool_observations": task.handoff_json.get("tool_observations", []),
+                        "observed_evidence_refs": list(task.evidence_refs or []),
+                        "prior_handoffs": prior_handoffs_summary,
+                    }
+                )
+                try:
+                    role_inv = self._adapter.generate_structured_json(
+                        role_sys, json.dumps(role_input, ensure_ascii=False, default=str)
+                    )
+                    if role_inv is not None:
+                        llm_prompt_tokens += role_inv.prompt_tokens
+                        llm_completion_tokens += role_inv.completion_tokens
+                        llm_total_tokens += role_inv.total_tokens
+                        synth = RoleHandoffSynthesis.model_validate(role_inv.data)
+                        observed_refs_set = set(task.evidence_refs or [])
+                        grounded_refs = [r for r in synth.evidence_refs if r in observed_refs_set]
+                        hj = dict(task.handoff_json or {})
+                        hj["findings_vi"] = synth.findings_vi
+                        hj["contradictions"] = synth.contradictions
+                        hj["unknowns"] = synth.unknowns
+                        hj["llm_grounded_evidence_refs"] = grounded_refs or list(observed_refs_set)
+                        hj["recommended_per_case_action"] = synth.recommended_per_case_action
+                        hj["runtime_mode"] = "LLM_API"
+                        hj["reasoning_mode"] = "LLM_API_ADAPTIVE_TASKFORCE"
+                        hj["llm_invoked"] = True
+                        hj["auto_resolved_children"] = False
+                        hj["requires_per_case_approval_and_verification"] = True
+                        task.handoff_json = sanitize_no_oracle_leak(hj)
+                        llm_calls_succeeded += 1
+
+                        # Bounded dynamic replan (max 1 extra whitelisted role, max 3 roles total)
+                        if (
+                            synth.request_replan
+                            and replans_used < 1
+                            and len(role_queue) < 3
+                            and isinstance(synth.suggested_next_role, str)
+                        ):
+                            cand_role = synth.suggested_next_role.strip().upper()
+                            if cand_role in valid_role_values and cand_role not in role_queue:
+                                role_queue.append(cand_role)
+                                replans_used += 1
+                                hj_replan = dict(task.handoff_json)
+                                hj_replan["handoff_to"] = cand_role
+                                hj_replan["replan_triggered"] = True
+                                task.handoff_json = hj_replan
+                except Exception as exc:  # noqa: BLE001
+                    llm_fallback_reasons.append(f"{role_name}_fallback:{str(exc)[:180]}")
+
+            prior_handoffs_summary.append(
+                {
+                    "role": role_name,
+                    "findings_vi": task.handoff_json.get("findings_vi"),
+                    "contradictions": task.handoff_json.get("contradictions", []),
+                    "unknowns": task.handoff_json.get("unknowns", []),
+                    "checked_case_ids": task.handoff_json.get("checked_case_ids", []),
+                }
+            )
             self._db.add(task)
             created_tasks.append(task)
+            idx += 1
 
+        selected_roles = list(role_queue)
+        llm_actually_invoked = llm_calls_succeeded > 0
         sf = dict(target_inc.shared_factors_json or {})
         sf["role_selection"] = sanitize_no_oracle_leak(role_rationale)
-        sf["taskforce_execution_mode"] = "DETERMINISTIC_TASKFORCE_RULES"
-        sf["llm_invoked"] = False
+        sf["taskforce_execution_mode"] = (
+            "LLM_API_ADAPTIVE_TASKFORCE"
+            if llm_actually_invoked
+            else "DETERMINISTIC_TASKFORCE_RULES"
+        )
+        sf["llm_invoked"] = llm_actually_invoked
+        sf["llm_usage"] = {
+            "adapter": self._adapter.adapter_name,
+            "calls_attempted": llm_calls_used,
+            "calls_succeeded": llm_calls_succeeded,
+            "prompt_tokens": llm_prompt_tokens,
+            "completion_tokens": llm_completion_tokens,
+            "total_tokens": llm_total_tokens,
+            "replans_used": replans_used,
+            "fallback_reasons": llm_fallback_reasons,
+        }
         target_inc.shared_factors_json = sf
         target_inc.status = IncidentStatus.TASKFORCE_ASSIGNED.value
         target_inc.updated_at = now

@@ -314,6 +314,37 @@ export function CasesWorkspace() {
   }
 
   const aiMode = detail ? resolveCaseAiModeLabel(detail.model_mode) : null;
+  const planEvents = events.filter((e) => e.type === "AI_PLAN_GENERATED");
+  const latestPlan = planEvents.length > 0 ? planEvents[planEvents.length - 1] : null;
+  const toolEvents = events.filter((e) => e.type === "TOOL_READ_COMPLETED");
+  const latestHypotheses = Array.isArray(latestPlan?.payload_json?.hypotheses)
+    ? (latestPlan.payload_json.hypotheses as Array<{
+        label?: string;
+        supporting_evidence_refs?: string[];
+      }>)
+    : [];
+  const latestNextStep =
+    latestPlan?.payload_json?.next_step && typeof latestPlan.payload_json.next_step === "object"
+      ? (latestPlan.payload_json.next_step as {
+          kind?: string;
+          tool_name?: string;
+          action_type?: string;
+        })
+      : null;
+
+  const pauseExplanation: Record<string, string> = {
+    INVESTIGATING: "Agent đang thu thập bằng chứng từ các công cụ đọc được phép.",
+    WAITING_EVIDENCE:
+      "Workflow dừng ở WAITING_EVIDENCE vì thiếu bằng chứng xác thực từ nguồn dữ liệu gốc (không tự đoán đơn hàng hay thanh toán).",
+    WAITING_APPROVAL:
+      "Workflow dừng ở WAITING_APPROVAL vì mọi hành động tài chính bắt buộc phải có xác nhận phê duyệt trước khi thực thi.",
+    UNKNOWN_OUTCOME:
+      "Workflow dừng ở UNKNOWN_OUTCOME do cổng thanh toán/công cụ phản hồi timeout hoặc trạng thái chưa xác định — không tự thử lại mù quáng.",
+    ESCALATED:
+      "Workflow chuyển ESCALATED để vận hành/rủi ro xem xét thêm thay vì tự thực thi.",
+    RESOLVED:
+      "Case đã được kiểm chứng độc lập (Verification PASSED) sau thực thi.",
+  };
 
   return (
     <div className="space-y-6">
@@ -443,6 +474,66 @@ export function CasesWorkspace() {
                   <p className="mt-3 text-sm text-amber-800">
                     Điểm chưa biết: {detail.unknowns.join("; ")}
                   </p>
+                )}
+                {pauseExplanation[detail.state] && (
+                  <p className="mt-3 rounded-lg border border-indigo-100 bg-indigo-50/70 p-3 text-xs text-indigo-900">
+                    <strong>Trạng thái luồng Agentic:</strong> {pauseExplanation[detail.state]}
+                  </p>
+                )}
+                {(latestPlan || toolEvents.length > 0) && (
+                  <div className="mt-4 space-y-3 rounded-xl border border-slate-200 bg-slate-50/70 p-3 text-xs">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <strong className="text-slate-800">
+                        Kế hoạch &amp; giả thuyết hiện tại ({planEvents.length} bước lập kế hoạch ·{" "}
+                        {toolEvents.length} lượt đọc tool)
+                      </strong>
+                      {latestNextStep?.kind && (
+                        <span className="rounded bg-white px-2 py-0.5 font-mono text-indigo-800 ring-1 ring-slate-200">
+                          {latestNextStep.kind}
+                          {latestNextStep.tool_name || latestNextStep.action_type
+                            ? ` → ${latestNextStep.tool_name || latestNextStep.action_type}`
+                            : ""}
+                        </span>
+                      )}
+                    </div>
+                    {latestHypotheses.length > 0 && (
+                      <div>
+                        <p className="font-medium text-slate-700">Giả thuyết dựa trên bằng chứng:</p>
+                        <ul className="mt-1 list-disc space-y-1 pl-4 text-slate-600">
+                          {latestHypotheses.map((h, idx) => (
+                            <li key={idx}>
+                              <span className="font-mono text-slate-800">{h.label || "hypothesis"}</span>
+                              {Array.isArray(h.supporting_evidence_refs) &&
+                                h.supporting_evidence_refs.length > 0 && (
+                                  <span className="ml-1 text-slate-500">
+                                    (chứng cứ: {h.supporting_evidence_refs.join(", ")})
+                                  </span>
+                                )}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {toolEvents.length > 0 && (
+                      <div>
+                        <p className="font-medium text-slate-700">Công cụ đọc đã thực thi:</p>
+                        <div className="mt-1 flex flex-wrap gap-1.5">
+                          {toolEvents.map((te) => (
+                            <span
+                              key={te.id}
+                              className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-0.5 font-mono text-slate-700"
+                            >
+                              <span>{String(te.payload_json.tool_name || "read_tool")}</span>
+                              <span className="text-slate-400">·</span>
+                              <span className="text-emerald-700">
+                                {String(te.payload_json.status || "OK")}
+                              </span>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 )}
                 <div className="mt-4 flex flex-wrap items-center gap-2">
                   <button

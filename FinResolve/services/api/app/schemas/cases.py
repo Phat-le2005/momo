@@ -113,7 +113,7 @@ class CaseStatusResponse(BaseModel):
     latest_decision_summary: str | None = None
     pending_proposals_count: int = 0
     active_run_id: str | None = None
-    investigation_status: Literal["IDLE", "RUNNING", "COMPLETED", "FAILED"] = "IDLE"
+    investigation_status: Literal["IDLE", "RUNNING", "COMPLETED", "FAILED", "INTERRUPTED"] = "IDLE"
 
 
 class InvestigateCaseRequest(BaseModel):
@@ -132,7 +132,7 @@ class InvestigationJobStatusResponse(BaseModel):
     run_id: str
     case_id: str
     session_id: str
-    job_status: Literal["RUNNING", "COMPLETED", "FAILED"]
+    job_status: Literal["RUNNING", "COMPLETED", "FAILED", "INTERRUPTED"]
     case_state: str
     case_version: int
     model_mode: str

@@ -415,23 +415,64 @@ export function LiveWorkspace() {
                 </p>
               </Panel>
               <Panel title={`Role Handoffs (${incident.assigned_tasks.length})`}>
-                {incident.assigned_tasks.map((t) => (
-                  <article key={t.id} className="mb-3 rounded-lg border border-slate-200 p-4">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <strong>{t.role}</strong>
-                      <StatusPill value={t.state} />
-                    </div>
-                    <p className="mt-1 text-sm text-slate-700">{t.objective}</p>
-                    <details className="mt-2 text-sm">
-                      <summary className="cursor-pointer text-indigo-700">
-                        Handoff, Case đã kiểm tra và chưa kiểm tra
-                      </summary>
-                      <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-3 text-xs">
-                        {JSON.stringify(t.handoff_json, null, 2)}
-                      </pre>
-                    </details>
-                  </article>
-                ))}
+                {incident.assigned_tasks.map((t) => {
+                  const hj = t.handoff_json || {};
+                  const checkedIds = Array.isArray(hj.checked_case_ids) ? hj.checked_case_ids : [];
+                  const uncheckedIds = Array.isArray(hj.unchecked_case_ids)
+                    ? hj.unchecked_case_ids
+                    : [];
+                  const contradictions = Array.isArray(hj.contradictions)
+                    ? (hj.contradictions as string[])
+                    : [];
+                  const unknowns = Array.isArray(hj.unknowns) ? (hj.unknowns as string[]) : [];
+                  const handoffTo = typeof hj.handoff_to === "string" ? hj.handoff_to : null;
+                  const findings = typeof hj.findings_vi === "string" ? hj.findings_vi : null;
+                  const replanTriggered = hj.replan_triggered === true;
+                  const taskLlm = hj.llm_invoked === true;
+                  return (
+                    <article key={t.id} className="mb-3 rounded-lg border border-slate-200 p-4">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <strong>{t.role}</strong>
+                        <StatusPill value={t.state} />
+                        <StatusPill value={taskLlm ? "LLM_API" : "DEMO_RULES"} />
+                        {replanTriggered && <StatusPill value="REPLAN" />}
+                        {handoffTo && (
+                          <span className="text-xs text-slate-500">
+                            Chuyển giao → <strong>{handoffTo}</strong>
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-1 text-sm text-slate-700">{t.objective}</p>
+                      {findings && (
+                        <p className="mt-2 rounded bg-slate-50 p-2.5 text-sm text-slate-800">
+                          {findings}
+                        </p>
+                      )}
+                      <p className="mt-2 text-xs text-slate-500">
+                        Đã kiểm tra trực tiếp: <strong>{checkedIds.length}</strong> Case · Chưa kiểm
+                        tra: <strong>{uncheckedIds.length}</strong> Case
+                      </p>
+                      {contradictions.length > 0 && (
+                        <p className="mt-1 text-xs text-rose-700">
+                          Mâu thuẫn phát hiện: {contradictions.join("; ")}
+                        </p>
+                      )}
+                      {unknowns.length > 0 && (
+                        <p className="mt-1 text-xs text-amber-800">
+                          Điểm chưa rõ: {unknowns.join("; ")}
+                        </p>
+                      )}
+                      <details className="mt-2 text-sm">
+                        <summary className="cursor-pointer text-indigo-700">
+                          Handoff chi tiết &amp; bằng chứng
+                        </summary>
+                        <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-3 text-xs">
+                          {JSON.stringify(t.handoff_json, null, 2)}
+                        </pre>
+                      </details>
+                    </article>
+                  );
+                })}
               </Panel>
             </>
           )}

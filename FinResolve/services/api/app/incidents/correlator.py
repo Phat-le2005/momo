@@ -29,14 +29,18 @@ Hard Domain Invariants (Prompt 05 & Prompt 05.1 Hardening):
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.ai_core.model_adapter import ModelAdapter, get_model_adapter
+from app.core.config import ModelMode, get_settings
 from app.core.errors import AppError, ErrorCode
 from app.models.cases import Case, CaseEvent, Evidence
 from app.models.enums import (
@@ -125,10 +129,25 @@ class RejectedLookalikeItem:
     rejection_reason: str
 
 
+class CorrelationReviewOutput(BaseModel):
+    """Pydantic-validated LLM review of a deterministic Incident candidate cluster."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    shared_root_cause_hypothesis: str = Field(..., min_length=5, max_length=1200)
+    supporting_evidence_refs: list[str] = Field(default_factory=list)
+    contradicting_evidence_refs: list[str] = Field(default_factory=list)
+    confirmed_case_ids: list[str] = Field(default_factory=list)
+    excluded_lookalike_case_ids: list[str] = Field(default_factory=list)
+    abstain: bool = False
+    abstain_reason: str | None = Field(default=None, max_length=500)
+
+
 @dataclass
 class CorrelationOutcome:
     incidents: list[Incident] = field(default_factory=list)
     rejected_lookalikes: list[RejectedLookalikeItem] = field(default_factory=list)
+    abstained_clusters: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _parse_iso_timestamp(ts_raw: Any) -> datetime | None:
@@ -222,11 +241,100 @@ def compute_explainable_evidence_score(
 
 
 class IncidentCorrelator:
-    """Correlates session Cases by shared causal OBSERVED_FACT evidence without oracle leakage."""
+    """Correlates session Cases by shared causal OBSERVED_FACT evidence without oracle leakage.
 
-    def __init__(self, db: Session, session_id: str) -> None:
+    Deterministic same-event causal correlation is ALWAYS the safety gate. When `MODEL_MODE=LLM_API`
+    (or an explicit LLM adapter is provided), AI-assisted review evaluates sanitized evidence,
+    highlights supporting vs contradicting references, and can abstain on weak/conflicting clusters
+    without ever merging lookalikes or auto-resolving child Cases.
+    """
+
+    def __init__(
+        self,
+        db: Session,
+        session_id: str,
+        *,
+        adapter: ModelAdapter | None = None,
+    ) -> None:
         self._db = db
         self._session_id = session_id
+        self._adapter = adapter or get_model_adapter(get_settings())
+
+    def _review_cluster_with_llm(
+        self,
+        *,
+        window_members: list[CausalObservation],
+        worker_id: str,
+        batch_id: str,
+        error_code: str,
+        all_ev_refs: list[str],
+    ) -> tuple[CorrelationReviewOutput, dict[str, Any]] | None:
+        """Invoke LLM to review sanitized cluster evidence; never sends oracle hidden truth."""
+        if self._adapter.mode != ModelMode.LLM_API:
+            return None
+        sys_prompt = (
+            "You are the FinResolve Evidence-Aware Incident Correlation Reviewer. "
+            "Review sanitized OBSERVED_FACT evidence for a candidate incident cluster. "
+            "Highlight supporting and contradicting evidence_refs. Set abstain=true if evidence "
+            "is contradictory or insufficient. Never merge cases based on complaint text alone "
+            "and never mark cases RESOLVED. Return strict JSON matching: "
+            '{"shared_root_cause_hypothesis": "...", "supporting_evidence_refs": [...], '
+            '"contradicting_evidence_refs": [...], "confirmed_case_ids": [...], '
+            '"excluded_lookalike_case_ids": [...], "abstain": false, "abstain_reason": null}.'
+        )
+        payload = sanitize_no_oracle_leak(
+            {
+                "worker_id": worker_id,
+                "batch_id": batch_id,
+                "error_code": error_code,
+                "members": [
+                    {
+                        "case_id": m.case.id,
+                        "order_id": m.order_id,
+                        "payment_id": m.payment_id,
+                        "payment_status": m.payment_status or "UNKNOWN",
+                        "causal_event_evidence_id": m.causal_event_evidence_id,
+                        "evidence_refs": m.evidence_refs,
+                        "event_timestamp": (
+                            m.event_timestamp.isoformat() if m.event_timestamp else None
+                        ),
+                    }
+                    for m in window_members
+                ],
+            }
+        )
+        try:
+            inv = self._adapter.generate_structured_json(
+                sys_prompt, json.dumps(payload, ensure_ascii=False, default=str)
+            )
+            if inv is None:
+                return None
+            review = CorrelationReviewOutput.model_validate(inv.data)
+            allowed_refs = set(all_ev_refs)
+            allowed_cases = {m.case.id for m in window_members}
+            grounded_support = [r for r in review.supporting_evidence_refs if r in allowed_refs]
+            grounded_contra = [r for r in review.contradicting_evidence_refs if r in allowed_refs]
+            grounded_confirmed = [c for c in review.confirmed_case_ids if c in allowed_cases]
+            review_meta = sanitize_no_oracle_leak(
+                {
+                    "llm_invoked": True,
+                    "adapter": inv.adapter_name,
+                    "abstained": review.abstain,
+                    "abstain_reason": review.abstain_reason,
+                    "supporting_evidence_refs": grounded_support,
+                    "contradicting_evidence_refs": grounded_contra,
+                    "confirmed_case_ids": grounded_confirmed or sorted(allowed_cases),
+                    "tokens": {
+                        "prompt": inv.prompt_tokens,
+                        "completion": inv.completion_tokens,
+                        "total": inv.total_tokens,
+                    },
+                    "latency_ms": inv.latency_ms,
+                }
+            )
+            return review, review_meta
+        except Exception:  # noqa: BLE001
+            return None
 
     def extract_causal_observation(self, case: Case) -> CausalObservation:
         """Extract causal observation for a Case.
@@ -407,6 +515,7 @@ class IncidentCorrelator:
 
         causal_buckets: dict[tuple[str, str, str], list[CausalObservation]] = {}
         unbucketed: list[CausalObservation] = []
+        abstained_clusters: list[dict[str, Any]] = []
 
         for obs in observations:
             if (
@@ -476,6 +585,33 @@ class IncidentCorrelator:
                     f"{observed_pay_statuses}). Không tự động xác thực hoặc đóng các Case con."
                 )
 
+                ai_review_pair = self._review_cluster_with_llm(
+                    window_members=window_members,
+                    worker_id=worker_id,
+                    batch_id=batch_id,
+                    error_code=error_code,
+                    all_ev_refs=all_ev_refs,
+                )
+                ai_review_meta: dict[str, Any] | None = None
+                if ai_review_pair is not None:
+                    ai_review, ai_review_meta = ai_review_pair
+                    if ai_review.abstain:
+                        abstained_clusters.append(
+                            {
+                                "correlation_key": corr_key,
+                                "case_ids": [m.case.id for m in window_members],
+                                "abstain_reason": (
+                                    ai_review.abstain_reason
+                                    or "LLM abstained due to insufficient/contradictory evidence"
+                                ),
+                                "contradicting_evidence_refs": ai_review_meta[
+                                    "contradicting_evidence_refs"
+                                ],
+                            }
+                        )
+                        continue
+                    hypothesis_vi = ai_review.shared_root_cause_hypothesis
+
                 existing_inc = self._db.scalar(
                     select(Incident)
                     .options(selectinload(Incident.incident_cases))
@@ -498,6 +634,11 @@ class IncidentCorrelator:
                         "correlation_basis": "SAME_EVENT_CAUSAL_OBSERVED_FACT_METADATA",
                         "pure_text_similarity_used": False,
                         "evidence_score_breakdown": score_breakdown,
+                        **(
+                            {"ai_correlation_review": ai_review_meta}
+                            if ai_review_meta is not None
+                            else {}
+                        ),
                     }
                 )
 
@@ -754,6 +895,7 @@ class IncidentCorrelator:
         return CorrelationOutcome(
             incidents=created_or_updated_incidents,
             rejected_lookalikes=rejected_lookalikes,
+            abstained_clusters=abstained_clusters,
         )
 
 

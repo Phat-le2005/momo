@@ -22,11 +22,13 @@ for _key in ("MODEL_PROVIDER", "MODEL_NAME", "MODEL_API_KEY"):
 
 def _clear_caches() -> None:
     from app.core.config import get_settings
+    from app.core.rate_limit import reset_rate_limiter
     from app.db.session import get_engine, get_sessionmaker
 
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_sessionmaker.cache_clear()
+    reset_rate_limiter()
 
 
 @pytest.fixture(autouse=True)

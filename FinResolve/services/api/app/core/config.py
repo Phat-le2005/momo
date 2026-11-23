@@ -87,6 +87,9 @@ class Settings(BaseSettings):
     demo_max_scenario_runs_per_session: int = Field(default=10, ge=1, le=200)
     demo_stale_run_timeout_seconds: int = Field(default=120, ge=1, le=3600)
     max_request_body_bytes: int = Field(default=1_048_576, ge=1024, le=10_485_760)
+    trust_proxy_headers: bool = False
+    rate_limit_sessions_per_minute: int = Field(default=60, ge=1, le=10_000)
+    rate_limit_ai_calls_per_minute: int = Field(default=60, ge=1, le=10_000)
 
     @field_validator("web_origin")
     @classmethod
