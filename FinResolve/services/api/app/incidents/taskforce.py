@@ -309,18 +309,19 @@ class TaskforceManager:
         selected_roles, role_rationale = self.select_roles_for_incident(target_inc, inc_cases)
         role_objectives_override: dict[str, str] = {}
 
-        llm_calls_used = 0
+        llm_calls_attempted = 0
         llm_calls_succeeded = 0
+        llm_calls_failed = 0
         llm_prompt_tokens = 0
         llm_completion_tokens = 0
         llm_total_tokens = 0
         llm_fallback_reasons: list[str] = []
         valid_role_values = {r.value for r in TaskforceRole}
 
-        # Prompt 08.2: When adapter is LLM_API, let LLM plan role selection & objectives
+        # Prompt 08.2 / 08.3: When adapter is LLM_API, let LLM plan role selection & objectives
         # within the strict backend whitelist (2-3 roles, read-only scopes).
-        if self._adapter.mode == ModelMode.LLM_API and llm_calls_used < self._max_llm_calls:
-            llm_calls_used += 1
+        if self._adapter.mode == ModelMode.LLM_API and llm_calls_attempted < self._max_llm_calls:
+            llm_calls_attempted += 1
             plan_sys = (
                 "You are the FinResolve Adaptive Taskforce Coordinator. "
                 "Select 2 to 3 roles from [FINANCE, OPERATIONS, RISK, SUPPORT] based ONLY on "
@@ -362,7 +363,14 @@ class TaskforceManager:
                         role_rationale["llm_planned_roles"] = selected_roles
                         role_rationale["llm_initial_hypothesis"] = parsed_plan.initial_hypothesis
                         llm_calls_succeeded += 1
+                    else:
+                        llm_calls_failed += 1
+                        llm_fallback_reasons.append("role_plan_fallback:insufficient_valid_roles")
+                else:
+                    llm_calls_failed += 1
+                    llm_fallback_reasons.append("role_plan_fallback:empty_llm_response")
             except Exception as exc:  # noqa: BLE001
+                llm_calls_failed += 1
                 llm_fallback_reasons.append(f"role_plan_fallback:{str(exc)[:180]}")
 
         all_pay_ids = [
@@ -454,11 +462,11 @@ class TaskforceManager:
             # Per-role LLM synthesis grounded strictly in observed read-tool outputs
             within_budget = (
                 self._adapter.mode == ModelMode.LLM_API
-                and llm_calls_used < self._max_llm_calls
+                and llm_calls_attempted < self._max_llm_calls
                 and (self._token_budget <= 0 or llm_total_tokens < self._token_budget)
             )
             if within_budget:
-                llm_calls_used += 1
+                llm_calls_attempted += 1
                 role_sys = (
                     f"You are the {role_name} Agent in FinResolve Taskforce. "
                     "Synthesize findings ONLY from the provided tool_observations and "
@@ -499,6 +507,7 @@ class TaskforceManager:
                         hj["runtime_mode"] = "LLM_API"
                         hj["reasoning_mode"] = "LLM_API_ADAPTIVE_TASKFORCE"
                         hj["llm_invoked"] = True
+                        hj["llm_output_validated"] = True
                         hj["auto_resolved_children"] = False
                         hj["requires_per_case_approval_and_verification"] = True
                         task.handoff_json = sanitize_no_oracle_leak(hj)
@@ -519,7 +528,11 @@ class TaskforceManager:
                                 hj_replan["handoff_to"] = cand_role
                                 hj_replan["replan_triggered"] = True
                                 task.handoff_json = hj_replan
+                    else:
+                        llm_calls_failed += 1
+                        llm_fallback_reasons.append(f"{role_name}_fallback:empty_llm_response")
                 except Exception as exc:  # noqa: BLE001
+                    llm_calls_failed += 1
                     llm_fallback_reasons.append(f"{role_name}_fallback:{str(exc)[:180]}")
 
             prior_handoffs_summary.append(
@@ -536,23 +549,31 @@ class TaskforceManager:
             idx += 1
 
         selected_roles = list(role_queue)
-        llm_actually_invoked = llm_calls_succeeded > 0
+        llm_actually_invoked = llm_calls_attempted > 0
+        llm_output_validated = llm_calls_succeeded > 0
+        fallback_reason = "; ".join(llm_fallback_reasons) if llm_fallback_reasons else None
         sf = dict(target_inc.shared_factors_json or {})
         sf["role_selection"] = sanitize_no_oracle_leak(role_rationale)
         sf["taskforce_execution_mode"] = (
             "LLM_API_ADAPTIVE_TASKFORCE"
-            if llm_actually_invoked
+            if llm_output_validated
             else "DETERMINISTIC_TASKFORCE_RULES"
         )
         sf["llm_invoked"] = llm_actually_invoked
+        sf["llm_output_validated"] = llm_output_validated
+        sf["fallback_reason"] = fallback_reason
         sf["llm_usage"] = {
             "adapter": self._adapter.adapter_name,
-            "calls_attempted": llm_calls_used,
-            "calls_succeeded": llm_calls_succeeded,
+            "llm_calls_attempted": llm_calls_attempted,
+            "llm_calls_succeeded": llm_calls_succeeded,
+            "llm_calls_failed": llm_calls_failed,
+            "llm_invoked": llm_actually_invoked,
+            "llm_output_validated": llm_output_validated,
             "prompt_tokens": llm_prompt_tokens,
             "completion_tokens": llm_completion_tokens,
             "total_tokens": llm_total_tokens,
             "replans_used": replans_used,
+            "fallback_reason": fallback_reason,
             "fallback_reasons": llm_fallback_reasons,
         }
         target_inc.shared_factors_json = sf

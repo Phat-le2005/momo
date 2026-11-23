@@ -153,7 +153,9 @@ export function CasesWorkspace() {
             setNotice(
               status.job_status === "COMPLETED"
                 ? "AI/DEMO_RULES đã kết thúc điều tra. Kiểm tra bằng chứng và đề xuất bên dưới."
-                : "Điều tra không hoàn tất. Không có hành động tự động nào được xác nhận.",
+                : status.job_status === "INTERRUPTED"
+                  ? "Phiên điều tra bị gián đoạn (INTERRUPTED) do thay đổi đồng thời hoặc worker dừng đột ngột. Không có hành động tài chính nào được thực thi."
+                  : "Điều tra không hoàn tất. Không có hành động tự động nào được xác nhận.",
             );
           }
         }

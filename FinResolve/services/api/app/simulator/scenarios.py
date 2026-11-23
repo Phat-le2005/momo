@@ -28,6 +28,7 @@ from typing import Any
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from app.ai_core.model_adapter import ModelAdapter
 from app.ai_core.runtime import BoundedAgentRuntime
 from app.cases.state_machine import can_transition, transition_case
 from app.core.config import get_settings
@@ -389,56 +390,69 @@ class ScenarioRegistry:
         order_count: int,
         reset_before_run: bool = False,
         investigate_selected_exception: bool = False,
+        adapter: ModelAdapter | None = None,
     ) -> SimScenarioRun:
-        """Execute a scenario run synchronously within `db` and persist metrics + Oracle truth."""
+        """Execute a scenario run in isolated short-transaction stages (Prompt 08.3):
+        1. GENERATE & COMMIT: Create synthetic MOCK orders/payments/Cases and commit BEFORE
+           any external LLM invocation (zero PostgreSQL row locks held during LLM I/O).
+        2. COORDINATE: Run IncidentCorrelator & TaskforceManager outside long write locks,
+           re-checking run status so superseded/interrupted runs are never overwritten.
+        3. INVESTIGATE: Run BoundedAgentRuntime in a brand-new independent DB session with
+           short transactions (`manage_transactions=True`).
+        4. FINALIZE: Persist final metrics and mark `COMPLETED` only if all required stages
+           succeeded; record honest partial progress (`FAILED`) if AI stage fails post-commit.
+        """
         t0 = time.perf_counter_ns()
+        run_id = run.id
         session_id = run.session_id
         scenario_id = run.scenario_id
         seed = run.seed
+        mock_committed = False
+        metrics: dict[str, Any] = {}
 
-        demo_session = db.scalar(
-            select(DemoSession).where(DemoSession.id == session_id).with_for_update()
-        )
-        if demo_session is None:
-            raise AppError(
-                ErrorCode.NOT_FOUND, f"Session '{session_id}' not found", status_code=404
-            )
-
-        if reset_before_run:
-            # Mark prior runs SUPERSEDED while keeping the current SimScenarioRun row active
-            _supersede_prior_runs(
-                db,
-                session_id,
-                exclude_run_id=run.id,
-                reason=f"Superseded by reset_before_run for '{run.id}'",
-            )
-            for model in (
-                AgentTask,
-                IncidentCase,
-                Incident,
-                Case,
-                SimRefund,
-                SimPaymentEvent,
-                SimPayment,
-                InventoryReservation,
-                InventoryMovement,
-                InventoryLevel,
-                OrderItem,
-                SimOrder,
-                Product,
-                Warehouse,
-            ):
-                db.execute(delete(model).where(model.session_id == session_id))
-            demo_session.case_count = 0
-            db.flush()
-
+        # --- STAGE 1 & 2: GENERATE SYNTHETIC MOCK DATA & COMMIT ---
         try:
+            demo_session = db.scalar(
+                select(DemoSession).where(DemoSession.id == session_id).with_for_update()
+            )
+            if demo_session is None:
+                raise AppError(
+                    ErrorCode.NOT_FOUND, f"Session '{session_id}' not found", status_code=404
+                )
+
+            if reset_before_run:
+                _supersede_prior_runs(
+                    db,
+                    session_id,
+                    exclude_run_id=run_id,
+                    reason=f"Superseded by reset_before_run for '{run_id}'",
+                )
+                for model in (
+                    AgentTask,
+                    IncidentCase,
+                    Incident,
+                    Case,
+                    SimRefund,
+                    SimPaymentEvent,
+                    SimPayment,
+                    InventoryReservation,
+                    InventoryMovement,
+                    InventoryLevel,
+                    OrderItem,
+                    SimOrder,
+                    Product,
+                    Warehouse,
+                ):
+                    db.execute(delete(model).where(model.session_id == session_id))
+                demo_session.case_count = 0
+                db.flush()
+
             if scenario_id == "payment_sync":
                 result = self._run_payment_sync(db, session_id=session_id, seed=seed)
             elif scenario_id == "refund_risk":
                 result = self._run_refund_risk(db, session_id=session_id, seed=seed)
             else:
-                result = self._run_mega_live(
+                result = self._run_mega_live_generate(
                     db,
                     session_id=session_id,
                     seed=seed,
@@ -451,45 +465,151 @@ class ScenarioRegistry:
             metrics["recommended_investigation_case_ids"] = recommended_ids
             metrics["investigated_case_ids"] = []
             metrics["llm_calls_for_selected_exceptions"] = 0
+            metrics["stage"] = "MOCK_DATA_COMMITTED"
+            metrics["partial_progress"] = False
 
-            # Optional selected-exception AI investigation (max 1 Case, 0 bulk LLM calls)
-            if investigate_selected_exception and recommended_ids:
-                selected_case_id = recommended_ids[0]
-                db.flush()
-                # Pass manage_transactions=False so BoundedAgentRuntime never prematurely commits
-                # uncommitted simulator rows before execute_run finalizes atomically.
-                runtime = BoundedAgentRuntime(db, max_steps=6, manage_transactions=False)
-                inv_result = runtime.investigate_case(
-                    case_id=selected_case_id,
-                    session_id=session_id,
-                )
-                metrics["investigated_case_ids"] = [selected_case_id]
-                metrics["selected_exception_ai_mode"] = inv_result.model_mode.value
-                metrics["selected_exception_adapter"] = inv_result.adapter_name
-                metrics["llm_calls_for_selected_exceptions"] = (
-                    1 if inv_result.model_mode.value == "LLM_API" else 0
-                )
-
-            total_ms = max(1, int((time.perf_counter_ns() - t0) / 1_000_000))
-            metrics["total_run_ms"] = total_ms
-
-            run.status = "COMPLETED"
-            run.progress_pct = 100
+            run.progress_pct = 50
             run.orders_generated = int(result["orders_generated"])
             run.case_ids_json = list(result["case_ids"])
             run.incident_ids_json = list(result["incident_ids"])
             run.metrics_json = metrics
             run.oracle_truth_json = dict(result["oracle_truth"])
             run.updated_at = datetime.now(UTC)
+            # Commit MOCK data BEFORE any external LLM call (releases DemoSession FOR UPDATE lock!)
             db.commit()
-            db.refresh(run)
-            return run
+            mock_committed = True
         except Exception as exc:
             db.rollback()
-            failed_run = db.get(SimScenarioRun, run.id)
+            failed_run = db.get(SimScenarioRun, run_id)
             if failed_run is not None and failed_run.status == "RUNNING":
                 failed_run.status = "FAILED"
                 failed_run.error_message = str(exc)[:500]
+                failed_run.updated_at = datetime.now(UTC)
+                db.commit()
+            raise
+
+        # --- STAGE 3 & 4: COORDINATE (CORRELATOR/TASKFORCE) & INVESTIGATE (INDEPENDENT SESSION) ---
+        incident_ids: list[str] = list(result["incident_ids"])
+        try:
+            # Verify run was not superseded/interrupted before starting AI stages
+            current_run = db.get(SimScenarioRun, run_id)
+            if current_run is None or current_run.status != "RUNNING":
+                return current_run or run
+
+            if scenario_id == "mega_live":
+                t_corr = time.perf_counter_ns()
+                dropped_set = set(result["oracle_truth"].get("expected_sync_case_ids") or [])
+                correlator = IncidentCorrelator(db, session_id, adapter=adapter)
+                outcome = correlator.correlate_session_cases()
+                db.commit()
+
+                tf_manager = TaskforceManager(db, session_id, adapter=adapter)
+                taskforce_mode = "DETERMINISTIC_TASKFORCE_RULES"
+                incident_ids = []
+                for inc in outcome.incidents:
+                    linked_ids = set(
+                        db.scalars(
+                            select(IncidentCase.case_id).where(
+                                IncidentCase.session_id == session_id,
+                                IncidentCase.incident_id == inc.id,
+                            )
+                        ).all()
+                    )
+                    if linked_ids & dropped_set:
+                        tf_tasks = tf_manager.assign_and_run_taskforce(inc)
+                        db.commit()
+                        refreshed_inc = db.get(Incident, inc.id)
+                        if refreshed_inc is not None:
+                            sf = refreshed_inc.shared_factors_json or {}
+                            if isinstance(sf.get("taskforce_execution_mode"), str):
+                                taskforce_mode = str(sf["taskforce_execution_mode"])
+                        elif tf_tasks:
+                            first_mode = (tf_tasks[0].handoff_json or {}).get("reasoning_mode")
+                            if isinstance(first_mode, str) and first_mode:
+                                taskforce_mode = first_mode
+                        incident_ids.append(inc.id)
+                corr_ms = max(1, int((time.perf_counter_ns() - t_corr) / 1_000_000))
+                metrics["correlation_ms"] = corr_ms
+                metrics["taskforce_mode"] = taskforce_mode
+                metrics["stage"] = "COORDINATED"
+
+                # Update progress in a short transaction (guarding against supersede)
+                run_after_corr = db.scalar(
+                    select(SimScenarioRun).where(SimScenarioRun.id == run_id).with_for_update()
+                )
+                if run_after_corr is None or run_after_corr.status != "RUNNING":
+                    db.rollback()
+                    return run_after_corr or run
+                run_after_corr.incident_ids_json = list(incident_ids)
+                run_after_corr.progress_pct = 80
+                run_after_corr.metrics_json = dict(metrics)
+                run_after_corr.updated_at = datetime.now(UTC)
+                db.commit()
+
+            # Stage 4: Optional selected-exception AI investigation in an INDEPENDENT DB session
+            if investigate_selected_exception and recommended_ids:
+                check_run = db.get(SimScenarioRun, run_id)
+                if check_run is None or check_run.status != "RUNNING":
+                    return check_run or run
+                selected_case_id = recommended_ids[0]
+                with get_sessionmaker()() as inv_db:
+                    runtime = BoundedAgentRuntime(
+                        inv_db,
+                        adapter=adapter,
+                        max_steps=6,
+                        manage_transactions=True,
+                    )
+                    inv_result = runtime.investigate_case(
+                        case_id=selected_case_id,
+                        session_id=session_id,
+                    )
+                metrics["investigated_case_ids"] = [selected_case_id]
+                metrics["selected_exception_ai_mode"] = inv_result.model_mode.value
+                metrics["selected_exception_adapter"] = inv_result.adapter_name
+                metrics["llm_calls_for_selected_exceptions"] = (
+                    1 if inv_result.model_mode.value == "LLM_API" else 0
+                )
+                metrics["stage"] = "INVESTIGATED"
+
+            # --- STAGE 5: FINALIZE ---
+            total_ms = max(1, int((time.perf_counter_ns() - t0) / 1_000_000))
+            metrics["total_run_ms"] = total_ms
+            metrics["stage"] = "COMPLETED"
+
+            final_run = db.scalar(
+                select(SimScenarioRun).where(SimScenarioRun.id == run_id).with_for_update()
+            )
+            if final_run is None:
+                db.rollback()
+                return run
+            if final_run.status != "RUNNING":
+                # Never overwrite a run that was superseded or interrupted mid-flight!
+                db.rollback()
+                return final_run
+
+            final_run.status = "COMPLETED"
+            final_run.progress_pct = 100
+            final_run.incident_ids_json = list(incident_ids)
+            final_run.metrics_json = metrics
+            final_run.updated_at = datetime.now(UTC)
+            db.commit()
+            db.refresh(final_run)
+            return final_run
+        except Exception as exc:
+            db.rollback()
+            failed_run = db.scalar(
+                select(SimScenarioRun).where(SimScenarioRun.id == run_id).with_for_update()
+            )
+            if failed_run is not None and failed_run.status == "RUNNING":
+                failed_run.status = "FAILED"
+                failed_run.error_message = str(exc)[:500]
+                partial_metrics = dict(metrics or failed_run.metrics_json or {})
+                if mock_committed:
+                    partial_metrics["partial_progress"] = True
+                    partial_metrics["stage"] = "AI_STAGE_FAILED_AFTER_MOCK_COMMIT"
+                    partial_metrics["ai_stage_error"] = str(exc)[:300]
+                failed_run.metrics_json = partial_metrics
+                failed_run.incident_ids_json = list(incident_ids)
                 failed_run.updated_at = datetime.now(UTC)
                 db.commit()
             raise
@@ -857,7 +977,7 @@ class ScenarioRegistry:
             },
         }
 
-    def _run_mega_live(
+    def _run_mega_live_generate(
         self,
         db: Session,
         *,
@@ -1420,46 +1540,20 @@ class ScenarioRegistry:
         db.flush()
         gen_ms = max(1, int((time.perf_counter_ns() - t_gen) / 1_000_000))
 
-        # 3. Correlate exceptions via IncidentCorrelator & run deterministic TaskforceManager
-        t_corr = time.perf_counter_ns()
-        correlator = IncidentCorrelator(db, session_id)
-        outcome = correlator.correlate_session_cases()
-        tf_manager = TaskforceManager(db, session_id)
-        incident_ids: list[str] = []
-        dropped_set = set(dropped_sync_case_ids)
-        taskforce_mode = "DETERMINISTIC_TASKFORCE"
-        for inc in outcome.incidents:
-            linked_ids = set(
-                db.scalars(
-                    select(IncidentCase.case_id).where(
-                        IncidentCase.session_id == session_id,
-                        IncidentCase.incident_id == inc.id,
-                    )
-                ).all()
-            )
-            if linked_ids & dropped_set:
-                tf_tasks = tf_manager.assign_and_run_taskforce(inc)
-                if tf_tasks:
-                    first_mode = (tf_tasks[0].handoff_json or {}).get("reasoning_mode")
-                    if isinstance(first_mode, str) and first_mode:
-                        taskforce_mode = first_mode
-                incident_ids.append(inc.id)
-        corr_ms = max(1, int((time.perf_counter_ns() - t_corr) / 1_000_000))
-
         recommended_ids = dropped_sync_case_ids[:1]
         return {
             "orders_generated": order_count,
             "case_ids": all_case_ids,
-            "incident_ids": incident_ids,
+            "incident_ids": [],
             "recommended_investigation_case_ids": recommended_ids,
             "metrics": {
                 "order_count": order_count,
                 "healthy_orders_processed_in_batch": order_count - 16,
                 "exception_cases_created": len(all_case_ids),
                 "llm_calls_for_bulk_orders": 0,
-                "taskforce_mode": taskforce_mode,
+                "taskforce_mode": "DETERMINISTIC_TASKFORCE_RULES",
                 "generation_ms": gen_ms,
-                "correlation_ms": corr_ms,
+                "correlation_ms": 0,
             },
             "oracle_truth": {
                 "scenario_id": "mega_live",

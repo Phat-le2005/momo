@@ -51,7 +51,7 @@ export type CaseEvent = {
   id: string; case_id: string; type: string; payload_json: JsonObject; created_at: string;
 };
 export type Investigation = {
-  run_id: string; case_id: string; job_status: "RUNNING" | "COMPLETED" | "FAILED";
+  run_id: string; case_id: string; job_status: "RUNNING" | "COMPLETED" | "FAILED" | "INTERRUPTED";
   model_mode: string; steps_executed: number; stop_reason: string | null;
   decision_summary: string | null; error_message: string | null;
   proposed_action_ids: string[]; risk_signal_ids: string[];

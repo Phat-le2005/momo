@@ -106,15 +106,17 @@ def _to_incident_detail_response(db: Session, incident: Incident) -> IncidentDet
 
     safe_factors = sanitize_no_oracle_leak(dict(incident.shared_factors_json or {}))
     rejected = list(safe_factors.get("rejected_lookalikes") or [])
+    llm_validated = bool(safe_factors.get("llm_output_validated", False))
+    tf_mode = str(safe_factors.get("taskforce_execution_mode") or "DETERMINISTIC_TASKFORCE_RULES")
 
     return IncidentDetailResponse(
         id=incident.id,
         session_id=incident.session_id,
         source_mode="MOCK",
-        model_mode="DEMO_RULES",
+        model_mode="LLM_API" if llm_validated else "DEMO_RULES",
         configured_model_mode=settings.model_mode.value,
-        taskforce_execution_mode="DETERMINISTIC_TASKFORCE_RULES",
-        llm_invoked=False,
+        taskforce_execution_mode=tf_mode,
+        llm_invoked=llm_validated,
         title=incident.title,
         hypothesis=incident.hypothesis,
         status=incident.status,

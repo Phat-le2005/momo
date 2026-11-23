@@ -312,18 +312,48 @@ class IncidentCorrelator:
             review = CorrelationReviewOutput.model_validate(inv.data)
             allowed_refs = set(all_ev_refs)
             allowed_cases = {m.case.id for m in window_members}
+            session_case_ids = set(
+                self._db.scalars(select(Case.id).where(Case.session_id == self._session_id)).all()
+            )
+
             grounded_support = [r for r in review.supporting_evidence_refs if r in allowed_refs]
+            rejected_support = [r for r in review.supporting_evidence_refs if r not in allowed_refs]
             grounded_contra = [r for r in review.contradicting_evidence_refs if r in allowed_refs]
+            rejected_contra = [
+                r for r in review.contradicting_evidence_refs if r not in allowed_refs
+            ]
+
             grounded_confirmed = [c for c in review.confirmed_case_ids if c in allowed_cases]
+            rejected_case_ids = [c for c in review.confirmed_case_ids if c not in allowed_cases]
+            cross_session_attempts = [c for c in rejected_case_ids if c not in session_case_ids]
+
+            validated_excluded = [
+                c for c in review.excluded_lookalike_case_ids if c in session_case_ids
+            ]
+            rejected_excluded = [
+                c for c in review.excluded_lookalike_case_ids if c not in session_case_ids
+            ]
+
             review_meta = sanitize_no_oracle_leak(
                 {
                     "llm_invoked": True,
+                    "llm_output_validated": True,
                     "adapter": inv.adapter_name,
+                    "safety_gate_policy": (
+                        "DETERMINISTIC_CAUSAL_GATE_AUTHORITATIVE_AI_ADVISORY_ONLY"
+                    ),
                     "abstained": review.abstain,
                     "abstain_reason": review.abstain_reason,
                     "supporting_evidence_refs": grounded_support,
                     "contradicting_evidence_refs": grounded_contra,
+                    "rejected_ungrounded_evidence_refs": sorted(
+                        set(rejected_support) | set(rejected_contra)
+                    ),
                     "confirmed_case_ids": grounded_confirmed or sorted(allowed_cases),
+                    "rejected_unverified_case_ids": sorted(set(rejected_case_ids)),
+                    "rejected_cross_session_case_ids": sorted(set(cross_session_attempts)),
+                    "excluded_lookalike_case_ids_validated": sorted(set(validated_excluded)),
+                    "rejected_excluded_case_ids": sorted(set(rejected_excluded)),
                     "tokens": {
                         "prompt": inv.prompt_tokens,
                         "completion": inv.completion_tokens,
@@ -333,7 +363,8 @@ class IncidentCorrelator:
                 }
             )
             return review, review_meta
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            _ = exc
             return None
 
     def extract_causal_observation(self, case: Case) -> CausalObservation:

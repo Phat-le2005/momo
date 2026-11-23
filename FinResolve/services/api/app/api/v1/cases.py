@@ -419,7 +419,10 @@ def get_investigation_job_status(
     if case_obj is None:
         raise AppError(ErrorCode.NOT_FOUND, f"Case '{case_id}' not found", status_code=404)
 
-    run_events = [e for e in case_obj.events if str(e.payload_json.get("run_id") or "") == run_id]
+    run_events = sorted(
+        [e for e in case_obj.events if str(e.payload_json.get("run_id") or "") == run_id],
+        key=lambda e: (e.created_at, e.id),
+    )
     if not run_events:
         raise AppError(
             ErrorCode.NOT_FOUND,
@@ -429,7 +432,7 @@ def get_investigation_job_status(
 
     started_at = run_events[0].created_at
     completed_at: datetime | None = None
-    job_status: Literal["RUNNING", "COMPLETED", "FAILED"] = "RUNNING"
+    job_status: Literal["RUNNING", "COMPLETED", "FAILED", "INTERRUPTED"] = "RUNNING"
     model_mode = get_settings().model_mode.value
     steps_executed = 0
     stop_reason: str | None = None
@@ -457,7 +460,30 @@ def get_investigation_job_status(
         elif evt.type == "INVESTIGATION_FAILED":
             job_status = "FAILED"
             completed_at = evt.created_at
+            stop_reason = str(evt.payload_json.get("reason") or "INVESTIGATION_FAILED")
             error_message = str(evt.payload_json.get("error") or "Investigation failed")
+        elif evt.type == "INVESTIGATION_INTERRUPTED":
+            job_status = "INTERRUPTED"
+            completed_at = evt.created_at
+            stop_reason = str(evt.payload_json.get("reason") or "INVESTIGATION_INTERRUPTED")
+            error_message = str(
+                evt.payload_json.get("error")
+                or evt.payload_json.get("reason")
+                or "Investigation interrupted before completion"
+            )
+
+    # Detect stale unfinished worker runs on poll so frontend polling never hangs forever
+    if job_status == "RUNNING":
+        stale_s = get_settings().demo_stale_run_timeout_seconds
+        start_ts = started_at if started_at.tzinfo else started_at.replace(tzinfo=UTC)
+        if (datetime.now(UTC) - start_ts).total_seconds() >= stale_s:
+            job_status = "INTERRUPTED"
+            completed_at = datetime.now(UTC)
+            stop_reason = "STALE_WORKER_TIMEOUT"
+            error_message = (
+                "Phiên điều tra bị gián đoạn (worker timeout). Không có hành động nào được "
+                "tự động thực thi; bạn có thể kiểm tra lại trạng thái Case."
+            )
 
     return InvestigationJobStatusResponse(
         run_id=run_id,

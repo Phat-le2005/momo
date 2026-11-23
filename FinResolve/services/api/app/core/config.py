@@ -88,8 +88,10 @@ class Settings(BaseSettings):
     demo_stale_run_timeout_seconds: int = Field(default=120, ge=1, le=3600)
     max_request_body_bytes: int = Field(default=1_048_576, ge=1024, le=10_485_760)
     trust_proxy_headers: bool = False
+    trusted_proxy_ips: str = ""
     rate_limit_sessions_per_minute: int = Field(default=60, ge=1, le=10_000)
     rate_limit_ai_calls_per_minute: int = Field(default=60, ge=1, le=10_000)
+    max_concurrent_llm_calls: int = Field(default=4, ge=1, le=100)
 
     @field_validator("web_origin")
     @classmethod
@@ -146,6 +148,10 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip().rstrip("/") for o in self.web_origin.split(",") if o.strip()]
+
+    @property
+    def trusted_proxy_ip_set(self) -> frozenset[str]:
+        return frozenset(ip.strip() for ip in self.trusted_proxy_ips.split(",") if ip.strip())
 
     @property
     def model_mode(self) -> ModelMode:
