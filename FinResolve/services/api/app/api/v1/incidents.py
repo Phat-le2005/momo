@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import get_settings
 from app.core.errors import AppError, ErrorCode
+from app.core.rate_limit import enforce_ai_investigation_rate_limit
 from app.core.session import get_current_session
 from app.db.session import get_db
 from app.incidents.capabilities import CapabilityRegistry
@@ -268,15 +269,19 @@ def list_incident_tasks(
     summary="Run IncidentCorrelator and TaskforceManager over current session Cases",
 )
 def correlate_session_incidents(
+    _rate_limit: None = Depends(enforce_ai_investigation_rate_limit),
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> IncidentListResponse:
+    # Phase 1: Correlate and commit Incidents before Taskforce LLM reasoning
     correlator = IncidentCorrelator(db, current_session.id)
     outcome = correlator.correlate_session_cases()
-    tf_manager = TaskforceManager(db, current_session.id)
+    db.commit()
+
+    # Phase 2: Run 3-phase zero-lock Taskforce per Incident (each commits its own short txn)
+    tf_manager = TaskforceManager(db, current_session.id, manage_transactions=True)
     for inc in outcome.incidents:
         tf_manager.assign_and_run_taskforce(inc, force_rerun=True)
-    db.commit()
     return list_incidents(current_session=current_session, db=db)
 
 

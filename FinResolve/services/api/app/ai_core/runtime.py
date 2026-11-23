@@ -65,6 +65,186 @@ from app.models.simulator import SimOrder, SimPayment, SimRefund
 MAX_INVESTIGATIONS_PER_CASE = 5
 
 
+def recover_stale_investigation(
+    db: Session,
+    *,
+    case_id: str,
+    session_id: str,
+    run_id: str | None = None,
+    stale_after_seconds: int | None = None,
+) -> list[str]:
+    """Idempotently persist `INVESTIGATION_INTERRUPTED` and recover `Case` from `INVESTIGATING`.
+
+    Requirements (Prompt 08.3.1 Fix 2):
+    - Uses short PostgreSQL `FOR UPDATE NOWAIT` row lock only when a stale unfinished run exists.
+    - Revalidates `session_id`, `run_id`, Case state, and latest events under lock.
+    - Persists AT MOST ONE `INVESTIGATION_INTERRUPTED` terminal event per interrupted run.
+    - Moves `Case` from `INVESTIGATING` -> `ESCALATED` (via `transition_case`, bumping `version`
+      so any late-returning crashed worker fails optimistic version checks and cannot overwrite).
+    - Never marks `Case` as `RESOLVED` or `COMPLETED`, and never interrupts a healthy active run.
+    """
+    timeout_s = (
+        stale_after_seconds
+        if stale_after_seconds is not None
+        else get_settings().demo_stale_run_timeout_seconds
+    )
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(seconds=max(1, timeout_s))
+
+    # Fast read-only check before taking any write lock (avoids mutations on healthy polling)
+    evts = list(
+        db.scalars(
+            select(CaseEvent)
+            .where(
+                CaseEvent.case_id == case_id,
+                CaseEvent.session_id == session_id,
+                CaseEvent.type.in_(
+                    [
+                        "INVESTIGATION_QUEUED",
+                        "INVESTIGATION_STARTED",
+                        "AI_PLAN_GENERATED",
+                        "TOOL_READ_COMPLETED",
+                        "INVESTIGATION_COMPLETED",
+                        "INVESTIGATION_FAILED",
+                        "INVESTIGATION_INTERRUPTED",
+                    ]
+                ),
+            )
+            .order_by(CaseEvent.created_at.asc(), CaseEvent.id.asc())
+        ).all()
+    )
+    if not evts:
+        return []
+
+    last_heartbeat: dict[str, datetime] = {}
+    terminal_runs: set[str] = set()
+    for ev in evts:
+        rid = str(ev.payload_json.get("run_id") or "")
+        if not rid:
+            continue
+        if run_id is not None and rid != run_id:
+            continue
+        ts = ev.created_at if ev.created_at.tzinfo else ev.created_at.replace(tzinfo=UTC)
+        if ev.type in (
+            "INVESTIGATION_COMPLETED",
+            "INVESTIGATION_FAILED",
+            "INVESTIGATION_INTERRUPTED",
+        ):
+            terminal_runs.add(rid)
+        else:
+            prev = last_heartbeat.get(rid)
+            if prev is None or ts > prev:
+                last_heartbeat[rid] = ts
+
+    candidate_stale = [
+        rid for rid, hb in last_heartbeat.items() if rid not in terminal_runs and hb <= cutoff
+    ]
+    if not candidate_stale:
+        return []
+
+    # Acquire short row lock on Case to re-verify and atomically recover
+    try:
+        locked_case = db.scalar(
+            select(Case)
+            .where(Case.id == case_id, Case.session_id == session_id)
+            .with_for_update(nowait=True)
+        )
+    except OperationalError:
+        db.rollback()
+        return []
+
+    if locked_case is None:
+        db.rollback()
+        return []
+
+    # Re-read events under lock for strict idempotency
+    locked_evts = list(
+        db.scalars(
+            select(CaseEvent)
+            .where(
+                CaseEvent.case_id == locked_case.id,
+                CaseEvent.session_id == session_id,
+                CaseEvent.type.in_(
+                    [
+                        "INVESTIGATION_QUEUED",
+                        "INVESTIGATION_STARTED",
+                        "AI_PLAN_GENERATED",
+                        "TOOL_READ_COMPLETED",
+                        "INVESTIGATION_COMPLETED",
+                        "INVESTIGATION_FAILED",
+                        "INVESTIGATION_INTERRUPTED",
+                    ]
+                ),
+            )
+            .order_by(CaseEvent.created_at.asc(), CaseEvent.id.asc())
+        ).all()
+    )
+    hb_locked: dict[str, datetime] = {}
+    term_locked: set[str] = set()
+    for ev in locked_evts:
+        rid = str(ev.payload_json.get("run_id") or "")
+        if not rid or (run_id is not None and rid != run_id):
+            continue
+        ts = ev.created_at if ev.created_at.tzinfo else ev.created_at.replace(tzinfo=UTC)
+        if ev.type in (
+            "INVESTIGATION_COMPLETED",
+            "INVESTIGATION_FAILED",
+            "INVESTIGATION_INTERRUPTED",
+        ):
+            term_locked.add(rid)
+        else:
+            prev = hb_locked.get(rid)
+            if prev is None or ts > prev:
+                hb_locked[rid] = ts
+
+    recovered_ids: list[str] = []
+    for rid, hb in hb_locked.items():
+        if rid in term_locked or hb > cutoff:
+            continue
+        db.add(
+            CaseEvent(
+                id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
+                case_id=locked_case.id,
+                session_id=session_id,
+                type="INVESTIGATION_INTERRUPTED",
+                payload_json={
+                    "run_id": rid,
+                    "job_status": "INTERRUPTED",
+                    "reason": "STALE_WORKER_TIMEOUT",
+                    "error": (
+                        "Phiên điều tra bị gián đoạn (worker timeout). Đã khôi phục Case về "
+                        "trạng thái an toàn ESCALATED; không có hành động tài chính nào được ghi."
+                    ),
+                    "last_heartbeat_at": hb.isoformat(),
+                },
+                created_at=now,
+            )
+        )
+        recovered_ids.append(rid)
+
+    if not recovered_ids:
+        db.rollback()
+        return []
+
+    # Recover Case from INVESTIGATING -> ESCALATED (bumping case.version so late old worker fails!)
+    if locked_case.state == CaseState.INVESTIGATING.value and can_transition(
+        CaseState.INVESTIGATING, CaseState.ESCALATED
+    ):
+        transition_case(
+            db,
+            locked_case,
+            CaseState.ESCALATED,
+            reason=(
+                f"Khôi phục tự động sau khi worker điều tra bị gián đoạn ({recovered_ids[0]}). "
+                "Cho phép điều tra lại khi hạn mức cho phép."
+            ),
+            extra_payload={"recovered_run_ids": recovered_ids},
+        )
+
+    db.commit()
+    return recovered_ids
+
+
 class BoundedAgentRuntime:
     """Iterative, policy-guarded investigation runtime with hard step/time/token bounds."""
 

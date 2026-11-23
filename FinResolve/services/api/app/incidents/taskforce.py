@@ -35,11 +35,13 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.ai_core.model_adapter import ModelAdapter, get_model_adapter
 from app.connectors.read_tools import ReadToolRegistry
 from app.core.config import ModelMode, get_settings
+from app.core.errors import AppError, ErrorCode
 from app.incidents.capabilities import CapabilityRegistry, ScopedRoleToolExecutor
 from app.incidents.correlator import sanitize_no_oracle_leak
 from app.models.cases import Case, CaseEvent
@@ -119,6 +121,7 @@ class TaskforceManager:
         adapter: ModelAdapter | None = None,
         max_llm_calls: int = 5,
         token_budget: int | None = None,
+        manage_transactions: bool = True,
     ) -> None:
         settings = get_settings()
         self._db = db
@@ -128,6 +131,17 @@ class TaskforceManager:
         self._token_budget = (
             token_budget if token_budget is not None else settings.model_budget_tokens
         )
+        self._manage_transactions = manage_transactions
+
+    def _release_read_transaction(self) -> None:
+        """Close any open read-only DB transaction before external LLM network I/O."""
+        if (
+            self._manage_transactions
+            and not self._db.new
+            and not self._db.dirty
+            and not self._db.deleted
+        ):
+            self._db.rollback()
 
     def select_roles_for_incident(
         self,
@@ -260,13 +274,37 @@ class TaskforceManager:
         *,
         force_rerun: bool = False,
     ) -> list[AgentTask]:
-        """Conditionally allocate and run 2-3 bounded role tasks on `incident`."""
+        """Conditionally allocate and run 2-3 bounded role tasks on `incident` using strict
+        3-phase short transactions (Prompt 08.3.1 Fix 3):
+        - Phase A (Read Snapshot): Load Incident, IncidentCases, existing tasks; do NOT mutate
+          or hold write locks; release read transaction before external LLM calls.
+        - Phase B (LLM Reasoning & Scoped Read Tools): Invoke LLM outside DB write locks.
+        - Phase C (Revalidate & Persist): Acquire short `FOR UPDATE NOWAIT` lock on Incident,
+          verify optimistic `updated_at` concurrency token, supersede prior tasks if
+          `force_rerun=True`, persist new AgentTasks + CaseEvents, and commit immediately.
+        """
+        incident_id = incident.id
+
+        # --- PHASE A: READ SNAPSHOT (zero writes, zero locks held across LLM calls) ---
+        inc_loaded = self._db.scalar(
+            select(Incident).where(
+                Incident.id == incident_id,
+                Incident.session_id == self._session_id,
+            )
+        )
+        if inc_loaded is None:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                f"Incident '{incident_id}' not found in current session",
+                status_code=404,
+            )
+
         existing_tasks = list(
             self._db.scalars(
                 select(AgentTask)
                 .where(
                     AgentTask.session_id == self._session_id,
-                    AgentTask.incident_id == incident.id,
+                    AgentTask.incident_id == incident_id,
                 )
                 .order_by(AgentTask.created_at.asc())
             ).all()
@@ -274,31 +312,16 @@ class TaskforceManager:
         if existing_tasks and not force_rerun:
             return existing_tasks
 
-        now = datetime.now(UTC)
-        if existing_tasks and force_rerun:
-            # Preserve AgentTask history: NEVER delete audit handoffs referenced by CaseEvent.
-            # Mark prior active tasks as superseded in handoff_json and append new tasks.
-            for old_t in existing_tasks:
-                old_hj = dict(old_t.handoff_json or {})
-                if not old_hj.get("superseded"):
-                    old_hj["superseded"] = True
-                    old_hj["superseded_at"] = now.isoformat()
-                    old_t.handoff_json = old_hj
-                    old_t.updated_at = now
-            self._db.flush()
+        snapshot_updated_at = inc_loaded.updated_at
+        snapshot_title = inc_loaded.title
+        snapshot_hypothesis = inc_loaded.hypothesis
+        snapshot_shared_factors = dict(inc_loaded.shared_factors_json or {})
 
-        inc_loaded = self._db.scalar(
-            select(Incident).where(
-                Incident.id == incident.id,
-                Incident.session_id == self._session_id,
-            )
-        )
-        target_inc = inc_loaded or incident
         inc_cases = list(
             self._db.scalars(
                 select(IncidentCase)
                 .where(
-                    IncidentCase.incident_id == target_inc.id,
+                    IncidentCase.incident_id == incident_id,
                     IncidentCase.session_id == self._session_id,
                 )
                 .order_by(IncidentCase.created_at.asc(), IncidentCase.case_id.asc())
@@ -306,9 +329,58 @@ class TaskforceManager:
         )
 
         all_case_ids = [ic.case_id for ic in inc_cases]
-        selected_roles, role_rationale = self.select_roles_for_incident(target_inc, inc_cases)
+        selected_roles, role_rationale = self.select_roles_for_incident(inc_loaded, inc_cases)
         role_objectives_override: dict[str, str] = {}
 
+        all_pay_ids = [
+            str(ic.causal_factors_json.get("payment_id"))
+            for ic in inc_cases
+            if ic.causal_factors_json.get("payment_id")
+        ]
+        pay_ids_with_refunds: set[str] = set()
+        if all_pay_ids:
+            ref_rows = list(
+                self._db.scalars(
+                    select(SimRefund).where(
+                        SimRefund.session_id == self._session_id,
+                        SimRefund.payment_id.in_(all_pay_ids),
+                    )
+                ).all()
+            )
+            pay_ids_with_refunds = {r.payment_id for r in ref_rows if r.payment_id}
+
+        sampled_ics = self._select_sample_incident_cases(inc_cases, pay_ids_with_refunds)
+        sampled_ic_snapshots: list[IncidentCase] = [
+            IncidentCase(
+                id=ic.id,
+                incident_id=ic.incident_id,
+                case_id=ic.case_id,
+                session_id=ic.session_id,
+                link_reason=ic.link_reason,
+                shared_evidence_refs=list(ic.shared_evidence_refs or []),
+                causal_factors_json=dict(ic.causal_factors_json or {}),
+                is_auto_resolved=False,
+            )
+            for ic in sampled_ics
+        ]
+        inc_snapshot = Incident(
+            id=incident_id,
+            session_id=self._session_id,
+            title=snapshot_title,
+            hypothesis=snapshot_hypothesis,
+            status=inc_loaded.status,
+            correlation_key=inc_loaded.correlation_key,
+            correlation_trace=inc_loaded.correlation_trace,
+            shared_factors_json=snapshot_shared_factors,
+            evidence_refs=list(inc_loaded.evidence_refs or []),
+            confidence=inc_loaded.confidence,
+        )
+
+        # Release read-only DB transaction BEFORE any external LLM call!
+        self._release_read_transaction()
+
+        # --- PHASE B: LLM REASONING & SCOPED READ-TOOL EXECUTION (zero write locks!) ---
+        now = datetime.now(UTC)
         llm_calls_attempted = 0
         llm_calls_succeeded = 0
         llm_calls_failed = 0
@@ -318,8 +390,6 @@ class TaskforceManager:
         llm_fallback_reasons: list[str] = []
         valid_role_values = {r.value for r in TaskforceRole}
 
-        # Prompt 08.2 / 08.3: When adapter is LLM_API, let LLM plan role selection & objectives
-        # within the strict backend whitelist (2-3 roles, read-only scopes).
         if self._adapter.mode == ModelMode.LLM_API and llm_calls_attempted < self._max_llm_calls:
             llm_calls_attempted += 1
             plan_sys = (
@@ -331,11 +401,11 @@ class TaskforceManager:
             )
             plan_payload = sanitize_no_oracle_leak(
                 {
-                    "incident_id": target_inc.id,
-                    "title": target_inc.title,
-                    "hypothesis": target_inc.hypothesis,
-                    "linked_cases_count": len(inc_cases),
-                    "shared_factors": target_inc.shared_factors_json,
+                    "incident_id": incident_id,
+                    "title": snapshot_title,
+                    "hypothesis": snapshot_hypothesis,
+                    "linked_cases_count": len(all_case_ids),
+                    "shared_factors": snapshot_shared_factors,
                     "deterministic_rationale": role_rationale,
                 }
             )
@@ -373,29 +443,8 @@ class TaskforceManager:
                 llm_calls_failed += 1
                 llm_fallback_reasons.append(f"role_plan_fallback:{str(exc)[:180]}")
 
-        all_pay_ids = [
-            str(ic.causal_factors_json.get("payment_id"))
-            for ic in inc_cases
-            if ic.causal_factors_json.get("payment_id")
-        ]
-        pay_ids_with_refunds: set[str] = set()
-        if all_pay_ids:
-            ref_rows = list(
-                self._db.scalars(
-                    select(SimRefund).where(
-                        SimRefund.session_id == self._session_id,
-                        SimRefund.payment_id.in_(all_pay_ids),
-                    )
-                ).all()
-            )
-            pay_ids_with_refunds = {r.payment_id for r in ref_rows if r.payment_id}
-
-        sampled_ics = self._select_sample_incident_cases(inc_cases, pay_ids_with_refunds)
-
         read_registry = ReadToolRegistry(self._db, self._session_id)
         configured_mode = self._adapter.mode.value
-        # Base deterministic task handoff starts as DEMO_RULES; upgraded to LLM_API ONLY
-        # after an actual LLM synthesis call succeeds and passes Pydantic validation.
         effective_runtime_mode = "DEMO_RULES"
 
         created_tasks: list[AgentTask] = []
@@ -413,9 +462,9 @@ class TaskforceManager:
             )
             if role_name == TaskforceRole.FINANCE.value:
                 task = self._run_finance_task(
-                    target_inc=target_inc,
+                    target_inc=inc_snapshot,
                     all_case_ids=all_case_ids,
-                    sampled_ics=sampled_ics,
+                    sampled_ics=sampled_ic_snapshots,
                     next_role=next_role,
                     read_registry=read_registry,
                     effective_runtime_mode=effective_runtime_mode,
@@ -424,9 +473,9 @@ class TaskforceManager:
                 )
             elif role_name == TaskforceRole.OPERATIONS.value:
                 task = self._run_operations_task(
-                    target_inc=target_inc,
+                    target_inc=inc_snapshot,
                     all_case_ids=all_case_ids,
-                    sampled_ics=sampled_ics,
+                    sampled_ics=sampled_ic_snapshots,
                     next_role=next_role,
                     read_registry=read_registry,
                     effective_runtime_mode=effective_runtime_mode,
@@ -435,9 +484,9 @@ class TaskforceManager:
                 )
             elif role_name == TaskforceRole.RISK.value:
                 task = self._run_risk_task(
-                    target_inc=target_inc,
+                    target_inc=inc_snapshot,
                     all_case_ids=all_case_ids,
-                    sampled_ics=sampled_ics,
+                    sampled_ics=sampled_ic_snapshots,
                     next_role=next_role,
                     read_registry=read_registry,
                     effective_runtime_mode=effective_runtime_mode,
@@ -446,9 +495,9 @@ class TaskforceManager:
                 )
             else:
                 task = self._run_support_task(
-                    target_inc=target_inc,
+                    target_inc=inc_snapshot,
                     all_case_ids=all_case_ids,
-                    sampled_ics=sampled_ics,
+                    sampled_ics=sampled_ic_snapshots,
                     next_role=next_role,
                     read_registry=read_registry,
                     effective_runtime_mode=effective_runtime_mode,
@@ -456,10 +505,12 @@ class TaskforceManager:
                     now=now,
                 )
 
+            # Release read-only DB transaction opened by ReadToolRegistry before calling LLM!
+            self._release_read_transaction()
+
             if role_name in role_objectives_override:
                 task.objective = role_objectives_override[role_name]
 
-            # Per-role LLM synthesis grounded strictly in observed read-tool outputs
             within_budget = (
                 self._adapter.mode == ModelMode.LLM_API
                 and llm_calls_attempted < self._max_llm_calls
@@ -513,7 +564,6 @@ class TaskforceManager:
                         task.handoff_json = sanitize_no_oracle_leak(hj)
                         llm_calls_succeeded += 1
 
-                        # Bounded dynamic replan (max 1 extra whitelisted role, max 3 roles total)
                         if (
                             synth.request_replan
                             and replans_used < 1
@@ -544,15 +594,79 @@ class TaskforceManager:
                     "checked_case_ids": task.handoff_json.get("checked_case_ids", []),
                 }
             )
-            self._db.add(task)
             created_tasks.append(task)
             idx += 1
+
+        # --- PHASE C: REVALIDATE & PERSIST IN A SHORT ATOMIC WRITE TRANSACTION ---
+        try:
+            fresh_inc = self._db.scalar(
+                select(Incident)
+                .where(
+                    Incident.id == incident_id,
+                    Incident.session_id == self._session_id,
+                )
+                .with_for_update(nowait=True)
+            )
+        except OperationalError as err:
+            self._db.rollback()
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"CONCURRENT_TASKFORCE_EXECUTION: Incident '{incident_id}' is currently "
+                "being updated by another Taskforce run",
+                status_code=409,
+                details={"incident_id": incident_id},
+            ) from err
+
+        if fresh_inc is None:
+            self._db.rollback()
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                f"Incident '{incident_id}' no longer exists in session",
+                status_code=404,
+            )
+
+        if fresh_inc.updated_at != snapshot_updated_at:
+            self._db.rollback()
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"STALE_INCIDENT_STATE: Incident '{incident_id}' was updated concurrently "
+                "while Taskforce was reasoning; stale results rejected.",
+                status_code=409,
+                details={"incident_id": incident_id},
+            )
+
+        current_tasks = list(
+            self._db.scalars(
+                select(AgentTask)
+                .where(
+                    AgentTask.session_id == self._session_id,
+                    AgentTask.incident_id == incident_id,
+                )
+                .order_by(AgentTask.created_at.asc())
+            ).all()
+        )
+        if current_tasks and not force_rerun:
+            self._db.rollback()
+            return current_tasks
+
+        persist_now = datetime.now(UTC)
+        if current_tasks and force_rerun:
+            for old_t in current_tasks:
+                old_hj = dict(old_t.handoff_json or {})
+                if not old_hj.get("superseded"):
+                    old_hj["superseded"] = True
+                    old_hj["superseded_at"] = persist_now.isoformat()
+                    old_t.handoff_json = old_hj
+                    old_t.updated_at = persist_now
+
+        for t in created_tasks:
+            self._db.add(t)
 
         selected_roles = list(role_queue)
         llm_actually_invoked = llm_calls_attempted > 0
         llm_output_validated = llm_calls_succeeded > 0
         fallback_reason = "; ".join(llm_fallback_reasons) if llm_fallback_reasons else None
-        sf = dict(target_inc.shared_factors_json or {})
+        sf = dict(fresh_inc.shared_factors_json or {})
         sf["role_selection"] = sanitize_no_oracle_leak(role_rationale)
         sf["taskforce_execution_mode"] = (
             "LLM_API_ADAPTIVE_TASKFORCE"
@@ -576,9 +690,9 @@ class TaskforceManager:
             "fallback_reason": fallback_reason,
             "fallback_reasons": llm_fallback_reasons,
         }
-        target_inc.shared_factors_json = sf
-        target_inc.status = IncidentStatus.TASKFORCE_ASSIGNED.value
-        target_inc.updated_at = now
+        fresh_inc.shared_factors_json = sf
+        fresh_inc.status = IncidentStatus.TASKFORCE_ASSIGNED.value
+        fresh_inc.updated_at = persist_now
         self._db.flush()
 
         actual_checked_union: list[str] = []
@@ -590,16 +704,16 @@ class TaskforceManager:
             cid for cid in all_case_ids if cid not in set(actual_checked_union)
         ]
 
-        for ic in inc_cases:
-            was_checked = ic.case_id in set(actual_checked_union)
+        for cid in all_case_ids:
+            was_checked = cid in set(actual_checked_union)
             self._db.add(
                 CaseEvent(
                     id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
-                    case_id=ic.case_id,
+                    case_id=cid,
                     session_id=self._session_id,
                     type="INCIDENT_TASKFORCE_HANDOFF",
                     payload_json={
-                        "incident_id": target_inc.id,
+                        "incident_id": fresh_inc.id,
                         "assigned_roles": selected_roles,
                         "task_ids": [t.id for t in created_tasks],
                         "checked_case_ids": actual_checked_union,
@@ -608,16 +722,25 @@ class TaskforceManager:
                         "verification_status": (
                             "OBSERVED_SAMPLE_FACT_NOT_VERIFIED" if was_checked else "UNKNOWN"
                         ),
-                        "runtime_mode": effective_runtime_mode,
-                        "llm_invoked": False,
+                        "runtime_mode": "LLM_API" if llm_output_validated else "DEMO_RULES",
+                        "llm_invoked": llm_actually_invoked,
+                        "llm_output_validated": llm_output_validated,
                         "auto_resolved": False,
                         "requires_independent_per_case_verification": True,
                     },
-                    created_at=now,
+                    created_at=persist_now,
                 )
             )
 
-        self._db.flush()
+        if self._manage_transactions:
+            self._db.commit()
+        else:
+            self._db.flush()
+
+        if incident is not fresh_inc:
+            incident.shared_factors_json = fresh_inc.shared_factors_json
+            incident.status = fresh_inc.status
+            incident.updated_at = fresh_inc.updated_at
         return created_tasks
 
     def _run_finance_task(

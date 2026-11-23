@@ -14,7 +14,11 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, selectinload
 
 from app.ai_core.model_adapter import get_model_adapter
-from app.ai_core.runtime import MAX_INVESTIGATIONS_PER_CASE, BoundedAgentRuntime
+from app.ai_core.runtime import (
+    MAX_INVESTIGATIONS_PER_CASE,
+    BoundedAgentRuntime,
+    recover_stale_investigation,
+)
 from app.ai_core.schemas import InvestigationRunResult
 from app.ai_core.understanding import analyze_vietnamese_complaint
 from app.core.config import get_settings
@@ -411,6 +415,13 @@ def get_investigation_job_status(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> InvestigationJobStatusResponse:
+    # Idempotently persist INVESTIGATION_INTERRUPTED & recover Case from INVESTIGATING if stale
+    recover_stale_investigation(
+        db,
+        case_id=case_id,
+        session_id=current_session.id,
+        run_id=run_id,
+    )
     case_obj = db.scalar(
         select(Case)
         .options(selectinload(Case.events))
@@ -470,19 +481,6 @@ def get_investigation_job_status(
                 evt.payload_json.get("error")
                 or evt.payload_json.get("reason")
                 or "Investigation interrupted before completion"
-            )
-
-    # Detect stale unfinished worker runs on poll so frontend polling never hangs forever
-    if job_status == "RUNNING":
-        stale_s = get_settings().demo_stale_run_timeout_seconds
-        start_ts = started_at if started_at.tzinfo else started_at.replace(tzinfo=UTC)
-        if (datetime.now(UTC) - start_ts).total_seconds() >= stale_s:
-            job_status = "INTERRUPTED"
-            completed_at = datetime.now(UTC)
-            stop_reason = "STALE_WORKER_TIMEOUT"
-            error_message = (
-                "Phiên điều tra bị gián đoạn (worker timeout). Không có hành động nào được "
-                "tự động thực thi; bạn có thể kiểm tra lại trạng thái Case."
             )
 
     return InvestigationJobStatusResponse(

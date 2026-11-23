@@ -268,10 +268,23 @@ class IncidentCorrelator:
         batch_id: str,
         error_code: str,
         all_ev_refs: list[str],
+        session_case_ids: set[str] | None = None,
     ) -> tuple[CorrelationReviewOutput, dict[str, Any]] | None:
-        """Invoke LLM to review sanitized cluster evidence; never sends oracle hidden truth."""
+        """Invoke LLM to review sanitized cluster evidence; never sends oracle hidden truth
+        and releases any read-only DB transaction before calling the external LLM."""
         if self._adapter.mode != ModelMode.LLM_API:
             return None
+        resolved_session_cases = (
+            session_case_ids
+            if session_case_ids is not None
+            else set(
+                self._db.scalars(select(Case.id).where(Case.session_id == self._session_id)).all()
+            )
+        )
+        # Release any read-only DB transaction before external LLM network I/O
+        if not self._db.new and not self._db.dirty and not self._db.deleted:
+            self._db.rollback()
+
         sys_prompt = (
             "You are the FinResolve Evidence-Aware Incident Correlation Reviewer. "
             "Review sanitized OBSERVED_FACT evidence for a candidate incident cluster. "
@@ -312,9 +325,6 @@ class IncidentCorrelator:
             review = CorrelationReviewOutput.model_validate(inv.data)
             allowed_refs = set(all_ev_refs)
             allowed_cases = {m.case.id for m in window_members}
-            session_case_ids = set(
-                self._db.scalars(select(Case.id).where(Case.session_id == self._session_id)).all()
-            )
 
             grounded_support = [r for r in review.supporting_evidence_refs if r in allowed_refs]
             rejected_support = [r for r in review.supporting_evidence_refs if r not in allowed_refs]
@@ -325,13 +335,15 @@ class IncidentCorrelator:
 
             grounded_confirmed = [c for c in review.confirmed_case_ids if c in allowed_cases]
             rejected_case_ids = [c for c in review.confirmed_case_ids if c not in allowed_cases]
-            cross_session_attempts = [c for c in rejected_case_ids if c not in session_case_ids]
+            cross_session_attempts = [
+                c for c in rejected_case_ids if c not in resolved_session_cases
+            ]
 
             validated_excluded = [
-                c for c in review.excluded_lookalike_case_ids if c in session_case_ids
+                c for c in review.excluded_lookalike_case_ids if c in resolved_session_cases
             ]
             rejected_excluded = [
-                c for c in review.excluded_lookalike_case_ids if c not in session_case_ids
+                c for c in review.excluded_lookalike_case_ids if c not in resolved_session_cases
             ]
 
             review_meta = sanitize_no_oracle_leak(
@@ -922,7 +934,7 @@ class IncidentCorrelator:
             ]
             inc.shared_factors_json = sf
 
-        self._db.flush()
+        self._db.commit()
         return CorrelationOutcome(
             incidents=created_or_updated_incidents,
             rejected_lookalikes=rejected_lookalikes,
@@ -1229,7 +1241,7 @@ def seed_incident_taskforce_scenario(
         lookalike_case_ids.append(l_case_id)
 
     demo_session.case_count += 14
-    db.flush()
+    db.commit()
 
     from app.incidents.taskforce import TaskforceManager
 
@@ -1237,10 +1249,10 @@ def seed_incident_taskforce_scenario(
     outcome = correlator.correlate_session_cases()
     assert len(outcome.incidents) >= 1  # noqa: S101
     primary_inc = outcome.incidents[0]
+    db.commit()
 
     tf_manager = TaskforceManager(db, session_id)
     tasks = tf_manager.assign_and_run_taskforce(primary_inc)
-    db.commit()
 
     return {
         "idempotent_replay": False,

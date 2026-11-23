@@ -29,6 +29,7 @@ from app.ai_core.schemas import (
     PlanStepKind,
 )
 from app.core.config import ModelMode, Settings, get_settings
+from app.core.rate_limit import llm_concurrency_guard
 
 
 class ModelInvocationResult(BaseModel):
@@ -105,28 +106,34 @@ class LLMModelAdapter:
     def adapter_name(self) -> str:
         return f"LLMModelAdapter({self._provider}:{self._model_name})"
 
+    def _invoke_provider(
+        self,
+        system_prompt: str,
+        user_message: str,
+    ) -> tuple[str, int, int, int]:
+        """Single shared external LLM provider boundary protected by `llm_concurrency_guard()`.
+
+        Covers OpenAI-compatible, Gemini, and Anthropic providers for both `generate_plan()`
+        and `generate_structured_json()`, ensuring bounded concurrency without double-acquiring
+        the semaphore and guaranteed release on success, timeout, or exception.
+        """
+        with llm_concurrency_guard():
+            client = self._http_client or httpx.Client(timeout=self._timeout)
+            close_client = self._http_client is None
+            try:
+                if self._provider in ("gemini", "google", "google_gemini"):
+                    return self._call_gemini(client, system_prompt, user_message)
+                if self._provider == "anthropic":
+                    return self._call_anthropic(client, system_prompt, user_message)
+                return self._call_openai_compatible(client, system_prompt, user_message)
+            finally:
+                if close_client:
+                    client.close()
+
     def generate_plan(self, context: InvestigationContext) -> ModelInvocationResult:
         start_ns = time.perf_counter_ns()
         system_prompt, user_message = ContextBuilder.build_llm_messages(context)
-
-        client = self._http_client or httpx.Client(timeout=self._timeout)
-        close_client = self._http_client is None
-        try:
-            if self._provider in ("gemini", "google", "google_gemini"):
-                raw_json_str, p_tok, c_tok, t_tok = self._call_gemini(
-                    client, system_prompt, user_message
-                )
-            elif self._provider == "anthropic":
-                raw_json_str, p_tok, c_tok, t_tok = self._call_anthropic(
-                    client, system_prompt, user_message
-                )
-            else:
-                raw_json_str, p_tok, c_tok, t_tok = self._call_openai_compatible(
-                    client, system_prompt, user_message
-                )
-        finally:
-            if close_client:
-                client.close()
+        raw_json_str, p_tok, c_tok, t_tok = self._invoke_provider(system_prompt, user_message)
 
         parsed_obj = self._extract_json_dict(raw_json_str)
         validated_plan = Plan.model_validate(parsed_obj)
@@ -160,24 +167,7 @@ class LLMModelAdapter:
     ) -> StructuredJsonInvocationResult:
         """Invoke the configured external LLM and return a parsed JSON object with usage."""
         start_ns = time.perf_counter_ns()
-        client = self._http_client or httpx.Client(timeout=self._timeout)
-        close_client = self._http_client is None
-        try:
-            if self._provider in ("gemini", "google", "google_gemini"):
-                raw_json_str, p_tok, c_tok, t_tok = self._call_gemini(
-                    client, system_prompt, user_message
-                )
-            elif self._provider == "anthropic":
-                raw_json_str, p_tok, c_tok, t_tok = self._call_anthropic(
-                    client, system_prompt, user_message
-                )
-            else:
-                raw_json_str, p_tok, c_tok, t_tok = self._call_openai_compatible(
-                    client, system_prompt, user_message
-                )
-        finally:
-            if close_client:
-                client.close()
+        raw_json_str, p_tok, c_tok, t_tok = self._invoke_provider(system_prompt, user_message)
 
         parsed_obj = self._extract_json_dict(raw_json_str)
         latency_ms = max(0, int((time.perf_counter_ns() - start_ns) / 1_000_000))
