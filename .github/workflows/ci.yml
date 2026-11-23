@@ -1,0 +1,66 @@
+name: FinResolve CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  frontend:
+    name: Web (Next.js lint, typecheck, build, unit tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: FinResolve/apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: FinResolve/apps/web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: node --experimental-strip-types --test src/lib/session-state.test.mts
+      - run: npm run build
+
+  backend:
+    name: API (PostgreSQL 17, Alembic, Ruff, Mypy, Pytest)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: finresolve
+          POSTGRES_PASSWORD: ci_test_password_only
+          POSTGRES_DB: finresolve_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: FinResolve/services/api
+    env:
+      APP_ENV: test
+      SOURCE_MODE: MOCK
+      DATABASE_URL: postgresql+psycopg://finresolve:ci_test_password_only@127.0.0.1:5432/finresolve_test
+      TEST_DATABASE_URL: postgresql+psycopg://finresolve:ci_test_password_only@127.0.0.1:5432/finresolve_test
+      WEB_ORIGIN: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - run: python -m alembic upgrade head
+      - run: python -m alembic check
+      - run: python -m ruff check .
+      - run: python -m ruff format --check .
+      - run: python -m mypy app
+      - run: python -m pytest -q

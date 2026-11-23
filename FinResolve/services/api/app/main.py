@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import __version__
 from app.api.health import router as health_router
 from app.api.v1.router import api_v1_router
+from app.core.body_limit import MaxBodySizeMiddleware
 from app.core.config import get_settings
 from app.core.errors import register_error_handlers
 from app.core.request_id import REQUEST_ID_HEADER, RequestIdMiddleware
@@ -45,6 +46,7 @@ def create_app() -> FastAPI:
         ],
         expose_headers=[REQUEST_ID_HEADER],
     )
+    app.add_middleware(MaxBodySizeMiddleware, max_body_bytes=settings.max_request_body_bytes)
     app.add_middleware(RequestIdMiddleware)
 
     register_error_handlers(app)
