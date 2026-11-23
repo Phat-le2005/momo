@@ -756,3 +756,419 @@ def test_prompt05_1_conditional_role_selection_and_honest_model_mode_reporting(
             assert handoff.llm_invoked is False
     finally:
         config_module.get_settings.cache_clear()
+
+
+def test_prompt05_1_reconcile_incident_case_memberships_when_case_changes_causal_event(
+    client: TestClient, active_session: dict[str, str]
+) -> None:
+    """Prompt 05.1 Final (Items 1 & 4):
+    - When a Case changes its causal OBSERVED_FACT event (by appending a newer corrective
+      OBSERVED_FACT) and re-correlation runs:
+      1. Stale `IncidentCase` link is removed from the old Incident.
+      2. An append-only `CaseEvent(type='INCIDENT_UNLINKED')` audit trail is preserved and
+         `removed_stale_case_ids` is recorded on the Incident.
+      3. When an Incident drops below 2 valid Cases, its remaining stale links are removed,
+         the Incident transitions to `CLOSED`, and child Cases are NEVER auto-resolved."""
+    token = active_session["token"]
+    session_id = active_session["id"]
+    headers = {"X-Demo-Session": token}
+    base_ts = datetime(2026, 11, 22, 15, 0, 0, tzinfo=UTC)
+
+    maker = get_sessionmaker()
+    with maker() as db:
+        for idx in (1, 2, 3):
+            ord_id = f"ORD-RECON-0{idx}"
+            pay_id = f"PAY-RECON-0{idx}"
+            case_id = f"CASE-RECON-0{idx}"
+            db.add_all(
+                [
+                    SimOrder(
+                        id=ord_id,
+                        session_id=session_id,
+                        customer_name=f"Khách Recon {idx}",
+                        customer_phone=f"093300011{idx}",
+                        amount=200000,
+                        currency="VND",
+                        subtotal=200000,
+                        grand_total=200000,
+                        status=OrderStatus.PENDING.value,
+                        payment_status=OrderPaymentStatus.UNPAID.value,
+                    ),
+                    SimPayment(
+                        id=pay_id,
+                        session_id=session_id,
+                        order_id=ord_id,
+                        merchant_id="MERCHANT_MOCK_01",
+                        provider="MOCK_MOMO",
+                        provider_ref=f"MOMO_RECON_0{idx}",
+                        result_code=0,
+                        amount=200000,
+                        currency="VND",
+                        status=PaymentStatus.SUCCESS.value,
+                        verified_at=base_ts,
+                    ),
+                    Case(
+                        id=case_id,
+                        session_id=session_id,
+                        type="ORDER_SYNC",
+                        goal=f"Đồng bộ đơn {ord_id}",
+                        state=CaseState.NEW.value,
+                        version=1,
+                    ),
+                ]
+            )
+            db.flush()
+            db.add(
+                Evidence(
+                    id=f"EVD-RECON-FCT-0{idx}",
+                    case_id=case_id,
+                    session_id=session_id,
+                    kind=EvidenceKind.OBSERVED_FACT.value,
+                    source="ORDER_EVENT_LOG_DB",
+                    source_ref=f"sim_orders:{ord_id}",
+                    payload_json={
+                        "order_id": ord_id,
+                        "payment_id": pay_id,
+                        "payment_status": "SUCCESS",
+                        "worker_id": "SYNC_WORKER_W55",
+                        "batch_id": "BATCH_RECON_1500",
+                        "error_code": "ERR_DROPPED_WEBHOOK_SYNC",
+                        "event_timestamp": (base_ts + timedelta(seconds=idx * 15)).isoformat(),
+                    },
+                    observed_at=base_ts + timedelta(seconds=idx * 15),
+                )
+            )
+        db.commit()
+
+    # Initial correlation links all 3 Cases into 1 Incident
+    res_1 = client.post("/api/v1/incidents/correlate", headers=headers)
+    assert res_1.status_code == 200
+    inc_id = res_1.json()["items"][0]["id"]
+    detail_1 = client.get(f"/api/v1/incidents/{inc_id}", headers=headers).json()
+    assert {ic["case_id"] for ic in detail_1["linked_cases"]} == {
+        "CASE-RECON-01",
+        "CASE-RECON-02",
+        "CASE-RECON-03",
+    }
+
+    # Append a newer corrective OBSERVED_FACT on CASE-RECON-03 with a different causal event
+    with maker() as db:
+        db.add(
+            Evidence(
+                id="EVD-RECON-FCT-03-UPDATED",
+                case_id="CASE-RECON-03",
+                session_id=session_id,
+                kind=EvidenceKind.OBSERVED_FACT.value,
+                source="ORDER_EVENT_LOG_DB",
+                source_ref="sim_orders:ORD-RECON-03",
+                payload_json={
+                    "order_id": "ORD-RECON-03",
+                    "payment_id": "PAY-RECON-03",
+                    "payment_status": "FAILED",
+                    "worker_id": "CHECKOUT_WORKER_W88",
+                    "batch_id": "BATCH_OTHER_9999",
+                    "error_code": "ERR_USER_OTP_EXPIRED",
+                    "event_timestamp": (base_ts + timedelta(minutes=5)).isoformat(),
+                },
+                observed_at=base_ts + timedelta(minutes=5),
+            )
+        )
+        db.commit()
+
+    # Re-correlate: CASE-RECON-03 stale link MUST be removed and audited
+    res_2 = client.post("/api/v1/incidents/correlate", headers=headers)
+    assert res_2.status_code == 200
+    detail_2 = client.get(f"/api/v1/incidents/{inc_id}", headers=headers).json()
+    assert {ic["case_id"] for ic in detail_2["linked_cases"]} == {
+        "CASE-RECON-01",
+        "CASE-RECON-02",
+    }
+    assert "CASE-RECON-03" in detail_2["shared_factors_json"]["removed_stale_case_ids"]
+
+    c3_evts = client.get("/api/v1/cases/CASE-RECON-03/events", headers=headers).json()
+    assert any(e["type"] == "INCIDENT_UNLINKED" for e in c3_evts)
+
+    # Now update CASE-RECON-02 so the cluster drops below 2 valid Cases -> Incident closes &
+    # removes remaining stale links without auto-resolving any child Case
+    with maker() as db:
+        db.add(
+            Evidence(
+                id="EVD-RECON-FCT-02-UPDATED",
+                case_id="CASE-RECON-02",
+                session_id=session_id,
+                kind=EvidenceKind.OBSERVED_FACT.value,
+                source="ORDER_EVENT_LOG_DB",
+                source_ref="sim_orders:ORD-RECON-02",
+                payload_json={
+                    "order_id": "ORD-RECON-02",
+                    "payment_id": "PAY-RECON-02",
+                    "payment_status": "FAILED",
+                    "worker_id": "CHECKOUT_WORKER_W89",
+                    "batch_id": "BATCH_OTHER_8888",
+                    "error_code": "ERR_CARD_DECLINED",
+                    "event_timestamp": (base_ts + timedelta(minutes=6)).isoformat(),
+                },
+                observed_at=base_ts + timedelta(minutes=6),
+            )
+        )
+        db.commit()
+
+    res_3 = client.post("/api/v1/incidents/correlate", headers=headers)
+    assert res_3.status_code == 200
+    detail_3 = client.get(f"/api/v1/incidents/{inc_id}", headers=headers).json()
+    assert detail_3["status"] == IncidentStatus.CLOSED.value
+    assert len(detail_3["linked_cases"]) == 0
+    assert {"CASE-RECON-01", "CASE-RECON-02", "CASE-RECON-03"}.issubset(
+        set(detail_3["shared_factors_json"]["removed_stale_case_ids"])
+    )
+
+    with maker() as db:
+        all_3 = list(
+            db.scalars(
+                select(Case).where(Case.id.in_(["CASE-RECON-01", "CASE-RECON-02", "CASE-RECON-03"]))
+            ).all()
+        )
+        assert all(c.state == CaseState.NEW.value for c in all_3)
+
+
+def test_prompt05_1_risk_distinguishes_empty_refund_history_from_missing_payment_or_order(
+    client: TestClient, active_session: dict[str, str]
+) -> None:
+    """Prompt 05.1 Final (Items 2 & 4):
+    - `get_refund_history` distinguishes a verified payment with 0 refunds (`status='OK'`,
+      `payment_found=True`, `authority_status='VERIFIED_EMPTY_REFUND_HISTORY'`) from a missing
+      payment/order (`status='NOT_FOUND'`, `payment_found=False`, `outcome='UNKNOWN'`).
+    - When payment/order is missing, `RISK` marks that Case as `UNKNOWN` (`has_in_flight_refund`
+      is `None`, not `False`) and recommends `HOLD_OR_REVIEW_UNKNOWN_REFUND_AUTHORITY_PER_CASE`."""
+    token = active_session["token"]
+    session_id = active_session["id"]
+    headers = {"X-Demo-Session": token}
+    base_ts = datetime(2026, 11, 22, 16, 0, 0, tzinfo=UTC)
+
+    maker = get_sessionmaker()
+    with maker() as db:
+        # Case 1: Real verified payment with 0 refunds
+        o1 = SimOrder(
+            id="ORD-REF-AUTH-01",
+            session_id=session_id,
+            customer_name="Khách Auth 1",
+            customer_phone="0944000111",
+            amount=220000,
+            currency="VND",
+            subtotal=220000,
+            grand_total=220000,
+            status=OrderStatus.PENDING.value,
+            payment_status=OrderPaymentStatus.UNPAID.value,
+        )
+        p1 = SimPayment(
+            id="PAY-REF-AUTH-01",
+            session_id=session_id,
+            order_id=o1.id,
+            merchant_id="MERCHANT_MOCK_01",
+            provider="MOCK_MOMO",
+            provider_ref="MOMO_AUTH_01",
+            result_code=0,
+            amount=220000,
+            currency="VND",
+            status=PaymentStatus.SUCCESS.value,
+            verified_at=base_ts,
+        )
+        c1 = Case(
+            id="CASE-REF-AUTH-01",
+            session_id=session_id,
+            type="REFUND_REQUEST",
+            goal="Kiểm tra lịch sử hoàn tiền có thanh toán xác thực",
+            state=CaseState.NEW.value,
+            version=1,
+        )
+        # Case 2: References missing payment_id / order_id (not in DB!)
+        c2 = Case(
+            id="CASE-REF-AUTH-02-MISSING",
+            session_id=session_id,
+            type="REFUND_REQUEST",
+            goal="Kiểm tra lịch sử hoàn tiền khi thiếu bản ghi thanh toán",
+            state=CaseState.NEW.value,
+            version=1,
+        )
+        db.add_all([o1, p1, c1, c2])
+        db.flush()
+        db.add_all(
+            [
+                Evidence(
+                    id="EVD-AUTH-FCT-01",
+                    case_id=c1.id,
+                    session_id=session_id,
+                    kind=EvidenceKind.OBSERVED_FACT.value,
+                    source="ORDER_EVENT_LOG_DB",
+                    source_ref=f"sim_orders:{o1.id}",
+                    payload_json={
+                        "order_id": o1.id,
+                        "payment_id": p1.id,
+                        "payment_status": "SUCCESS",
+                        "worker_id": "SYNC_WORKER_W77",
+                        "batch_id": "BATCH_AUTH_1600",
+                        "error_code": "ERR_DROPPED_WEBHOOK_SYNC",
+                        "event_timestamp": base_ts.isoformat(),
+                    },
+                    observed_at=base_ts,
+                ),
+                Evidence(
+                    id="EVD-AUTH-FCT-02",
+                    case_id=c2.id,
+                    session_id=session_id,
+                    kind=EvidenceKind.OBSERVED_FACT.value,
+                    source="ORDER_EVENT_LOG_DB",
+                    source_ref="sim_orders:ORD-MISSING-999",
+                    payload_json={
+                        "order_id": "ORD-MISSING-999",
+                        "payment_id": "PAY-MISSING-999",
+                        "payment_status": "UNKNOWN",
+                        "worker_id": "SYNC_WORKER_W77",
+                        "batch_id": "BATCH_AUTH_1600",
+                        "error_code": "ERR_DROPPED_WEBHOOK_SYNC",
+                        "event_timestamp": (base_ts + timedelta(seconds=20)).isoformat(),
+                    },
+                    observed_at=base_ts + timedelta(seconds=20),
+                ),
+            ]
+        )
+        db.commit()
+
+    corr_res = client.post("/api/v1/incidents/correlate", headers=headers)
+    assert corr_res.status_code == 200
+    inc_id = corr_res.json()["items"][0]["id"]
+    detail = client.get(f"/api/v1/incidents/{inc_id}", headers=headers).json()
+    risk_task = next(t for t in detail["assigned_tasks"] if t["role"] == "RISK")
+    risk_handoff = TaskHandoffPayload.model_validate(risk_task["handoff_json"])
+
+    # Case 1 has verified empty refund history
+    assert (
+        risk_handoff.per_case_verification_status["CASE-REF-AUTH-01"]
+        == "OBSERVED_NO_REFUND_ON_VERIFIED_PAYMENT"
+    )
+    obs_c1 = next(
+        o
+        for o in risk_handoff.tool_observations
+        if o.tool_name == "get_refund_history" and o.case_id == "CASE-REF-AUTH-01"
+    )
+    assert obs_c1.status == "OK"
+    assert obs_c1.summary["payment_found"] is True
+    assert obs_c1.summary["has_in_flight_refund"] is False
+    assert obs_c1.summary["refund_authority_status"] == "VERIFIED_EMPTY_REFUND_HISTORY"
+
+    # Case 2 has missing payment/order -> UNKNOWN (NOT false positive "no refund"!)
+    assert risk_handoff.per_case_verification_status["CASE-REF-AUTH-02-MISSING"] == "UNKNOWN"
+    obs_c2 = next(
+        o
+        for o in risk_handoff.tool_observations
+        if o.tool_name == "get_refund_history" and o.case_id == "CASE-REF-AUTH-02-MISSING"
+    )
+    assert obs_c2.status == "NOT_FOUND"
+    assert obs_c2.summary["payment_found"] is False
+    assert obs_c2.summary["has_in_flight_refund"] is None
+    assert obs_c2.summary["refund_authority_status"] == "UNKNOWN_PAYMENT_OR_ORDER_NOT_FOUND"
+    assert risk_handoff.recommended_per_case_action == (
+        "HOLD_OR_REVIEW_UNKNOWN_REFUND_AUTHORITY_PER_CASE"
+    )
+
+
+def test_prompt05_1_checked_case_ids_computed_from_actual_tool_invocations_only(
+    client: TestClient, active_session: dict[str, str]
+) -> None:
+    """Prompt 05.1 Final (Items 3 & 4):
+    - When a Case is selected in the planned sample (`sampled_ics`) but has NO `order_id` and
+      NO `payment_id` (so no case-scoped read tool can be invoked for it):
+      - `checked_case_ids` MUST NOT include that Case for any role.
+      - `unchecked_case_ids` MUST include that Case, and `per_case_verification_status` MUST mark
+        it `UNKNOWN` (even if a role invoked a generic `get_policy` call)."""
+    token = active_session["token"]
+    session_id = active_session["id"]
+    headers = {"X-Demo-Session": token}
+    base_ts = datetime(2026, 11, 22, 17, 0, 0, tzinfo=UTC)
+
+    maker = get_sessionmaker()
+    with maker() as db:
+        # Case 1: No order_id, no payment_id -> no executable case-scoped read tool!
+        c1 = Case(
+            id="CASE-NO-TOOL-01",
+            session_id=session_id,
+            type="PAYMENT_DISPUTE",
+            goal="Sự cố thiếu hoàn toàn mã đơn và mã thanh toán",
+            state=CaseState.NEW.value,
+            version=1,
+        )
+        # Case 2: Has order_id (no payment_id) -> OPERATIONS & SUPPORT can call get_order,
+        # FINANCE can call find_payment_candidates.
+        o2 = SimOrder(
+            id="ORD-TOOL-CHECK-02",
+            session_id=session_id,
+            customer_name="Khách Tool Check 2",
+            customer_phone="0955000222",
+            amount=150000,
+            currency="VND",
+            subtotal=150000,
+            grand_total=150000,
+            status=OrderStatus.PENDING.value,
+            payment_status=OrderPaymentStatus.UNPAID.value,
+        )
+        c2 = Case(
+            id="CASE-HAS-ORD-02",
+            session_id=session_id,
+            type="PAYMENT_DISPUTE",
+            goal="Sự cố có order_id để chạy tool đọc",
+            state=CaseState.NEW.value,
+            version=1,
+        )
+        db.add_all([c1, o2, c2])
+        db.flush()
+        db.add_all(
+            [
+                Evidence(
+                    id="EVD-NOTOOL-FCT-01",
+                    case_id=c1.id,
+                    session_id=session_id,
+                    kind=EvidenceKind.OBSERVED_FACT.value,
+                    source="ORDER_EVENT_LOG_DB",
+                    source_ref="worker:SYNC_WORKER_W66",
+                    payload_json={
+                        "worker_id": "SYNC_WORKER_W66",
+                        "batch_id": "BATCH_NOTOOL_1700",
+                        "error_code": "ERR_DROPPED_WEBHOOK_SYNC",
+                        "event_timestamp": base_ts.isoformat(),
+                    },
+                    observed_at=base_ts,
+                ),
+                Evidence(
+                    id="EVD-NOTOOL-FCT-02",
+                    case_id=c2.id,
+                    session_id=session_id,
+                    kind=EvidenceKind.OBSERVED_FACT.value,
+                    source="ORDER_EVENT_LOG_DB",
+                    source_ref=f"sim_orders:{o2.id}",
+                    payload_json={
+                        "order_id": o2.id,
+                        "worker_id": "SYNC_WORKER_W66",
+                        "batch_id": "BATCH_NOTOOL_1700",
+                        "error_code": "ERR_DROPPED_WEBHOOK_SYNC",
+                        "event_timestamp": (base_ts + timedelta(seconds=15)).isoformat(),
+                    },
+                    observed_at=base_ts + timedelta(seconds=15),
+                ),
+            ]
+        )
+        db.commit()
+
+    corr_res = client.post("/api/v1/incidents/correlate", headers=headers)
+    assert corr_res.status_code == 200
+    inc_id = corr_res.json()["items"][0]["id"]
+    detail = client.get(f"/api/v1/incidents/{inc_id}", headers=headers).json()
+
+    assert len(detail["assigned_tasks"]) >= 2
+    for t in detail["assigned_tasks"]:
+        handoff = TaskHandoffPayload.model_validate(t["handoff_json"])
+        # CASE-NO-TOOL-01 had NO executable case read tool -> MUST NOT be in checked_case_ids!
+        assert "CASE-NO-TOOL-01" not in handoff.checked_case_ids
+        assert "CASE-NO-TOOL-01" in handoff.unchecked_case_ids
+        assert handoff.per_case_verification_status["CASE-NO-TOOL-01"] == "UNKNOWN"
+        # CASE-HAS-ORD-02 had an executable case read tool -> IS in checked_case_ids!
+        assert "CASE-HAS-ORD-02" in handoff.checked_case_ids

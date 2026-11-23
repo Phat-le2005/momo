@@ -279,13 +279,16 @@ class IncidentCorrelator:
 
             # Same-event requirement: worker_id, batch_id, and error_code must all exist on
             # the SAME OBSERVED_FACT record to qualify as a valid causal correlation event.
-            if ev_w and ev_b and ev_e and causal_ev_id is None:
+            # When a Case receives a newer corrective OBSERVED_FACT event (ordered ascending by
+            # observed_at), the latest same-event triad supersedes earlier ones.
+            if ev_w and ev_b and ev_e:
                 causal_ev_id = ev.id
                 worker_id = ev_w
                 batch_id = ev_b
                 error_code = ev_e
                 event_ts = ev_ts
-                ev_refs.append(ev.id)
+                if ev.id not in ev_refs:
+                    ev_refs.append(ev.id)
 
                 p_val = safe_payload.get("provider")
                 if isinstance(p_val, str) and p_val.strip():
@@ -529,6 +532,41 @@ class IncidentCorrelator:
                     self._db.flush()
 
                 existing_case_map = {ic.case_id: ic for ic in (incident.incident_cases or [])}
+                current_member_ids = {m.case.id for m in window_members}
+
+                # Reconcile stale IncidentCase memberships on repeated correlation:
+                # remove stale links and append an audit trail CaseEvent(INCIDENT_UNLINKED).
+                removed_stale_ids: list[str] = []
+                for stale_case_id, stale_ic in list(existing_case_map.items()):
+                    if stale_case_id not in current_member_ids:
+                        removed_stale_ids.append(stale_case_id)
+                        self._db.delete(stale_ic)
+                        self._db.add(
+                            CaseEvent(
+                                id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
+                                case_id=stale_case_id,
+                                session_id=self._session_id,
+                                type="INCIDENT_UNLINKED",
+                                payload_json={
+                                    "incident_id": incident.id,
+                                    "correlation_key": corr_key,
+                                    "reason": "STALE_LINK_REMOVED_ON_RECORRELATION",
+                                    "auto_resolved": False,
+                                },
+                                created_at=now,
+                            )
+                        )
+                if removed_stale_ids:
+                    sf_reconciled = dict(incident.shared_factors_json or {})
+                    prior_removed = list(sf_reconciled.get("removed_stale_case_ids") or [])
+                    sf_reconciled["removed_stale_case_ids"] = sorted(
+                        set(prior_removed) | set(removed_stale_ids)
+                    )
+                    incident.shared_factors_json = sf_reconciled
+                    incident.title = (
+                        f"Sự cố nghẽn đồng bộ đơn hàng ({worker_id} / {batch_id} / {count} Cases)"
+                    )
+
                 for m in window_members:
                     correlated_case_ids.add(m.case.id)
                     causal_json = sanitize_no_oracle_leak(
@@ -580,10 +618,64 @@ class IncidentCorrelator:
                             )
                         )
                     else:
-                        existing_case_map[m.case.id].causal_factors_json = causal_json
+                        existing_ic = existing_case_map[m.case.id]
+                        existing_ic.causal_factors_json = causal_json
+                        existing_ic.shared_evidence_refs = m.evidence_refs
+                        existing_ic.link_reason = (
+                            f"Same-event causal OBSERVED_FACT ({m.causal_event_evidence_id}): "
+                            f"worker_id={worker_id}, batch_id={batch_id}, "
+                            f"error_code={error_code}"
+                        )
 
                 self._db.flush()
                 created_or_updated_incidents.append(incident)
+
+        # Reconcile previously existing session Incidents that no longer have a valid cluster
+        # (e.g., a 2-case Incident dropped to < 2 Cases after evidence update).
+        # Remove stale IncidentCase rows, preserve Incident + CaseEvent audit trail, and NEVER
+        # auto-resolve child Cases.
+        active_incident_ids = {inc.id for inc in created_or_updated_incidents}
+        all_session_incidents = list(
+            self._db.scalars(
+                select(Incident)
+                .options(selectinload(Incident.incident_cases))
+                .where(Incident.session_id == self._session_id)
+            ).all()
+        )
+        reconcile_now = datetime.now(UTC)
+        for old_inc in all_session_incidents:
+            if old_inc.id in active_incident_ids:
+                continue
+            stale_links = list(old_inc.incident_cases or [])
+            if not stale_links:
+                continue
+            removed_from_old: list[str] = []
+            for stale_ic in stale_links:
+                removed_from_old.append(stale_ic.case_id)
+                self._db.delete(stale_ic)
+                self._db.add(
+                    CaseEvent(
+                        id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
+                        case_id=stale_ic.case_id,
+                        session_id=self._session_id,
+                        type="INCIDENT_UNLINKED",
+                        payload_json={
+                            "incident_id": old_inc.id,
+                            "correlation_key": old_inc.correlation_key,
+                            "reason": "INCIDENT_CLUSTER_NO_LONGER_VALID_ON_RECORRELATION",
+                            "auto_resolved": False,
+                        },
+                        created_at=reconcile_now,
+                    )
+                )
+            old_sf = dict(old_inc.shared_factors_json or {})
+            prior_removed = list(old_sf.get("removed_stale_case_ids") or [])
+            old_sf["removed_stale_case_ids"] = sorted(set(prior_removed) | set(removed_from_old))
+            old_sf["linked_cases_count"] = 0
+            old_inc.shared_factors_json = old_sf
+            old_inc.status = IncidentStatus.CLOSED.value
+            old_inc.updated_at = reconcile_now
+        self._db.flush()
 
         rejected_lookalikes: list[RejectedLookalikeItem] = []
         for obs in unbucketed:

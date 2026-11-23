@@ -613,11 +613,27 @@ class ReadToolRegistry:
         payment_id = _safe_str(args, "payment_id")
         order_id_arg = _safe_str(args, "order_id")
 
-        resolved_order_id = order_id_arg
+        if simulate_timeout or args.get("simulate_timeout") is True:
+            return ToolResult(
+                tool_name="get_refund_history",
+                status="TIMEOUT",
+                source="SIM_REFUNDS_DB",
+                source_ref=f"sim_refunds:{payment_id or order_id_arg or 'none'}",
+                source_mode="MOCK",
+                observed_at=now,
+                data={
+                    "timed_out": True,
+                    "outcome": "UNKNOWN",
+                    "authority_status": "UNAVAILABLE",
+                    "payment_found": False,
+                    "order_found": False,
+                    "refunds": [],
+                },
+            )
+
+        resolved_order: SimOrder | None = None
         if order_id_arg:
             resolved_order = self._resolve_unique_order({"order_id": order_id_arg})
-            if resolved_order is not None:
-                resolved_order_id = resolved_order.id
 
         payment: SimPayment | None = None
         if payment_id:
@@ -627,21 +643,24 @@ class ReadToolRegistry:
                     SimPayment.id == payment_id,
                 )
             )
-        elif resolved_order_id:
+        elif resolved_order is not None:
             payment = self._db.scalar(
                 select(SimPayment)
                 .where(
                     SimPayment.session_id == self._session_id,
-                    SimPayment.order_id == resolved_order_id,
+                    SimPayment.order_id == resolved_order.id,
                 )
                 .order_by(SimPayment.created_at.asc())
             )
 
+        payment_found = payment is not None
+        order_found = resolved_order is not None
+
         conditions = []
         if payment is not None:
             conditions.append(SimRefund.payment_id == payment.id)
-        if resolved_order_id:
-            conditions.append(SimRefund.order_id == resolved_order_id)
+        if resolved_order is not None:
+            conditions.append(SimRefund.order_id == resolved_order.id)
 
         if conditions:
             refunds = list(
@@ -684,7 +703,48 @@ class ReadToolRegistry:
             for r in refunds
         ]
 
-        ref_target = (payment.id if payment else None) or resolved_order_id or "none"
+        ref_target = (
+            (payment.id if payment else None)
+            or (resolved_order.id if resolved_order else None)
+            or payment_id
+            or order_id_arg
+            or "none"
+        )
+        if not payment_found and not order_found and not refund_items:
+            return ToolResult(
+                tool_name="get_refund_history",
+                status="NOT_FOUND",
+                source="SIM_REFUNDS_DB",
+                source_ref=f"sim_refunds:{ref_target}",
+                source_mode="MOCK",
+                observed_at=now,
+                data={
+                    "payment_found": False,
+                    "order_found": False,
+                    "authority_status": "INSUFFICIENT_NOT_FOUND",
+                    "outcome": "UNKNOWN",
+                    "payment_id": None,
+                    "order_id": None,
+                    "payment_amount": 0,
+                    "payment_status": "NOT_FOUND",
+                    "refund_count": 0,
+                    "total_completed_refunds": 0,
+                    "total_pending_or_unknown_refunds": 0,
+                    "remaining_refundable_amount": 0,
+                    "has_completed_refund": False,
+                    "has_pending_or_unknown_refund": False,
+                    "is_fully_refunded_or_locked": False,
+                    "refunds": [],
+                },
+            )
+
+        if not payment_found:
+            authority_status = "INSUFFICIENT_PAYMENT_NOT_FOUND"
+        elif refund_items:
+            authority_status = "VERIFIED_REFUND_HISTORY"
+        else:
+            authority_status = "VERIFIED_EMPTY_REFUND_HISTORY"
+
         return ToolResult(
             tool_name="get_refund_history",
             status="OK",
@@ -693,8 +753,15 @@ class ReadToolRegistry:
             source_mode="MOCK",
             observed_at=now,
             data={
+                "payment_found": payment_found,
+                "order_found": order_found,
+                "authority_status": authority_status,
                 "payment_id": payment.id if payment else None,
-                "order_id": resolved_order_id or (payment.order_id if payment else None),
+                "order_id": (
+                    resolved_order.id
+                    if resolved_order is not None
+                    else (payment.order_id if payment else None)
+                ),
                 "payment_amount": payment_amount,
                 "payment_status": payment.status if payment else "NOT_FOUND",
                 "refund_count": len(refund_items),

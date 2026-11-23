@@ -246,7 +246,7 @@ class TaskforceManager:
                     IncidentCase.incident_id == target_inc.id,
                     IncidentCase.session_id == self._session_id,
                 )
-                .order_by(IncidentCase.created_at.asc(), IncidentCase.id.asc())
+                .order_by(IncidentCase.created_at.asc(), IncidentCase.case_id.asc())
             ).all()
         )
 
@@ -271,8 +271,6 @@ class TaskforceManager:
             pay_ids_with_refunds = {r.payment_id for r in ref_rows if r.payment_id}
 
         sampled_ics = self._select_sample_incident_cases(inc_cases, pay_ids_with_refunds)
-        checked_case_ids = [ic.case_id for ic in sampled_ics]
-        unchecked_case_ids = [cid for cid in all_case_ids if cid not in set(checked_case_ids)]
 
         read_registry = ReadToolRegistry(self._db, self._session_id)
         configured_mode = get_settings().model_mode.value
@@ -292,9 +290,8 @@ class TaskforceManager:
             if role_name == TaskforceRole.FINANCE.value:
                 task = self._run_finance_task(
                     target_inc=target_inc,
+                    all_case_ids=all_case_ids,
                     sampled_ics=sampled_ics,
-                    checked_case_ids=checked_case_ids,
-                    unchecked_case_ids=unchecked_case_ids,
                     next_role=next_role,
                     read_registry=read_registry,
                     effective_runtime_mode=effective_runtime_mode,
@@ -304,9 +301,8 @@ class TaskforceManager:
             elif role_name == TaskforceRole.OPERATIONS.value:
                 task = self._run_operations_task(
                     target_inc=target_inc,
+                    all_case_ids=all_case_ids,
                     sampled_ics=sampled_ics,
-                    checked_case_ids=checked_case_ids,
-                    unchecked_case_ids=unchecked_case_ids,
                     next_role=next_role,
                     read_registry=read_registry,
                     effective_runtime_mode=effective_runtime_mode,
@@ -316,9 +312,8 @@ class TaskforceManager:
             elif role_name == TaskforceRole.RISK.value:
                 task = self._run_risk_task(
                     target_inc=target_inc,
+                    all_case_ids=all_case_ids,
                     sampled_ics=sampled_ics,
-                    checked_case_ids=checked_case_ids,
-                    unchecked_case_ids=unchecked_case_ids,
                     next_role=next_role,
                     read_registry=read_registry,
                     effective_runtime_mode=effective_runtime_mode,
@@ -328,9 +323,8 @@ class TaskforceManager:
             else:
                 task = self._run_support_task(
                     target_inc=target_inc,
+                    all_case_ids=all_case_ids,
                     sampled_ics=sampled_ics,
-                    checked_case_ids=checked_case_ids,
-                    unchecked_case_ids=unchecked_case_ids,
                     next_role=next_role,
                     read_registry=read_registry,
                     effective_runtime_mode=effective_runtime_mode,
@@ -349,7 +343,17 @@ class TaskforceManager:
         target_inc.updated_at = now
         self._db.flush()
 
+        actual_checked_union: list[str] = []
+        for t in created_tasks:
+            for cid in t.handoff_json.get("checked_case_ids") or []:
+                if cid not in actual_checked_union:
+                    actual_checked_union.append(str(cid))
+        actual_unchecked_union = [
+            cid for cid in all_case_ids if cid not in set(actual_checked_union)
+        ]
+
         for ic in inc_cases:
+            was_checked = ic.case_id in set(actual_checked_union)
             self._db.add(
                 CaseEvent(
                     id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
@@ -360,13 +364,11 @@ class TaskforceManager:
                         "incident_id": target_inc.id,
                         "assigned_roles": selected_roles,
                         "task_ids": [t.id for t in created_tasks],
-                        "checked_case_ids": checked_case_ids,
-                        "unchecked_case_ids": unchecked_case_ids,
-                        "case_was_directly_checked": ic.case_id in set(checked_case_ids),
+                        "checked_case_ids": actual_checked_union,
+                        "unchecked_case_ids": actual_unchecked_union,
+                        "case_was_directly_checked": was_checked,
                         "verification_status": (
-                            "OBSERVED_SAMPLE_FACT_NOT_VERIFIED"
-                            if ic.case_id in set(checked_case_ids)
-                            else "UNKNOWN"
+                            "OBSERVED_SAMPLE_FACT_NOT_VERIFIED" if was_checked else "UNKNOWN"
                         ),
                         "runtime_mode": effective_runtime_mode,
                         "llm_invoked": False,
@@ -384,9 +386,8 @@ class TaskforceManager:
         self,
         *,
         target_inc: Incident,
+        all_case_ids: list[str],
         sampled_ics: list[IncidentCase],
-        checked_case_ids: list[str],
-        unchecked_case_ids: list[str],
         next_role: str,
         read_registry: ReadToolRegistry,
         effective_runtime_mode: str,
@@ -399,27 +400,36 @@ class TaskforceManager:
             tool_registry=read_registry,
         )
         fin_obs: list[ToolObservationSummary] = []
-        per_case_status: dict[str, str] = {cid: "UNKNOWN" for cid in unchecked_case_ids}
+        per_case_status: dict[str, str] = {cid: "UNKNOWN" for cid in all_case_ids}
+        checked_case_ids: list[str] = []
 
-        observed_statuses: list[str] = []
         verified_success_count = 0
         non_success_cases: list[str] = []
+        unknown_authority_cases: list[str] = []
 
         for ic in sampled_ics:
             pay_id = str(ic.causal_factors_json.get("payment_id") or "")
             ord_id = str(ic.causal_factors_json.get("order_id") or "")
             if pay_id:
                 pay_res = fin_exec.execute_read_tool("get_payment_record", {"payment_id": pay_id})
-                p_status = str(pay_res.data.get("status") or pay_res.status)
-                auth_ok = bool(pay_res.data.get("authoritative_success"))
-                res_code = pay_res.data.get("result_code")
-                observed_statuses.append(p_status)
-                if auth_ok and p_status == PaymentStatus.SUCCESS.value and res_code == 0:
-                    verified_success_count += 1
-                    per_case_status[ic.case_id] = "OBSERVED_PAYMENT_SUCCESS_UNVERIFIED_ORDER"
+                checked_case_ids.append(ic.case_id)
+                p_status: str
+                if pay_res.status != "OK":
+                    unknown_authority_cases.append(f"{ic.case_id}({pay_res.status})")
+                    per_case_status[ic.case_id] = "UNKNOWN"
+                    p_status = str(pay_res.status)
+                    auth_ok = False
+                    res_code = None
                 else:
-                    non_success_cases.append(f"{ic.case_id}({p_status},code={res_code})")
-                    per_case_status[ic.case_id] = f"OBSERVED_PAYMENT_{p_status}"
+                    p_status = str(pay_res.data.get("status") or pay_res.status)
+                    auth_ok = bool(pay_res.data.get("authoritative_success"))
+                    res_code = pay_res.data.get("result_code")
+                    if auth_ok and p_status == PaymentStatus.SUCCESS.value and res_code == 0:
+                        verified_success_count += 1
+                        per_case_status[ic.case_id] = "OBSERVED_PAYMENT_SUCCESS_UNVERIFIED_ORDER"
+                    else:
+                        non_success_cases.append(f"{ic.case_id}({p_status},code={res_code})")
+                        per_case_status[ic.case_id] = f"OBSERVED_PAYMENT_{p_status}"
 
                 fin_obs.append(
                     ToolObservationSummary(
@@ -443,10 +453,13 @@ class TaskforceManager:
                 cand_res = fin_exec.execute_read_tool(
                     "find_payment_candidates", {"order_id": ord_id}
                 )
-                c_count = int(cand_res.data.get("candidates_count") or 0)
-                per_case_status[ic.case_id] = (
-                    "OBSERVED_CANDIDATES_FOUND" if c_count > 0 else "UNKNOWN"
-                )
+                checked_case_ids.append(ic.case_id)
+                c_count = int(cand_res.data.get("candidate_count") or 0)
+                if cand_res.status == "OK" and c_count > 0:
+                    per_case_status[ic.case_id] = "OBSERVED_CANDIDATES_FOUND"
+                else:
+                    unknown_authority_cases.append(f"{ic.case_id}({cand_res.status})")
+                    per_case_status[ic.case_id] = "UNKNOWN"
                 fin_obs.append(
                     ToolObservationSummary(
                         case_id=ic.case_id,
@@ -455,14 +468,17 @@ class TaskforceManager:
                         source=cand_res.source,
                         source_ref=cand_res.source_ref,
                         summary=sanitize_no_oracle_leak(
-                            {"case_id": ic.case_id, "candidates_count": c_count}
+                            {"case_id": ic.case_id, "candidate_count": c_count}
                         ),
                     )
                 )
             else:
+                # No payment_id or order_id available -> no read tool invoked; remains UNKNOWN
                 per_case_status[ic.case_id] = "UNKNOWN"
 
-        total_cases = len(checked_case_ids) + len(unchecked_case_ids)
+        unchecked_case_ids = [cid for cid in all_case_ids if cid not in set(checked_case_ids)]
+        total_cases = len(all_case_ids)
+
         if non_success_cases:
             findings_vi = (
                 f"Vai trò FINANCE đã kiểm tra mẫu {len(checked_case_ids)}/{total_cases} Case "
@@ -472,6 +488,14 @@ class TaskforceManager:
                 "còn lại chưa kiểm tra trực tiếp được đánh dấu UNKNOWN. Không đồng bộ hàng loạt."
             )
             rec_action = "HOLD_OR_REVIEW_MIXED_PAYMENT_STATUS_PER_CASE"
+        elif unknown_authority_cases or not checked_case_ids:
+            findings_vi = (
+                f"Vai trò FINANCE đã gọi công cụ cho {len(checked_case_ids)}/{total_cases} Case "
+                f"({checked_case_ids}): không đủ thẩm quyền xác minh thanh toán tại "
+                f"{unknown_authority_cases or unchecked_case_ids} (trạng thái UNKNOWN). "
+                "Cần bổ sung mã giao dịch hoặc kiểm tra độc lập từng Case."
+            )
+            rec_action = "REQUEST_PAYMENT_EVIDENCE_OR_REVIEW_UNKNOWN_PER_CASE"
         else:
             findings_vi = (
                 f"Vai trò FINANCE đã đối soát mẫu {len(checked_case_ids)}/{total_cases} Case "
@@ -504,7 +528,7 @@ class TaskforceManager:
             id=f"TASK-FIN-{uuid.uuid4().hex[:8].upper()}",
             session_id=self._session_id,
             incident_id=target_inc.id,
-            case_id=sampled_ics[0].case_id if sampled_ics else None,
+            case_id=checked_case_ids[0] if checked_case_ids else None,
             role=TaskforceRole.FINANCE.value,
             objective=(
                 "Đối soát sổ cái thanh toán trên tập Case mẫu (get_payment_record / "
@@ -522,9 +546,8 @@ class TaskforceManager:
         self,
         *,
         target_inc: Incident,
+        all_case_ids: list[str],
         sampled_ics: list[IncidentCase],
-        checked_case_ids: list[str],
-        unchecked_case_ids: list[str],
         next_role: str,
         read_registry: ReadToolRegistry,
         effective_runtime_mode: str,
@@ -537,10 +560,12 @@ class TaskforceManager:
             tool_registry=read_registry,
         )
         ops_obs: list[ToolObservationSummary] = []
-        per_case_status: dict[str, str] = {cid: "UNKNOWN" for cid in unchecked_case_ids}
+        per_case_status: dict[str, str] = {cid: "UNKNOWN" for cid in all_case_ids}
+        checked_case_ids: list[str] = []
 
         pending_unpaid_count = 0
         other_order_states: list[str] = []
+        missing_order_cases: list[str] = []
 
         for ic in sampled_ics:
             ord_id = str(ic.causal_factors_json.get("order_id") or "")
@@ -550,15 +575,23 @@ class TaskforceManager:
 
             ord_res = ops_exec.execute_read_tool("get_order", {"order_id": ord_id})
             evt_res = ops_exec.execute_read_tool("get_order_events", {"order_id": ord_id})
-            o_status = str(ord_res.data.get("status") or ord_res.status)
-            o_pay_status = str(ord_res.data.get("payment_status") or "UNKNOWN")
+            checked_case_ids.append(ic.case_id)
 
-            if o_status == "PENDING" and o_pay_status == "UNPAID":
-                pending_unpaid_count += 1
-                per_case_status[ic.case_id] = "OBSERVED_ORDER_PENDING_UNPAID"
+            o_status: str
+            if ord_res.status != "OK":
+                missing_order_cases.append(f"{ic.case_id}({ord_res.status})")
+                per_case_status[ic.case_id] = "UNKNOWN"
+                o_status = str(ord_res.status)
+                o_pay_status = "UNKNOWN"
             else:
-                other_order_states.append(f"{ic.case_id}({o_status}/{o_pay_status})")
-                per_case_status[ic.case_id] = f"OBSERVED_ORDER_{o_status}_{o_pay_status}"
+                o_status = str(ord_res.data.get("status") or ord_res.status)
+                o_pay_status = str(ord_res.data.get("payment_status") or "UNKNOWN")
+                if o_status == "PENDING" and o_pay_status == "UNPAID":
+                    pending_unpaid_count += 1
+                    per_case_status[ic.case_id] = "OBSERVED_ORDER_PENDING_UNPAID"
+                else:
+                    other_order_states.append(f"{ic.case_id}({o_status}/{o_pay_status})")
+                    per_case_status[ic.case_id] = f"OBSERVED_ORDER_{o_status}_{o_pay_status}"
 
             ops_obs.extend(
                 [
@@ -596,7 +629,9 @@ class TaskforceManager:
                 ]
             )
 
-        total_cases = len(checked_case_ids) + len(unchecked_case_ids)
+        unchecked_case_ids = [cid for cid in all_case_ids if cid not in set(checked_case_ids)]
+        total_cases = len(all_case_ids)
+
         if other_order_states:
             findings_vi = (
                 f"Vai trò OPERATIONS đã kiểm tra mẫu {len(checked_case_ids)}/{total_cases} Case "
@@ -605,6 +640,13 @@ class TaskforceManager:
                 f"{len(unchecked_case_ids)} Case còn lại giữ trạng thái UNKNOWN."
             )
             rec_action = "INSPECT_INDIVIDUAL_ORDER_STATE_BEFORE_PROPOSAL"
+        elif missing_order_cases or not checked_case_ids:
+            findings_vi = (
+                f"Vai trò OPERATIONS đã gọi công cụ cho {len(checked_case_ids)}/{total_cases} "
+                f"Case ({checked_case_ids}): không tìm thấy đơn hàng hoặc thiếu order_id tại "
+                f"{missing_order_cases or unchecked_case_ids} (trạng thái UNKNOWN)."
+            )
+            rec_action = "REQUEST_ORDER_IDENTIFIER_OR_INSPECT_PER_CASE"
         else:
             findings_vi = (
                 f"Vai trò OPERATIONS đã kiểm tra mẫu {len(checked_case_ids)}/{total_cases} Case "
@@ -637,7 +679,7 @@ class TaskforceManager:
             id=f"TASK-OPS-{uuid.uuid4().hex[:8].upper()}",
             session_id=self._session_id,
             incident_id=target_inc.id,
-            case_id=sampled_ics[0].case_id if sampled_ics else None,
+            case_id=checked_case_ids[0] if checked_case_ids else None,
             role=TaskforceRole.OPERATIONS.value,
             objective=(
                 "Kiểm tra trạng thái đơn hàng (get_order) và sự kiện worker (get_order_events) "
@@ -655,9 +697,8 @@ class TaskforceManager:
         self,
         *,
         target_inc: Incident,
+        all_case_ids: list[str],
         sampled_ics: list[IncidentCase],
-        checked_case_ids: list[str],
-        unchecked_case_ids: list[str],
         next_role: str,
         read_registry: ReadToolRegistry,
         effective_runtime_mode: str,
@@ -670,11 +711,13 @@ class TaskforceManager:
             tool_registry=read_registry,
         )
         risk_obs: list[ToolObservationSummary] = []
-        per_case_status: dict[str, str] = {cid: "UNKNOWN" for cid in unchecked_case_ids}
+        per_case_status: dict[str, str] = {cid: "UNKNOWN" for cid in all_case_ids}
+        checked_case_ids: list[str] = []
 
         any_in_flight_refund = False
         any_settled_refund = False
         flagged_refund_cases: list[str] = []
+        insufficient_authority_cases: list[str] = []
 
         for ic in sampled_ics:
             pay_id = str(ic.causal_factors_json.get("payment_id") or "")
@@ -687,7 +730,42 @@ class TaskforceManager:
                 "get_refund_history",
                 {"payment_id": pay_id, "order_id": ord_id},
             )
+            checked_case_ids.append(ic.case_id)
             refunds_list = list(ref_res.data.get("refunds") or [])
+            payment_found = bool(ref_res.data.get("payment_found"))
+
+            # Distinguish verified empty refund history from payment/order not found or unavailable
+            if ref_res.status != "OK" or (not payment_found and not refunds_list):
+                auth_status = (
+                    "UNKNOWN_TOOL_UNAVAILABLE"
+                    if ref_res.status in ("TIMEOUT", "ERROR")
+                    else "UNKNOWN_PAYMENT_OR_ORDER_NOT_FOUND"
+                )
+                insufficient_authority_cases.append(f"{ic.case_id}({auth_status})")
+                per_case_status[ic.case_id] = "UNKNOWN"
+                risk_obs.append(
+                    ToolObservationSummary(
+                        case_id=ic.case_id,
+                        tool_name="get_refund_history",
+                        status=ref_res.status,
+                        source=ref_res.source,
+                        source_ref=ref_res.source_ref,
+                        summary=sanitize_no_oracle_leak(
+                            {
+                                "case_id": ic.case_id,
+                                "payment_id": pay_id or None,
+                                "order_id": ord_id or None,
+                                "payment_found": payment_found,
+                                "refund_authority_status": auth_status,
+                                "refund_count": len(refunds_list),
+                                "has_in_flight_refund": None,
+                                "has_settled_refund": None,
+                            }
+                        ),
+                    )
+                )
+                continue
+
             settled_amt = sum(
                 int(r.get("completed_amount") or r.get("amount") or 0)
                 for r in refunds_list
@@ -714,12 +792,15 @@ class TaskforceManager:
                     f"{ic.case_id}(IN_FLIGHT:{in_flight_statuses},{pending_or_unk_amt})"
                 )
                 per_case_status[ic.case_id] = "HOLD_IN_FLIGHT_REFUND_DETECTED"
+                auth_status = "VERIFIED_IN_FLIGHT_REFUND_DETECTED"
             elif has_settled:
                 any_settled_refund = True
                 flagged_refund_cases.append(f"{ic.case_id}(SETTLED:{settled_amt})")
                 per_case_status[ic.case_id] = "REVIEW_PRIOR_SETTLED_REFUND_DETECTED"
+                auth_status = "VERIFIED_SETTLED_REFUND_DETECTED"
             else:
-                per_case_status[ic.case_id] = "OBSERVED_NO_REFUND_ON_SAMPLE"
+                per_case_status[ic.case_id] = "OBSERVED_NO_REFUND_ON_VERIFIED_PAYMENT"
+                auth_status = "VERIFIED_EMPTY_REFUND_HISTORY"
 
             risk_obs.append(
                 ToolObservationSummary(
@@ -732,6 +813,8 @@ class TaskforceManager:
                         {
                             "case_id": ic.case_id,
                             "payment_id": pay_id,
+                            "payment_found": payment_found,
+                            "refund_authority_status": auth_status,
                             "refund_count": len(refunds_list),
                             "has_in_flight_refund": has_in_flight,
                             "has_settled_refund": has_settled,
@@ -746,7 +829,7 @@ class TaskforceManager:
         pol_res = risk_exec.execute_read_tool("get_policy", {"action_type": "ORDER_SYNC"})
         risk_obs.append(
             ToolObservationSummary(
-                case_id=sampled_ics[0].case_id if sampled_ics else None,
+                case_id=None,
                 tool_name="get_policy",
                 status=pol_res.status,
                 source=pol_res.source,
@@ -757,7 +840,9 @@ class TaskforceManager:
             )
         )
 
-        total_cases = len(checked_case_ids) + len(unchecked_case_ids)
+        unchecked_case_ids = [cid for cid in all_case_ids if cid not in set(checked_case_ids)]
+        total_cases = len(all_case_ids)
+
         if any_in_flight_refund or any_settled_refund:
             findings_vi = (
                 f"CẢNH BÁO RỦI RO: Vai trò RISK kiểm tra mẫu {len(checked_case_ids)}/{total_cases} "
@@ -767,11 +852,19 @@ class TaskforceManager:
                 f"thi. {len(unchecked_case_ids)} Case còn lại chưa kiểm tra giữ trạng thái UNKNOWN."
             )
             rec_action = "HOLD_ACTION_RECONCILE_IN_FLIGHT_OR_SETTLED_REFUND_PER_CASE"
+        elif insufficient_authority_cases or not checked_case_ids:
+            findings_vi = (
+                f"Vai trò RISK kiểm tra {len(checked_case_ids)}/{total_cases} Case "
+                f"({checked_case_ids}): không đủ dữ liệu thẩm quyền để kết luận không có hoàn "
+                f"tiền tại {insufficient_authority_cases or unchecked_case_ids} (thiếu bản ghi "
+                "thanh toán/đơn hàng hoặc công cụ không sẵn sàng -> trạng thái UNKNOWN)."
+            )
+            rec_action = "HOLD_OR_REVIEW_UNKNOWN_REFUND_AUTHORITY_PER_CASE"
         else:
             findings_vi = (
                 f"Vai trò RISK đã kiểm tra lịch sử hoàn tiền (get_refund_history) trên mẫu "
                 f"{len(checked_case_ids)}/{total_cases} Case ({checked_case_ids}): chưa ghi nhận "
-                f"lệnh hoàn tiền trên {len(checked_case_ids)} Case mẫu. Tuy nhiên "
+                f"lệnh hoàn tiền trên {len(checked_case_ids)} Case mẫu có thanh toán xác thực. "
                 f"{len(unchecked_case_ids)} Case còn lại chưa được kiểm tra trực tiếp nên có trạng "
                 "thái UNKNOWN; từng Case bắt buộc qua PolicyEngine, Approval và Verifier độc lập."
             )
@@ -799,11 +892,11 @@ class TaskforceManager:
             id=f"TASK-RSK-{uuid.uuid4().hex[:8].upper()}",
             session_id=self._session_id,
             incident_id=target_inc.id,
-            case_id=sampled_ics[0].case_id if sampled_ics else None,
+            case_id=checked_case_ids[0] if checked_case_ids else None,
             role=TaskforceRole.RISK.value,
             objective=(
                 "Kiểm tra thực tế lịch sử hoàn tiền (get_refund_history) và chính sách "
-                "(get_policy) trên tập Case mẫu; phát hiện lệnh hoàn PENDING/UNKNOWN."
+                "(get_policy) trên tập Case mẫu; phân biệt không có hoàn tiền với UNKNOWN."
             ),
             state=AgentTaskState.COMPLETED.value,
             allowed_tools=sorted(risk_spec.allowed_read_tools),
@@ -817,9 +910,8 @@ class TaskforceManager:
         self,
         *,
         target_inc: Incident,
+        all_case_ids: list[str],
         sampled_ics: list[IncidentCase],
-        checked_case_ids: list[str],
-        unchecked_case_ids: list[str],
         next_role: str,
         read_registry: ReadToolRegistry,
         effective_runtime_mode: str,
@@ -832,13 +924,17 @@ class TaskforceManager:
             tool_registry=read_registry,
         )
         sup_obs: list[ToolObservationSummary] = []
-        per_case_status: dict[str, str] = {cid: "UNKNOWN" for cid in unchecked_case_ids}
+        per_case_status: dict[str, str] = {cid: "UNKNOWN" for cid in all_case_ids}
+        checked_case_ids: list[str] = []
 
         for ic in sampled_ics:
             ord_id = str(ic.causal_factors_json.get("order_id") or "")
             if ord_id:
                 ord_res = sup_exec.execute_read_tool("get_order", {"order_id": ord_id})
-                per_case_status[ic.case_id] = f"OBSERVED_ORDER_{ord_res.status}"
+                checked_case_ids.append(ic.case_id)
+                per_case_status[ic.case_id] = (
+                    f"OBSERVED_ORDER_{ord_res.status}" if ord_res.status == "OK" else "UNKNOWN"
+                )
                 sup_obs.append(
                     ToolObservationSummary(
                         case_id=ic.case_id,
@@ -852,12 +948,12 @@ class TaskforceManager:
                     )
                 )
             else:
-                per_case_status[ic.case_id] = "UNKNOWN_MISSING_ORDER_ID"
+                per_case_status[ic.case_id] = "UNKNOWN"
 
         pol_res = sup_exec.execute_read_tool("get_policy", {"action_type": "ORDER_SYNC"})
         sup_obs.append(
             ToolObservationSummary(
-                case_id=sampled_ics[0].case_id if sampled_ics else None,
+                case_id=None,
                 tool_name="get_policy",
                 status=pol_res.status,
                 source=pol_res.source,
@@ -867,6 +963,8 @@ class TaskforceManager:
                 ),
             )
         )
+
+        unchecked_case_ids = [cid for cid in all_case_ids if cid not in set(checked_case_ids)]
 
         sup_handoff = TaskHandoffPayload(
             incident_id=target_inc.id,
@@ -881,9 +979,9 @@ class TaskforceManager:
             per_case_verification_status=per_case_status,
             tool_observations=sup_obs,
             findings_vi=(
-                f"Vai trò SUPPORT đã kiểm tra mẫu {len(checked_case_ids)} Case và chính sách; "
-                f"{len(unchecked_case_ids)} Case còn lại giữ trạng thái UNKNOWN, cần bổ sung mã "
-                "định danh hoặc xác minh từng hồ sơ."
+                f"Vai trò SUPPORT đã gọi công cụ tra cứu đơn hàng cho {len(checked_case_ids)} "
+                f"Case ({checked_case_ids}) và kiểm tra chính sách; {len(unchecked_case_ids)} "
+                "Case còn lại giữ trạng thái UNKNOWN, cần bổ sung mã định danh."
             ),
             recommended_per_case_action="REQUEST_MISSING_IDENTIFIER_OR_PER_CASE_REVIEW",
             auto_resolved_children=False,
@@ -894,7 +992,7 @@ class TaskforceManager:
             id=f"TASK-SUP-{uuid.uuid4().hex[:8].upper()}",
             session_id=self._session_id,
             incident_id=target_inc.id,
-            case_id=sampled_ics[0].case_id if sampled_ics else None,
+            case_id=checked_case_ids[0] if checked_case_ids else None,
             role=TaskforceRole.SUPPORT.value,
             objective="Tra cứu thông tin đơn hàng và chính sách hỗ trợ khách hàng trên Case mẫu.",
             state=AgentTaskState.COMPLETED.value,
