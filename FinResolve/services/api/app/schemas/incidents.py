@@ -65,7 +65,10 @@ class IncidentDetailResponse(BaseModel):
     id: str
     session_id: str
     source_mode: str = "MOCK"
-    model_mode: str
+    model_mode: str = "DEMO_RULES"
+    configured_model_mode: str = "DEMO_RULES"
+    taskforce_execution_mode: str = "DETERMINISTIC_TASKFORCE_RULES"
+    llm_invoked: bool = False
     title: str
     hypothesis: str
     status: str
@@ -84,7 +87,10 @@ class IncidentDetailResponse(BaseModel):
 class IncidentListResponse(BaseModel):
     session_id: str
     source_mode: str = "MOCK"
-    model_mode: str
+    model_mode: str = "DEMO_RULES"
+    configured_model_mode: str = "DEMO_RULES"
+    taskforce_execution_mode: str = "DETERMINISTIC_TASKFORCE_RULES"
+    llm_invoked: bool = False
     total_count: int
     items: list[IncidentSummaryResponse]
     capabilities_catalog: list[RoleCapabilityResponse]
@@ -100,7 +106,10 @@ class SeedIncidentScenarioRequest(BaseModel):
 class SeededIncidentScenarioResponse(BaseModel):
     session_id: str
     source_mode: str = "MOCK"
-    model_mode: str
+    model_mode: str = "DEMO_RULES"
+    configured_model_mode: str = "DEMO_RULES"
+    taskforce_execution_mode: str = "DETERMINISTIC_TASKFORCE_RULES"
+    llm_invoked: bool = False
     idempotent_replay: bool = False
     incident_id: str
     correlation_trace: str

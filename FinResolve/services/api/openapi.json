@@ -2598,7 +2598,23 @@
           },
           "model_mode": {
             "type": "string",
-            "title": "Model Mode"
+            "title": "Model Mode",
+            "default": "DEMO_RULES"
+          },
+          "configured_model_mode": {
+            "type": "string",
+            "title": "Configured Model Mode",
+            "default": "DEMO_RULES"
+          },
+          "taskforce_execution_mode": {
+            "type": "string",
+            "title": "Taskforce Execution Mode",
+            "default": "DETERMINISTIC_TASKFORCE_RULES"
+          },
+          "llm_invoked": {
+            "type": "boolean",
+            "title": "Llm Invoked",
+            "default": false
           },
           "title": {
             "type": "string",
@@ -2673,7 +2689,6 @@
         "required": [
           "id",
           "session_id",
-          "model_mode",
           "title",
           "hypothesis",
           "status",
@@ -2702,7 +2717,23 @@
           },
           "model_mode": {
             "type": "string",
-            "title": "Model Mode"
+            "title": "Model Mode",
+            "default": "DEMO_RULES"
+          },
+          "configured_model_mode": {
+            "type": "string",
+            "title": "Configured Model Mode",
+            "default": "DEMO_RULES"
+          },
+          "taskforce_execution_mode": {
+            "type": "string",
+            "title": "Taskforce Execution Mode",
+            "default": "DETERMINISTIC_TASKFORCE_RULES"
+          },
+          "llm_invoked": {
+            "type": "boolean",
+            "title": "Llm Invoked",
+            "default": false
           },
           "total_count": {
             "type": "integer",
@@ -2726,7 +2757,6 @@
         "type": "object",
         "required": [
           "session_id",
-          "model_mode",
           "total_count",
           "items",
           "capabilities_catalog"
@@ -3730,7 +3760,23 @@
           },
           "model_mode": {
             "type": "string",
-            "title": "Model Mode"
+            "title": "Model Mode",
+            "default": "DEMO_RULES"
+          },
+          "configured_model_mode": {
+            "type": "string",
+            "title": "Configured Model Mode",
+            "default": "DEMO_RULES"
+          },
+          "taskforce_execution_mode": {
+            "type": "string",
+            "title": "Taskforce Execution Mode",
+            "default": "DETERMINISTIC_TASKFORCE_RULES"
+          },
+          "llm_invoked": {
+            "type": "boolean",
+            "title": "Llm Invoked",
+            "default": false
           },
           "idempotent_replay": {
             "type": "boolean",
@@ -3770,7 +3816,6 @@
         "type": "object",
         "required": [
           "session_id",
-          "model_mode",
           "incident_id",
           "correlation_trace",
           "correlated_case_ids",

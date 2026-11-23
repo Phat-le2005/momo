@@ -104,7 +104,10 @@ def _to_incident_detail_response(db: Session, incident: Incident) -> IncidentDet
         id=incident.id,
         session_id=incident.session_id,
         source_mode="MOCK",
-        model_mode=settings.model_mode.value,
+        model_mode="DEMO_RULES",
+        configured_model_mode=settings.model_mode.value,
+        taskforce_execution_mode="DETERMINISTIC_TASKFORCE_RULES",
+        llm_invoked=False,
         title=incident.title,
         hypothesis=incident.hypothesis,
         status=incident.status,
@@ -166,7 +169,10 @@ def list_incidents(
     return IncidentListResponse(
         session_id=current_session.id,
         source_mode="MOCK",
-        model_mode=settings.model_mode.value,
+        model_mode="DEMO_RULES",
+        configured_model_mode=settings.model_mode.value,
+        taskforce_execution_mode="DETERMINISTIC_TASKFORCE_RULES",
+        llm_invoked=False,
         total_count=len(items),
         items=items,
         capabilities_catalog=_build_capabilities_catalog(),
@@ -256,7 +262,7 @@ def correlate_session_incidents(
     outcome = correlator.correlate_session_cases()
     tf_manager = TaskforceManager(db, current_session.id)
     for inc in outcome.incidents:
-        tf_manager.assign_and_run_taskforce(inc)
+        tf_manager.assign_and_run_taskforce(inc, force_rerun=True)
     db.commit()
     return list_incidents(current_session=current_session, db=db)
 
@@ -280,6 +286,9 @@ def seed_incident_scenario(
     return SeededIncidentScenarioResponse(
         session_id=current_session.id,
         source_mode="MOCK",
-        model_mode=get_settings().model_mode.value,
+        model_mode="DEMO_RULES",
+        configured_model_mode=get_settings().model_mode.value,
+        taskforce_execution_mode="DETERMINISTIC_TASKFORCE_RULES",
+        llm_invoked=False,
         **seeded,
     )

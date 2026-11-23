@@ -1,22 +1,27 @@
 """IncidentCorrelator and Prompt 05 Scenario Seeder (12 correlated cases + 2 unrelated lookalikes).
 
-Hard Domain Invariants:
-1. Causal Evidence Correlation Only (QA I01):
-   - Groups candidate Cases ONLY when authoritative `Evidence(kind="OBSERVED_FACT")` shares
-     causal operational metadata: `worker_id`, `batch_id`, `error_code`, and bounded event
-     timestamp window (`<= 20 minutes`).
+Hard Domain Invariants (Prompt 05 & Prompt 05.1 Hardening):
+1. Same-Event Causal Evidence Correlation Only (QA I01):
+   - Groups candidate Cases ONLY when a single authoritative `Evidence(kind="OBSERVED_FACT")`
+     event carries the shared causal triad (`worker_id`, `batch_id`, `error_code`) within a
+     contiguous bounded event time window (`<= 20 minutes`).
+   - Never stitches `worker_id` from one event with `batch_id` or `error_code` from a different
+     event.
    - Emits explicit correlation trace:
      "Detected 12 potentially linked cases by dropped-sync worker ID and time range".
 2. False Merge Prevention (QA I02):
    - Never merges Cases solely because customer complaint text (`CLAIM`) is similar or identical.
-   - Lookalike Cases with identical Vietnamese complaint text but different causal OBSERVED_FACT
-     metadata (e.g. failed payment OTP or different worker/batch/error_code) are explicitly
-     excluded and reported in `rejected_lookalikes`.
-3. Zero Oracle Leak (QA I01):
-   - Strips and forbids any simulator hidden-truth / oracle keys (`_oracle_*`, `hidden_truth`,
-     `ground_truth`, `oracle_label`, `fault_injection_truth`) from correlation inputs, persisted
-     records, and API outputs.
-4. No Auto-Resolution of Child Cases (QA I03):
+   - Cases outside the 20-minute time cluster or with different causal OBSERVED_FACT metadata
+     are excluded and reported in `rejected_lookalikes`.
+3. Recursive Zero Oracle Leak (QA I01):
+   - Recursively strips any simulator hidden-truth / oracle keys (`_oracle_*`, `hidden_truth`,
+     `ground_truth`, `oracle_label`, `fault_injection_truth`, etc.) across both dictionaries
+     AND lists/tuples.
+4. Explainable Evidence Score:
+   - Replaces fixed confidence numbers with a deterministic, explainable evidence score
+     breakdown (`evidence_score_breakdown`) reflecting causal triad completeness, time-window
+     cohesion, cluster size, provenance completeness, and payment status consistency.
+5. No Auto-Resolution of Child Cases (QA I03):
    - Correlation creates `Incident` and `IncidentCase(is_auto_resolved=False)` records and
      logs `CaseEvent(type="INCIDENT_CORRELATED")`, but NEVER mutates `Case.state` to `RESOLVED`
      or `VERIFYING` and NEVER creates a `Verification` record.
@@ -66,18 +71,30 @@ MIN_CORRELATED_CASES_FOR_INCIDENT = 2
 MAX_INCIDENT_SCENARIO_SEEDS_PER_SESSION = 2
 
 
-def sanitize_no_oracle_leak(payload: dict[str, Any]) -> dict[str, Any]:
-    """Strip any hidden simulator oracle keys so correlation and APIs never leak ground truth."""
-    cleaned: dict[str, Any] = {}
-    for k, v in payload.items():
-        k_lower = str(k).lower()
-        if k_lower.startswith("_oracle") or k_lower in FORBIDDEN_ORACLE_KEYS:
-            continue
-        if isinstance(v, dict):
-            cleaned[k] = sanitize_no_oracle_leak(v)
-        else:
-            cleaned[k] = v
-    return cleaned
+def _is_forbidden_oracle_key(key: str) -> bool:
+    k_lower = str(key).strip().lower()
+    return (
+        k_lower.startswith("_oracle")
+        or k_lower in FORBIDDEN_ORACLE_KEYS
+        or "oracle_secret" in k_lower
+        or "oracle_root" in k_lower
+    )
+
+
+def sanitize_no_oracle_leak(payload: Any) -> Any:
+    """Recursively strip hidden simulator oracle keys across dictionaries, lists, and tuples."""
+    if isinstance(payload, dict):
+        cleaned: dict[str, Any] = {}
+        for k, v in payload.items():
+            if _is_forbidden_oracle_key(str(k)):
+                continue
+            cleaned[str(k)] = sanitize_no_oracle_leak(v)
+        return cleaned
+    if isinstance(payload, list):
+        return [sanitize_no_oracle_leak(item) for item in payload]
+    if isinstance(payload, tuple):
+        return [sanitize_no_oracle_leak(item) for item in payload]
+    return payload
 
 
 @dataclass
@@ -85,6 +102,7 @@ class CausalObservation:
     case: Case
     claim_text: str
     evidence_refs: list[str]
+    causal_event_evidence_id: str | None
     worker_id: str | None
     batch_id: str | None
     error_code: str | None
@@ -93,6 +111,7 @@ class CausalObservation:
     payment_id: str | None
     payment_status: str | None
     event_timestamp: datetime | None
+    has_split_event_causal_fields: bool = False
 
 
 @dataclass
@@ -112,6 +131,96 @@ class CorrelationOutcome:
     rejected_lookalikes: list[RejectedLookalikeItem] = field(default_factory=list)
 
 
+def _parse_iso_timestamp(ts_raw: Any) -> datetime | None:
+    if not isinstance(ts_raw, str) or not ts_raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts_raw.strip().replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def compute_explainable_evidence_score(
+    members: list[CausalObservation],
+) -> tuple[float, dict[str, Any]]:
+    """Compute an explainable evidence score in [0.0, 1.0] from observed causal factors."""
+    count = len(members)
+    all_have_same_event_triad = all(
+        bool(m.worker_id and m.batch_id and m.error_code and m.causal_event_evidence_id)
+        for m in members
+    )
+    triad_score = 0.35 if all_have_same_event_triad else 0.15
+
+    timestamps = [m.event_timestamp for m in members if m.event_timestamp is not None]
+    missing_ts_count = count - len(timestamps)
+    if len(timestamps) >= 2 and missing_ts_count == 0:
+        span_seconds = max(0.0, (max(timestamps) - min(timestamps)).total_seconds())
+        if span_seconds <= 600:
+            time_score = 0.25
+        elif span_seconds <= MAX_INCIDENT_TIME_WINDOW_SECONDS:
+            time_score = 0.18
+        else:
+            time_score = 0.05
+    else:
+        span_seconds = None
+        time_score = 0.05
+
+    if count >= 10:
+        size_score = 0.15
+    elif count >= 4:
+        size_score = 0.10
+    else:
+        size_score = 0.05
+
+    observed_statuses = sorted(
+        {m.payment_status if m.payment_status else "UNKNOWN" for m in members}
+    )
+    if observed_statuses == [PaymentStatus.SUCCESS.value]:
+        payment_consistency_score = 0.15
+        payment_consistency_label = "UNIFORM_OBSERVED_SUCCESS"
+    elif len(observed_statuses) == 1 and observed_statuses[0] != "UNKNOWN":
+        payment_consistency_score = 0.08
+        payment_consistency_label = f"UNIFORM_{observed_statuses[0]}"
+    else:
+        # Mixed or unknown payment statuses reduce confidence and require per-case scrutiny
+        payment_consistency_score = -0.08
+        payment_consistency_label = f"MIXED_OR_UNKNOWN_PAYMENT_STATUSES:{observed_statuses}"
+
+    complete_provenance_count = sum(
+        1
+        for m in members
+        if m.order_id and m.payment_id and m.event_timestamp is not None and m.evidence_refs
+    )
+    provenance_ratio = complete_provenance_count / max(1, count)
+    provenance_score = round(0.10 * provenance_ratio, 3)
+
+    raw_total = triad_score + time_score + size_score + payment_consistency_score + provenance_score
+    final_score = round(min(0.99, max(0.10, raw_total)), 2)
+
+    breakdown: dict[str, Any] = {
+        "final_score": final_score,
+        "scoring_method": "EXPLAINABLE_CAUSAL_EVIDENCE_RUBRIC_V1",
+        "components": {
+            "same_event_causal_triad_score": triad_score,
+            "time_window_cohesion_score": time_score,
+            "cluster_size_support_score": size_score,
+            "payment_status_consistency_score": payment_consistency_score,
+            "provenance_completeness_score": provenance_score,
+        },
+        "metrics": {
+            "member_cases_count": count,
+            "all_have_same_event_triad": all_have_same_event_triad,
+            "time_span_seconds": span_seconds,
+            "missing_timestamp_count": missing_ts_count,
+            "observed_payment_statuses": observed_statuses,
+            "payment_consistency_label": payment_consistency_label,
+            "complete_provenance_cases": complete_provenance_count,
+        },
+    }
+    return final_score, breakdown
+
+
 class IncidentCorrelator:
     """Correlates session Cases by shared causal OBSERVED_FACT evidence without oracle leakage."""
 
@@ -120,8 +229,13 @@ class IncidentCorrelator:
         self._session_id = session_id
 
     def extract_causal_observation(self, case: Case) -> CausalObservation:
+        """Extract causal observation for a Case.
+        Requires `worker_id`, `batch_id`, and `error_code` to come from the SAME `OBSERVED_FACT`
+        evidence record so unrelated events on a Case are never stitched together."""
         claim_text = ""
         ev_refs: list[str] = []
+
+        causal_ev_id: str | None = None
         worker_id: str | None = None
         batch_id: str | None = None
         error_code: str | None = None
@@ -130,6 +244,10 @@ class IncidentCorrelator:
         payment_id: str | None = None
         payment_status: str | None = None
         event_ts: datetime | None = None
+
+        partial_workers: list[str] = []
+        partial_batches: list[str] = []
+        partial_errors: list[str] = []
 
         for ev in case.evidence:
             if ev.kind == EvidenceKind.CLAIM.value:
@@ -141,73 +259,138 @@ class IncidentCorrelator:
             if ev.kind != EvidenceKind.OBSERVED_FACT.value:
                 continue
 
-            safe_payload = sanitize_no_oracle_leak(dict(ev.payload_json or {}))
-            has_causal_key = False
+            safe_payload: dict[str, Any] = sanitize_no_oracle_leak(dict(ev.payload_json or {}))
 
-            w_val = safe_payload.get("worker_id") or safe_payload.get("sync_worker_id")
-            if isinstance(w_val, str) and w_val.strip():
-                worker_id = w_val.strip()
-                has_causal_key = True
+            ev_w_raw = safe_payload.get("worker_id") or safe_payload.get("sync_worker_id")
+            ev_b_raw = safe_payload.get("batch_id") or safe_payload.get("sync_batch_id")
+            ev_e_raw = safe_payload.get("error_code") or safe_payload.get("sync_error_code")
 
-            b_val = safe_payload.get("batch_id") or safe_payload.get("sync_batch_id")
-            if isinstance(b_val, str) and b_val.strip():
-                batch_id = b_val.strip()
-                has_causal_key = True
+            ev_w = ev_w_raw.strip() if isinstance(ev_w_raw, str) and ev_w_raw.strip() else None
+            ev_b = ev_b_raw.strip() if isinstance(ev_b_raw, str) and ev_b_raw.strip() else None
+            ev_e = ev_e_raw.strip() if isinstance(ev_e_raw, str) and ev_e_raw.strip() else None
+            ev_ts = _parse_iso_timestamp(safe_payload.get("event_timestamp"))
 
-            e_val = safe_payload.get("error_code") or safe_payload.get("sync_error_code")
-            if isinstance(e_val, str) and e_val.strip():
-                error_code = e_val.strip()
-                has_causal_key = True
+            if ev_w:
+                partial_workers.append(ev_w)
+            if ev_b:
+                partial_batches.append(ev_b)
+            if ev_e:
+                partial_errors.append(ev_e)
 
-            p_val = safe_payload.get("provider")
-            if isinstance(p_val, str) and p_val.strip():
-                provider = p_val.strip()
-
-            o_val = safe_payload.get("order_id")
-            if isinstance(o_val, str) and o_val.strip():
-                order_id = o_val.strip()
-
-            pay_val = safe_payload.get("payment_id")
-            if isinstance(pay_val, str) and pay_val.strip():
-                payment_id = pay_val.strip()
-
-            ps_val = safe_payload.get("payment_status") or safe_payload.get("status")
-            if isinstance(ps_val, str) and ps_val.strip() and "payment_id" in safe_payload:
-                payment_status = ps_val.strip()
-
-            ts_raw = safe_payload.get("event_timestamp")
-            if isinstance(ts_raw, str) and ts_raw.strip():
-                try:
-                    parsed = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                    event_ts = parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-                    has_causal_key = True
-                except ValueError:
-                    pass
-
-            if has_causal_key or ev.source in (
-                "ORDER_EVENT_LOG_DB",
-                "PROVIDER_LEDGER_MOCK",
-                "SIM_ORDERS_DB",
-            ):
+            # Same-event requirement: worker_id, batch_id, and error_code must all exist on
+            # the SAME OBSERVED_FACT record to qualify as a valid causal correlation event.
+            if ev_w and ev_b and ev_e and causal_ev_id is None:
+                causal_ev_id = ev.id
+                worker_id = ev_w
+                batch_id = ev_b
+                error_code = ev_e
+                event_ts = ev_ts
                 ev_refs.append(ev.id)
 
+                p_val = safe_payload.get("provider")
+                if isinstance(p_val, str) and p_val.strip():
+                    provider = p_val.strip()
+                o_val = safe_payload.get("order_id")
+                if isinstance(o_val, str) and o_val.strip():
+                    order_id = o_val.strip()
+                pay_val = safe_payload.get("payment_id")
+                if isinstance(pay_val, str) and pay_val.strip():
+                    payment_id = pay_val.strip()
+                ps_val = safe_payload.get("payment_status") or safe_payload.get("status")
+                if isinstance(ps_val, str) and ps_val.strip() and "payment_id" in safe_payload:
+                    payment_status = ps_val.strip()
+            else:
+                # Secondary OBSERVED_FACT records on the same Case may provide order/payment
+                # context only if they reference the same order/payment, never stitching triad keys.
+                o_val = safe_payload.get("order_id")
+                if order_id is None and isinstance(o_val, str) and o_val.strip():
+                    order_id = o_val.strip()
+                pay_val = safe_payload.get("payment_id")
+                if payment_id is None and isinstance(pay_val, str) and pay_val.strip():
+                    payment_id = pay_val.strip()
+                ps_val = safe_payload.get("payment_status") or safe_payload.get("status")
+                if (
+                    payment_status is None
+                    and isinstance(ps_val, str)
+                    and ps_val.strip()
+                    and "payment_id" in safe_payload
+                ):
+                    payment_status = ps_val.strip()
+                if ev.source in ("ORDER_EVENT_LOG_DB", "PROVIDER_LEDGER_MOCK", "SIM_ORDERS_DB"):
+                    if ev.id not in ev_refs:
+                        ev_refs.append(ev.id)
+
+        has_split = bool(
+            causal_ev_id is None and (partial_workers or partial_batches or partial_errors)
+        )
         return CausalObservation(
             case=case,
             claim_text=claim_text,
             evidence_refs=ev_refs,
-            worker_id=worker_id,
-            batch_id=batch_id,
-            error_code=error_code,
+            causal_event_evidence_id=causal_ev_id,
+            worker_id=worker_id or (partial_workers[0] if partial_workers else None),
+            batch_id=batch_id or (partial_batches[0] if partial_batches else None),
+            error_code=error_code or (partial_errors[0] if partial_errors else None),
             provider=provider,
             order_id=order_id,
             payment_id=payment_id,
             payment_status=payment_status,
             event_timestamp=event_ts,
+            has_split_event_causal_fields=has_split,
         )
 
+    @staticmethod
+    def _cluster_by_time_window(
+        bucket: list[CausalObservation],
+    ) -> tuple[list[list[CausalObservation]], list[CausalObservation]]:
+        """Partition a `(worker_id, batch_id, error_code)` bucket into contiguous time-window
+        clusters where `(cluster_max_ts - cluster_min_ts) <= MAX_INCIDENT_TIME_WINDOW_SECONDS`.
+        Observations lacking a valid `event_timestamp` are never blindly grouped into a time
+        cluster."""
+        with_ts = [b for b in bucket if b.event_timestamp is not None]
+        without_ts = [b for b in bucket if b.event_timestamp is None]
+
+        if not with_ts:
+            return [], without_ts
+
+        with_ts.sort(
+            key=lambda x: (x.event_timestamp or datetime.min.replace(tzinfo=UTC), x.case.id)
+        )
+
+        clusters: list[list[CausalObservation]] = []
+        current_cluster: list[CausalObservation] = []
+        cluster_start_ts: datetime | None = None
+
+        for obs in with_ts:
+            assert obs.event_timestamp is not None  # noqa: S101
+            if not current_cluster or cluster_start_ts is None:
+                current_cluster = [obs]
+                cluster_start_ts = obs.event_timestamp
+            else:
+                span = (obs.event_timestamp - cluster_start_ts).total_seconds()
+                if span <= MAX_INCIDENT_TIME_WINDOW_SECONDS:
+                    current_cluster.append(obs)
+                else:
+                    clusters.append(current_cluster)
+                    current_cluster = [obs]
+                    cluster_start_ts = obs.event_timestamp
+
+        if current_cluster:
+            clusters.append(current_cluster)
+
+        valid_clusters: list[list[CausalObservation]] = []
+        outliers: list[CausalObservation] = list(without_ts)
+        for cl in clusters:
+            if len(cl) >= MIN_CORRELATED_CASES_FOR_INCIDENT:
+                valid_clusters.append(cl)
+            else:
+                outliers.extend(cl)
+
+        return valid_clusters, outliers
+
     def correlate_session_cases(self) -> CorrelationOutcome:
-        """Group session Cases by shared causal OBSERVED_FACT metadata (`worker_id`, `batch_id`,
-        `error_code`, and bounded event time window). Never group by complaint text alone."""
+        """Group session Cases by same-event shared causal OBSERVED_FACT metadata (`worker_id`,
+        `batch_id`, `error_code`) and bounded time-window clustering."""
         cases = list(
             self._db.scalars(
                 select(Case)
@@ -219,13 +402,17 @@ class IncidentCorrelator:
 
         observations = [self.extract_causal_observation(c) for c in cases]
 
-        # Bucket candidate observations by (worker_id, batch_id, error_code) ONLY when all 3
-        # causal OBSERVED_FACT attributes are present.
         causal_buckets: dict[tuple[str, str, str], list[CausalObservation]] = {}
         unbucketed: list[CausalObservation] = []
 
         for obs in observations:
-            if obs.worker_id and obs.batch_id and obs.error_code:
+            if (
+                obs.causal_event_evidence_id is not None
+                and obs.worker_id
+                and obs.batch_id
+                and obs.error_code
+                and not obs.has_split_event_causal_fields
+            ):
                 key = (obs.worker_id, obs.batch_id, obs.error_code)
                 causal_buckets.setdefault(key, []).append(obs)
             else:
@@ -234,185 +421,212 @@ class IncidentCorrelator:
         created_or_updated_incidents: list[Incident] = []
         correlated_case_ids: set[str] = set()
         primary_incident_key: tuple[str, str, str] | None = None
+        primary_window_range: tuple[datetime, datetime] | None = None
 
         for (worker_id, batch_id, error_code), bucket in causal_buckets.items():
-            # Filter bucket members by bounded time window (<= 20 minutes between min and max ts)
-            timestamps = [b.event_timestamp for b in bucket if b.event_timestamp is not None]
-            if timestamps:
-                min_ts = min(timestamps)
-                window_members = [
-                    b
-                    for b in bucket
-                    if b.event_timestamp is not None
-                    and abs((b.event_timestamp - min_ts).total_seconds())
-                    <= MAX_INCIDENT_TIME_WINDOW_SECONDS
+            valid_clusters, time_outliers = self._cluster_by_time_window(bucket)
+            unbucketed.extend(time_outliers)
+
+            for cluster_idx, window_members in enumerate(valid_clusters):
+                if primary_incident_key is None:
+                    primary_incident_key = (worker_id, batch_id, error_code)
+
+                member_ts = [
+                    m.event_timestamp for m in window_members if m.event_timestamp is not None
                 ]
-            else:
-                window_members = bucket
+                min_ts = min(member_ts)
+                max_ts = max(member_ts)
+                if primary_window_range is None:
+                    primary_window_range = (min_ts, max_ts)
 
-            if len(window_members) < MIN_CORRELATED_CASES_FOR_INCIDENT:
-                unbucketed.extend(bucket)
-                continue
+                ts_start = min_ts.isoformat()
+                ts_end = max_ts.isoformat()
 
-            if primary_incident_key is None:
-                primary_incident_key = (worker_id, batch_id, error_code)
-
-            corr_key = f"worker:{worker_id}|batch:{batch_id}|err:{error_code}"
-            member_ts = [m.event_timestamp for m in window_members if m.event_timestamp is not None]
-            ts_start = min(member_ts).isoformat() if member_ts else "N/A"
-            ts_end = max(member_ts).isoformat() if member_ts else "N/A"
-
-            all_ev_refs: list[str] = []
-            for m in window_members:
-                for ref in m.evidence_refs:
-                    if ref not in all_ev_refs:
-                        all_ev_refs.append(ref)
-
-            count = len(window_members)
-            trace_msg = (
-                f"Detected {count} potentially linked cases by dropped-sync worker ID "
-                f"and time range (worker_id={worker_id}, batch_id={batch_id}, "
-                f"error_code={error_code}, window={ts_start}..{ts_end})"
-            )
-            hypothesis_vi = (
-                f"Giả thuyết sự cố (Hypothesis - cần kiểm chứng độc lập từng Case): "
-                f"Nhóm {count} đơn hàng thanh toán MoMo thành công nhưng bị nghẽn đồng bộ "
-                f"trạng thái đơn hàng do lỗi '{error_code}' tại worker '{worker_id}' "
-                f"(lô '{batch_id}' trong khung giờ {ts_start} .. {ts_end}). "
-                "Không tự động đóng/giải quyết các Case con khi chưa kiểm chứng hậu điều kiện."
-            )
-
-            existing_inc = self._db.scalar(
-                select(Incident)
-                .options(selectinload(Incident.incident_cases))
-                .where(
-                    Incident.session_id == self._session_id,
-                    Incident.correlation_key == corr_key,
+                base_corr_key = f"worker:{worker_id}|batch:{batch_id}|err:{error_code}"
+                corr_key = (
+                    base_corr_key
+                    if cluster_idx == 0
+                    else f"{base_corr_key}|win:{min_ts.strftime('%Y%m%d%H%M%S')}"
                 )
-            )
-            now = datetime.now(UTC)
-            shared_factors = sanitize_no_oracle_leak(
-                {
-                    "worker_id": worker_id,
-                    "batch_id": batch_id,
-                    "error_code": error_code,
-                    "provider": window_members[0].provider or "MOCK_MOMO",
-                    "time_window_start": ts_start,
-                    "time_window_end": ts_end,
-                    "linked_cases_count": count,
-                    "correlation_basis": "CAUSAL_OBSERVED_FACT_METADATA",
-                    "pure_text_similarity_used": False,
-                }
-            )
 
-            if existing_inc is None:
-                incident = Incident(
-                    id=f"INC-{uuid.uuid4().hex[:10].upper()}",
-                    session_id=self._session_id,
-                    title=(
-                        f"Sự cố nghẽn đồng bộ đơn hàng ({worker_id} / {batch_id} / {count} Cases)"
-                    ),
-                    hypothesis=hypothesis_vi,
-                    status=IncidentStatus.INVESTIGATING.value,
-                    correlation_key=corr_key,
-                    correlation_trace=trace_msg,
-                    shared_factors_json=shared_factors,
-                    evidence_refs=all_ev_refs,
-                    confidence=0.92,
-                    created_at=now,
-                    updated_at=now,
+                all_ev_refs: list[str] = []
+                for m in window_members:
+                    for ref in m.evidence_refs:
+                        if ref not in all_ev_refs:
+                            all_ev_refs.append(ref)
+
+                count = len(window_members)
+                score, score_breakdown = compute_explainable_evidence_score(window_members)
+                observed_pay_statuses = score_breakdown["metrics"]["observed_payment_statuses"]
+
+                trace_msg = (
+                    f"Detected {count} potentially linked cases by dropped-sync worker ID "
+                    f"and time range (worker_id={worker_id}, batch_id={batch_id}, "
+                    f"error_code={error_code}, window={ts_start}..{ts_end}, "
+                    f"evidence_score={score:.2f})"
                 )
-                self._db.add(incident)
-                self._db.flush()
-            else:
-                incident = existing_inc
-                incident.hypothesis = hypothesis_vi
-                incident.correlation_trace = trace_msg
-                incident.shared_factors_json = shared_factors
-                incident.evidence_refs = all_ev_refs
-                incident.updated_at = now
-                self._db.flush()
+                hypothesis_vi = (
+                    f"Giả thuyết sự cố (Hypothesis - điểm bằng chứng {score:.2f}, cần kiểm chứng "
+                    f"độc lập từng Case): Nhóm {count} Case cùng chia sẻ sự kiện OBSERVED_FACT "
+                    f"tại worker '{worker_id}', lô '{batch_id}', mã lỗi '{error_code}' trong "
+                    f"khung giờ {ts_start} .. {ts_end} (trạng thái thanh toán quan sát được: "
+                    f"{observed_pay_statuses}). Không tự động xác thực hoặc đóng các Case con."
+                )
 
-            existing_case_map = {ic.case_id: ic for ic in (incident.incident_cases or [])}
-            for m in window_members:
-                correlated_case_ids.add(m.case.id)
-                if m.case.id not in existing_case_map:
-                    ic = IncidentCase(
-                        id=f"IC-{uuid.uuid4().hex[:10].upper()}",
-                        incident_id=incident.id,
-                        case_id=m.case.id,
-                        session_id=self._session_id,
-                        link_reason=(
-                            f"Shared causal OBSERVED_FACT: worker_id={worker_id}, "
-                            f"batch_id={batch_id}, error_code={error_code}"
-                        ),
-                        shared_evidence_refs=m.evidence_refs,
-                        causal_factors_json=sanitize_no_oracle_leak(
-                            {
-                                "worker_id": worker_id,
-                                "batch_id": batch_id,
-                                "error_code": error_code,
-                                "order_id": m.order_id,
-                                "payment_id": m.payment_id,
-                                "event_timestamp": (
-                                    m.event_timestamp.isoformat() if m.event_timestamp else None
-                                ),
-                            }
-                        ),
-                        is_auto_resolved=False,
-                        created_at=now,
+                existing_inc = self._db.scalar(
+                    select(Incident)
+                    .options(selectinload(Incident.incident_cases))
+                    .where(
+                        Incident.session_id == self._session_id,
+                        Incident.correlation_key == corr_key,
                     )
-                    self._db.add(ic)
-                    self._db.add(
-                        CaseEvent(
-                            id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
+                )
+                now = datetime.now(UTC)
+                shared_factors: dict[str, Any] = sanitize_no_oracle_leak(
+                    {
+                        "worker_id": worker_id,
+                        "batch_id": batch_id,
+                        "error_code": error_code,
+                        "provider": window_members[0].provider or "MOCK_MOMO",
+                        "time_window_start": ts_start,
+                        "time_window_end": ts_end,
+                        "linked_cases_count": count,
+                        "observed_payment_statuses": observed_pay_statuses,
+                        "correlation_basis": "SAME_EVENT_CAUSAL_OBSERVED_FACT_METADATA",
+                        "pure_text_similarity_used": False,
+                        "evidence_score_breakdown": score_breakdown,
+                    }
+                )
+
+                if existing_inc is None:
+                    incident = Incident(
+                        id=f"INC-{uuid.uuid4().hex[:10].upper()}",
+                        session_id=self._session_id,
+                        title=(
+                            f"Sự cố nghẽn đồng bộ đơn hàng ({worker_id} / {batch_id} / "
+                            f"{count} Cases)"
+                        ),
+                        hypothesis=hypothesis_vi,
+                        status=IncidentStatus.INVESTIGATING.value,
+                        correlation_key=corr_key,
+                        correlation_trace=trace_msg,
+                        shared_factors_json=shared_factors,
+                        evidence_refs=all_ev_refs,
+                        confidence=score,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    self._db.add(incident)
+                    self._db.flush()
+                else:
+                    incident = existing_inc
+                    incident.hypothesis = hypothesis_vi
+                    incident.correlation_trace = trace_msg
+                    incident.shared_factors_json = shared_factors
+                    incident.evidence_refs = all_ev_refs
+                    incident.confidence = score
+                    incident.updated_at = now
+                    self._db.flush()
+
+                existing_case_map = {ic.case_id: ic for ic in (incident.incident_cases or [])}
+                for m in window_members:
+                    correlated_case_ids.add(m.case.id)
+                    causal_json = sanitize_no_oracle_leak(
+                        {
+                            "causal_event_evidence_id": m.causal_event_evidence_id,
+                            "worker_id": worker_id,
+                            "batch_id": batch_id,
+                            "error_code": error_code,
+                            "order_id": m.order_id,
+                            "payment_id": m.payment_id,
+                            "observed_payment_status": m.payment_status or "UNKNOWN",
+                            "event_timestamp": (
+                                m.event_timestamp.isoformat() if m.event_timestamp else None
+                            ),
+                        }
+                    )
+                    if m.case.id not in existing_case_map:
+                        ic = IncidentCase(
+                            id=f"IC-{uuid.uuid4().hex[:10].upper()}",
+                            incident_id=incident.id,
                             case_id=m.case.id,
                             session_id=self._session_id,
-                            type="INCIDENT_CORRELATED",
-                            payload_json={
-                                "incident_id": incident.id,
-                                "correlation_key": corr_key,
-                                "correlation_trace": trace_msg,
-                                "shared_evidence_refs": m.evidence_refs,
-                                "auto_resolved": False,
-                            },
+                            link_reason=(
+                                f"Same-event causal OBSERVED_FACT ({m.causal_event_evidence_id}): "
+                                f"worker_id={worker_id}, batch_id={batch_id}, "
+                                f"error_code={error_code}"
+                            ),
+                            shared_evidence_refs=m.evidence_refs,
+                            causal_factors_json=causal_json,
+                            is_auto_resolved=False,
                             created_at=now,
                         )
-                    )
+                        self._db.add(ic)
+                        self._db.add(
+                            CaseEvent(
+                                id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
+                                case_id=m.case.id,
+                                session_id=self._session_id,
+                                type="INCIDENT_CORRELATED",
+                                payload_json={
+                                    "incident_id": incident.id,
+                                    "correlation_key": corr_key,
+                                    "correlation_trace": trace_msg,
+                                    "evidence_score": score,
+                                    "shared_evidence_refs": m.evidence_refs,
+                                    "auto_resolved": False,
+                                },
+                                created_at=now,
+                            )
+                        )
+                    else:
+                        existing_case_map[m.case.id].causal_factors_json = causal_json
 
-            self._db.flush()
-            created_or_updated_incidents.append(incident)
+                self._db.flush()
+                created_or_updated_incidents.append(incident)
 
-        # Identify lookalike Cases that share similar customer complaint text ("thanh toán",
-        # "chờ thanh toán", "250.000") but were rejected because causal OBSERVED_FACT differs!
         rejected_lookalikes: list[RejectedLookalikeItem] = []
         for obs in unbucketed:
             if obs.case.id in correlated_case_ids:
                 continue
             has_lookalike_complaint = any(
                 kw in obs.claim_text.lower()
-                for kw in ("chờ thanh toán", "đã thanh toán", "trừ tiền", "momo")
+                for kw in ("chờ thanh toán", "đã thanh toán", "trừ tiền", "momo", "đơn hàng")
             )
-            if not has_lookalike_complaint:
+            if not has_lookalike_complaint and not obs.has_split_event_causal_fields:
                 continue
 
-            if primary_incident_key is not None:
+            diff_parts: list[str] = []
+            if obs.has_split_event_causal_fields:
+                diff_parts.append(
+                    "causal fields (worker_id/batch_id/error_code) were split across separate "
+                    "OBSERVED_FACT events instead of a single causal event"
+                )
+            elif primary_incident_key is not None:
                 p_worker, p_batch, p_err = primary_incident_key
-                diff_parts: list[str] = []
                 if obs.worker_id != p_worker:
                     diff_parts.append(f"worker_id='{obs.worker_id}' != '{p_worker}'")
                 if obs.batch_id != p_batch:
                     diff_parts.append(f"batch_id='{obs.batch_id}' != '{p_batch}'")
                 if obs.error_code != p_err:
                     diff_parts.append(f"error_code='{obs.error_code}' != '{p_err}'")
+                if (
+                    not diff_parts
+                    and primary_window_range is not None
+                    and obs.event_timestamp is not None
+                ):
+                    w_start, w_end = primary_window_range
+                    diff_parts.append(
+                        f"event_timestamp '{obs.event_timestamp.isoformat()}' outside "
+                        f"incident window '{w_start.isoformat()}..{w_end.isoformat()}'"
+                    )
                 if obs.payment_status and obs.payment_status != PaymentStatus.SUCCESS.value:
                     diff_parts.append(f"payment_status='{obs.payment_status}' != 'SUCCESS'")
-                diff_summary = "; ".join(diff_parts) or "no shared causal worker/batch metadata"
-            else:
-                diff_summary = (
-                    f"worker_id='{obs.worker_id}', batch_id='{obs.batch_id}', "
-                    f"error_code='{obs.error_code}'"
-                )
+
+            diff_summary = "; ".join(diff_parts) or (
+                f"worker_id='{obs.worker_id}', batch_id='{obs.batch_id}', "
+                f"error_code='{obs.error_code}'"
+            )
 
             rejected_lookalikes.append(
                 RejectedLookalikeItem(
@@ -458,17 +672,12 @@ def seed_incident_taskforce_scenario(
     force_new: bool = False,
 ) -> dict[str, Any]:
     """Seed the Prompt 05 demonstration scenario:
-    - 12 correlated Cases sharing causal OBSERVED_FACT metadata:
+    - 12 correlated Cases sharing same-event causal OBSERVED_FACT metadata:
       `worker_id="SYNC_WORKER_W07"`, `batch_id="BATCH_20261122_0900"`,
-      `error_code="ERR_DROPPED_WEBHOOK_SYNC"`, event timestamps within 09:00..09:06 UTC.
+      `error_code="ERR_DROPPED_WEBHOOK_SYNC"`, event timestamps within 09:00..09:05 UTC.
     - 2 unrelated lookalike Cases with nearly identical Vietnamese customer complaint text
       ("Tôi đã thanh toán 250.000đ qua MoMo nhưng đơn hàng vẫn báo chờ thanh toán...")
-      but completely different root causes in OBSERVED_FACT:
-      1. Lookalike 1: Payment FAILED (OTP expired, `result_code=1006`,
-         `worker_id="CHECKOUT_GATEWAY_W02"`, `error_code="ERR_USER_OTP_EXPIRED"`).
-      2. Lookalike 2: Different worker/batch & signature error
-         (`worker_id="PARTNER_CALLBACK_W19"`, `batch_id="BATCH_20261121_2215"`,
-         `error_code="ERR_MERCHANT_SIGNATURE_MISMATCH"`).
+      but completely different root causes in OBSERVED_FACT.
     """
     demo_session = db.scalar(
         select(DemoSession).where(DemoSession.id == session_id).with_for_update()
@@ -518,7 +727,6 @@ def seed_incident_taskforce_scenario(
             status_code=429,
         )
 
-    # Ensure session max_cases accommodates the 14 scenario cases in MOCK demo mode
     if demo_session.case_count + 14 > demo_session.max_cases:
         demo_session.max_cases = max(demo_session.max_cases, demo_session.case_count + 20)
 
@@ -532,7 +740,6 @@ def seed_incident_taskforce_scenario(
 
     correlated_case_ids: list[str] = []
 
-    # 1. Create 12 correlated Cases + Orders + Verified SUCCESS Payments
     for idx in range(1, 13):
         tag = f"{idx:02d}-{suffix}"
         ord_id = f"ORD-INC-SYNC-{tag}"
@@ -634,8 +841,6 @@ def seed_incident_taskforce_scenario(
         db.add_all([ev_claim, ev_fact])
         correlated_case_ids.append(case_id)
 
-    # 2. Create 2 unrelated lookalike Cases with almost identical customer complaint text
-    #    but completely different causal OBSERVED_FACT metadata!
     lookalike_specs: list[tuple[int, str, str, str, str, int, datetime]] = [
         (
             1,
@@ -717,7 +922,6 @@ def seed_incident_taskforce_scenario(
         db.add_all([l_ord, l_pay, l_case])
         db.flush()
 
-        # Deliberately identical Vietnamese complaint text phrasing as the 12 correlated cases!
         l_claim = Evidence(
             id=f"EVD-LOOK-CLM-{l_tag}",
             case_id=l_case_id,
@@ -762,7 +966,6 @@ def seed_incident_taskforce_scenario(
     demo_session.case_count += 14
     db.flush()
 
-    # 3. Run IncidentCorrelator and TaskforceManager in-house
     from app.incidents.taskforce import TaskforceManager
 
     correlator = IncidentCorrelator(db, session_id)
