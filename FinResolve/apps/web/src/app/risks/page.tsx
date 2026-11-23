@@ -1,13 +1,5 @@
 import type { Metadata } from "next";
-import { PlaceholderPage } from "@/components/PlaceholderPage";
+import { RiskWorkspace } from "@/components/RiskWorkspace";
 
-export const metadata: Metadata = { title: "Trung tâm Rủi ro — FinResolve AI" };
-
-export default function RisksPage() {
-  return (
-    <PlaceholderPage
-      title="Trung tâm Rủi ro"
-      description="Tín hiệu rủi ro theo phạm vi (trùng hoàn tiền, vượt hạn mức, giao dịch đang chờ, quyền hạn) với phản hồi OBSERVE / REVIEW / HOLD_ACTION. Tín hiệu rủi ro không phải bằng chứng gian lận."
-    />
-  );
-}
+export const metadata: Metadata = { title: "Risk Center — FinResolve AI" };
+export default function RisksPage() { return <RiskWorkspace />; }

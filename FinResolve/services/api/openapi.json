@@ -297,6 +297,30 @@
       }
     },
     "/api/v1/cases": {
+      "get": {
+        "tags": [
+          "cases"
+        ],
+        "summary": "List Case records in the authenticated demo session (Prompt 07 Case Center)",
+        "description": "Tenant-scoped, read-only Case Center list; never accepts a caller session_id.",
+        "operationId": "list_session_cases_api_v1_cases_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CaseResponse"
+                  },
+                  "title": "Response List Session Cases Api V1 Cases Get"
+                }
+              }
+            }
+          }
+        }
+      },
       "post": {
         "tags": [
           "cases"

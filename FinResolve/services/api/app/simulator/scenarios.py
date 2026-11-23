@@ -501,7 +501,8 @@ class ScenarioRegistry:
     ) -> dict[str, Any]:
         t_gen = time.perf_counter_ns()
         rng = random.Random(seed)  # noqa: S311 - deterministic synthetic demo seed
-        tag = f"S{seed}-{rng.randint(1000, 9999)}"
+        sess_tag = session_id[-6:].upper()
+        tag = f"S{seed}-{sess_tag}-{rng.randint(1000, 9999)}"
         base_ts = datetime(2026, 11, 22, 8, 30, 0, tzinfo=UTC)
         now = datetime.now(UTC)
 
@@ -619,7 +620,8 @@ class ScenarioRegistry:
     ) -> dict[str, Any]:
         t_gen = time.perf_counter_ns()
         rng = random.Random(seed)  # noqa: S311 - deterministic synthetic demo seed
-        tag = f"S{seed}-{rng.randint(1000, 9999)}"
+        sess_tag = session_id[-6:].upper()
+        tag = f"S{seed}-{sess_tag}-{rng.randint(1000, 9999)}"
         base_ts = datetime(2026, 11, 22, 8, 45, 0, tzinfo=UTC)
         now = datetime.now(UTC)
 
@@ -871,7 +873,8 @@ class ScenarioRegistry:
         """
         t_gen = time.perf_counter_ns()
         rng = random.Random(seed)  # noqa: S311 - deterministic synthetic demo seed
-        tag = f"ML{seed}"
+        sess_tag = session_id[-6:].upper()
+        tag = f"ML{seed}-{sess_tag}"
         base_ts = datetime(2026, 11, 22, 9, 0, 0, tzinfo=UTC)
         now = datetime.now(UTC)
 

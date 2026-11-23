@@ -275,7 +275,7 @@ def test_prompt06_mega_live_100_orders_async_polling_fault_mix_and_zero_oracle_l
         inv_hot = db.scalar(
             select(InventoryLevel).where(
                 InventoryLevel.session_id == session_id,
-                InventoryLevel.id == "INV-HOT-ML20261122",
+                InventoryLevel.id == f"INV-HOT-ML20261122-{session_id[-6:].upper()}",
             )
         )
         assert inv_hot is not None
@@ -338,7 +338,7 @@ def test_prompt06_1_oracle_fails_on_missing_risk_hold_or_broken_duplicate_ipn(
         dup_ord = db.scalar(
             select(SimOrder).where(
                 SimOrder.session_id == session_id,
-                SimOrder.id == "ORD-ML555001-011",
+                SimOrder.id == f"ORD-ML555001-{session_id[-6:].upper()}-011",
             )
         )
         assert dup_ord is not None

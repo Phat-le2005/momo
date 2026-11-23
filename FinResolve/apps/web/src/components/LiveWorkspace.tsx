@@ -1,0 +1,151 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useState } from "react";
+import { MockBadge } from "@/components/MockBadge";
+import { Panel, StatusPill, Timestamp, secondaryButton } from "@/components/StatusPill";
+import { apiRequest, caseUrl, readableError, runKey, type IncidentDetail, type IncidentList, type OracleReport, type ScenarioRun } from "@/lib/api";
+import { useDemoSession } from "@/lib/useDemoSession";
+
+export function LiveWorkspace() {
+  const { session, loading, error: sessionError } = useDemoSession();
+  const [run, setRun] = useState<ScenarioRun | null>(null);
+  const [report, setReport] = useState<OracleReport | null>(null);
+  const [incidents, setIncidents] = useState<IncidentList | null>(null);
+  const [incidentId, setIncidentId] = useState<string | null>(null);
+  const [incident, setIncident] = useState<IncidentDetail | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const reload = useCallback(async () => {
+    if (!session) return;
+    setBusy(true);
+    try {
+      const list = await apiRequest<IncidentList>("/api/v1/incidents", { session });
+      setIncidents(list);
+      setIncidentId((old) => old || list.items[0]?.id || null);
+      const savedId = window.sessionStorage.getItem(runKey);
+      if (savedId) {
+        try {
+          const next = await apiRequest<ScenarioRun>(`/api/v1/demo/runs/${encodeURIComponent(savedId)}/status`, { session });
+          setRun(next);
+          if (next.status !== "RUNNING") {
+            setReport(await apiRequest<OracleReport>(`/api/v1/demo/runs/${encodeURIComponent(savedId)}/report`, { session }));
+          }
+        } catch { setRun(null); setReport(null); window.sessionStorage.removeItem(runKey); }
+      }
+      setError(null);
+    } catch (e) { setError(readableError(e)); }
+    finally { setBusy(false); }
+  }, [session]);
+
+  useEffect(() => {
+    if (!session) return;
+    let active = true;
+    const savedId = window.sessionStorage.getItem(runKey);
+    void (async () => {
+      try {
+        const list = await apiRequest<IncidentList>("/api/v1/incidents", { session });
+        if (!active) return;
+        setIncidents(list);
+        setIncidentId((old) => old || list.items[0]?.id || null);
+        if (savedId) {
+          try {
+            const next = await apiRequest<ScenarioRun>(`/api/v1/demo/runs/${encodeURIComponent(savedId)}/status`, { session });
+            if (!active) return;
+            setRun(next);
+            if (next.status !== "RUNNING") {
+              const rep = await apiRequest<OracleReport>(`/api/v1/demo/runs/${encodeURIComponent(savedId)}/report`, { session });
+              if (active) setReport(rep);
+            }
+          } catch {
+            if (active) { setRun(null); setReport(null); window.sessionStorage.removeItem(runKey); }
+          }
+        }
+        if (active) setError(null);
+      } catch (e) {
+        if (active) setError(readableError(e));
+      }
+    })();
+    return () => { active = false; };
+  }, [session]);
+
+  useEffect(() => {
+    if (!session || !incidentId) return;
+    let cancelled = false;
+    void apiRequest<IncidentDetail>(`/api/v1/incidents/${encodeURIComponent(incidentId)}`, { session })
+      .then((value) => { if (!cancelled) setIncident(value); })
+      .catch((e: unknown) => { if (!cancelled) setError(readableError(e)); });
+    return () => { cancelled = true; };
+  }, [session, incidentId]);
+
+  const runId = run?.run_id;
+  const runStatus = run?.status;
+  useEffect(() => {
+    if (!session || !runId || runStatus !== "RUNNING") return;
+    const timer = window.setInterval(() => { void reload(); }, 2500);
+    return () => window.clearInterval(timer);
+  }, [session, runId, runStatus, reload]);
+
+  return <div className="space-y-6">
+    <div className="flex flex-wrap items-end justify-between gap-3">
+      <div><MockBadge compact /><h1 className="mt-3 text-3xl font-bold">Mega Live & Incident Taskforce</h1><p className="mt-2 max-w-3xl text-sm text-slate-600">Quan sát sự cố và nhiệm vụ phối hợp trên dữ liệu MOCK. Taskforce chạy thuật toán xác định, không tự nhận là LLM Agent.</p></div>
+      <button className={secondaryButton} onClick={() => void reload()} disabled={!session || busy}>{busy ? "Đang tải…" : "Làm mới dữ liệu"}</button>
+    </div>
+    {loading && <p role="status" className="text-sm">Đang kết nối phiên…</p>}
+    {sessionError && <p role="alert" className="text-sm text-rose-700">{sessionError}</p>}
+    {error && <p role="alert" className="rounded-lg bg-rose-50 p-3 text-sm text-rose-700">{error}</p>}
+    <Panel title="Lượt chạy gần nhất trên tab này">
+      {!run && <p className="text-sm text-slate-600">Chưa có lượt chạy được lưu trong tab hiện tại. <Link href="/demo" className="text-indigo-700 underline">Chạy kịch bản Mega Live</Link> rồi quay lại.</p>}
+      {run && <div className="space-y-3">
+        <div className="flex flex-wrap items-center gap-2"><code className="break-all text-xs">{run.run_id}</code><StatusPill value={run.status} /><span className="text-sm">{run.orders_generated} đơn · {run.case_ids.length} Case · {run.incident_ids.length} Incident</span></div>
+        {run.metrics && Object.keys(run.metrics).length > 0 && <div className="flex flex-wrap gap-3 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
+          {typeof run.metrics.healthy_orders_processed_in_batch === "number" && <span>Đơn hợp lệ (batch): <strong>{run.metrics.healthy_orders_processed_in_batch}</strong></span>}
+          {typeof run.metrics.llm_calls_for_bulk_orders === "number" && <span>LLM bulk calls: <strong>{run.metrics.llm_calls_for_bulk_orders}</strong></span>}
+          {typeof run.metrics.taskforce_mode === "string" && <span>Taskforce: <strong>{run.metrics.taskforce_mode}</strong></span>}
+          {typeof run.metrics.total_run_ms === "number" && <span>Thời gian chạy: <strong>{run.metrics.total_run_ms} ms</strong></span>}
+        </div>}
+        {run.status === "RUNNING" && <progress className="w-full" value={run.progress_pct} max={100} aria-label="Tiến độ chạy" />}
+        {run.error_message && <p className="text-sm text-rose-700">{run.error_message}</p>}
+        {report && <div className="grid gap-3 sm:grid-cols-3">
+          <div><p className="text-xs text-slate-500">Safety</p><StatusPill value={report.safety_verdict} /></div>
+          <div><p className="text-xs text-slate-500">Resolution</p><StatusPill value={report.resolution_status} /></div>
+          <div><p className="text-xs text-slate-500">Kết luận</p><StatusPill value={report.verdict} /></div>
+          <div className="rounded-lg bg-slate-50 p-3 text-sm">Đơn chưa đồng bộ: <strong>{report.mismatched_count}</strong></div>
+          <div className="rounded-lg bg-slate-50 p-3 text-sm">HOLD: <strong>{report.blocked_risk_count}/{report.expected_blocked_risk_count}</strong></div>
+          <div className="rounded-lg bg-slate-50 p-3 text-sm">Case verified: <strong>{report.verified_resolved_count}/{report.expected_actionable_count}</strong></div>
+          {report.unsafe_effect_details.map((item, i) => <p className="col-span-full text-sm text-rose-700" key={i}>{item}</p>)}
+          <p className="col-span-full text-xs text-slate-500">INCOMPLETE không phải thất bại an toàn: một hoặc nhiều Case chưa được xác minh hoàn tất.</p>
+        </div>}
+        {!!run.recommended_investigation_case_ids.length && <p className="text-sm">Case ngoại lệ được gợi ý điều tra: {run.recommended_investigation_case_ids.map((id) => <Link key={id} href={caseUrl(id)} className="ml-2 break-all text-indigo-700 underline">{id}</Link>)}</p>}
+      </div>}
+    </Panel>
+    <div className="grid gap-5 lg:grid-cols-[310px_minmax(0,1fr)]">
+      <aside className="space-y-3"><h2 className="font-semibold">Incidents ({incidents?.total_count ?? 0})</h2>
+        {(incidents?.items || []).map((item) => <button key={item.id} onClick={() => { setIncident(null); setIncidentId(item.id); }} type="button" aria-current={incidentId === item.id ? "true" : undefined} className={`w-full rounded-xl border p-4 text-left hover:bg-indigo-50 ${incidentId === item.id ? "border-indigo-400 bg-indigo-50" : "border-slate-200 bg-white"}`}>
+          <p className="break-all font-mono text-xs text-slate-500">{item.id}</p><p className="mt-1 text-sm font-semibold">{item.title}</p><p className="mt-2 text-xs text-slate-600">{item.linked_cases_count} Case · {item.assigned_tasks_count} Task</p><div className="mt-2"><StatusPill value={item.status} /></div>
+        </button>)}
+        {!incidents?.items.length && <p className="rounded-lg border border-dashed border-slate-300 p-3 text-sm text-slate-500">Chưa có Incident ở phiên này.</p>}
+      </aside>
+      <div className="min-w-0 space-y-4">
+        {!incidentId && <Panel title="Chi tiết sự cố">Chọn Incident bên trái để xem bằng chứng và Taskforce.</Panel>}
+        {incidentId && (!incident || incident.id !== incidentId) && <Panel title="Đang tải Incident">Đang đọc bản ghi từ backend…</Panel>}
+        {incident && incident.id === incidentId && <>
+          <Panel title={incident.title}>
+            <div className="flex flex-wrap items-center gap-2"><StatusPill value={incident.status} /><StatusPill value={incident.taskforce_execution_mode} /></div>
+            <p className="mt-3 text-sm text-slate-700">{incident.hypothesis}</p>
+            <p className="mt-2 text-xs text-slate-500">Confidence bằng chứng: {Math.round(incident.confidence * 100)}% · Tạo: <Timestamp value={incident.created_at} /> · LLM Invoked: {incident.llm_invoked ? "Có" : "Không"}</p>
+            <details className="mt-3 text-xs"><summary className="cursor-pointer text-indigo-700">Chi tiết correlation</summary><pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-3">{JSON.stringify(incident.shared_factors_json, null, 2)}</pre></details>
+          </Panel>
+          <Panel title={`Case liên kết (${incident.linked_cases.length})`}>
+            <div className="space-y-2">{incident.linked_cases.map((c) => <div key={c.case_id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 p-3"><Link href={caseUrl(c.case_id)} className="break-all text-sm text-indigo-700 underline">{c.case_id}</Link><StatusPill value={c.case_state} /></div>)}</div>
+            <p className="mt-3 text-xs text-slate-500">Các Case con KHÔNG tự RESOLVED do Incident. Mỗi Case cần Approval & Verifier độc lập.</p>
+          </Panel>
+          <Panel title={`Role Handoffs (${incident.assigned_tasks.length})`}>
+            {incident.assigned_tasks.map((t) => <article key={t.id} className="mb-3 rounded-lg border border-slate-200 p-4"><div className="flex flex-wrap items-center gap-2"><strong>{t.role}</strong><StatusPill value={t.state} /></div><p className="mt-1 text-sm text-slate-700">{t.objective}</p><details className="mt-2 text-sm"><summary className="cursor-pointer text-indigo-700">Handoff, Case đã kiểm tra và chưa kiểm tra</summary><pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-3 text-xs">{JSON.stringify(t.handoff_json, null, 2)}</pre></details></article>)}
+          </Panel>
+        </>}
+      </div>
+    </div>
+  </div>;
+}

@@ -86,6 +86,32 @@ def _execute_background_investigation(
             bg_db.commit()
 
 
+@router.get(
+    "",
+    response_model=list[CaseResponse],
+    summary="List Case records in the authenticated demo session (Prompt 07 Case Center)",
+)
+def list_session_cases(
+    current_session: DemoSession = Depends(get_current_session),
+    db: Session = Depends(get_db),
+) -> list[CaseResponse]:
+    """Tenant-scoped, read-only Case Center list; never accepts a caller session_id."""
+    stmt = (
+        select(Case)
+        .options(
+            selectinload(Case.evidence),
+            selectinload(Case.action_proposals),
+            selectinload(Case.risk_signals),
+            selectinload(Case.verifications),
+            selectinload(Case.events),
+        )
+        .where(Case.session_id == current_session.id)
+        .order_by(Case.created_at.desc(), Case.id.desc())
+        .limit(min(100, current_session.max_cases))
+    )
+    return [_to_case_response(item) for item in db.scalars(stmt).all()]
+
+
 @router.post(
     "",
     response_model=CaseResponse,
