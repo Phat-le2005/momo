@@ -84,6 +84,9 @@ class Settings(BaseSettings):
     model_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
     model_budget_tokens: int = Field(default=20000, ge=0)
 
+    demo_max_scenario_runs_per_session: int = Field(default=10, ge=1, le=200)
+    demo_stale_run_timeout_seconds: int = Field(default=120, ge=1, le=3600)
+
     @field_validator("web_origin")
     @classmethod
     def _no_wildcard_origin(cls, value: str) -> str:

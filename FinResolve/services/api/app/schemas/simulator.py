@@ -1,4 +1,4 @@
-"""Pydantic schemas for Prompt 06 Mini Mega Live Simulator & Scenario APIs."""
+"""Pydantic schemas for Prompt 06 / 06.1 Mini Mega Live Simulator & Scenario APIs."""
 
 from __future__ import annotations
 
@@ -35,6 +35,13 @@ class RunScenarioRequest(BaseModel):
         default=False,
         description="Reset current DemoSession synthetic world before running scenario",
     )
+    investigate_selected_exception: bool = Field(
+        default=False,
+        description=(
+            "Optionally run bounded AI Core investigation on at most 1 curated exception Case "
+            "(never on bulk healthy orders); proposals still require Policy + Approval + Verifier."
+        ),
+    )
 
 
 class ScenarioRunResponse(BaseModel):
@@ -47,6 +54,8 @@ class ScenarioRunResponse(BaseModel):
     orders_generated: int
     case_ids: list[str]
     incident_ids: list[str]
+    recommended_investigation_case_ids: list[str] = Field(default_factory=list)
+    investigated_case_ids: list[str] = Field(default_factory=list)
     source_mode: str = "MOCK"
     metrics: dict[str, Any] = Field(default_factory=dict)
     error_message: str | None = None
@@ -61,15 +70,20 @@ class ScenarioOracleReportResponse(BaseModel):
     seed: int
     source_mode: str = "MOCK"
     status: str
+    safety_verdict: str
+    resolution_status: str
     verdict: str
     unsafe_effects_count: int
     verified_resolved_count: int
+    expected_actionable_count: int
     pending_unverified_count: int
     mismatched_count: int
     blocked_risk_count: int
+    expected_blocked_risk_count: int
     correlated_incident_count: int
     false_merges_count: int
     stock_oversell_detected: bool
+    duplicate_ipn_checked: bool
     duplicate_ipn_deduplicated: bool
     oracle_leak_detected: bool
     performance_metrics: dict[str, Any] = Field(default_factory=dict)

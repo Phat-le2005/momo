@@ -25,10 +25,12 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from app.ai_core.runtime import BoundedAgentRuntime
 from app.cases.state_machine import can_transition, transition_case
+from app.core.config import get_settings
 from app.core.errors import AppError, ErrorCode
 from app.db.session import get_sessionmaker
 from app.incidents.correlator import IncidentCorrelator
@@ -109,10 +111,79 @@ SCENARIO_CATALOG: tuple[dict[str, Any], ...] = (
 )
 
 ALLOWED_SCENARIO_IDS: frozenset[str] = frozenset({"payment_sync", "refund_risk", "mega_live"})
+SCENARIO_EXPECTED_CASES: dict[str, int] = {
+    "payment_sync": 1,
+    "refund_risk": 2,
+    "mega_live": 13,
+}
+
+
+def recover_stale_runs(
+    db: Session,
+    session_id: str,
+    *,
+    stale_after_seconds: int | None = None,
+) -> list[str]:
+    """Mark stale `RUNNING` scenario runs as `INTERRUPTED` so crashes never wedge a session."""
+    timeout_s = (
+        stale_after_seconds
+        if stale_after_seconds is not None
+        else get_settings().demo_stale_run_timeout_seconds
+    )
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(seconds=max(1, timeout_s))
+    stale_runs = list(
+        db.scalars(
+            select(SimScenarioRun)
+            .where(
+                SimScenarioRun.session_id == session_id,
+                SimScenarioRun.status == "RUNNING",
+                SimScenarioRun.updated_at <= cutoff,
+            )
+            .with_for_update()
+        ).all()
+    )
+    recovered: list[str] = []
+    for run in stale_runs:
+        run.status = "INTERRUPTED"
+        run.error_message = (
+            "Background worker interrupted before completion; safe to reset or re-run."
+        )
+        run.updated_at = now
+        recovered.append(run.id)
+    if recovered:
+        db.flush()
+    return recovered
+
+
+def _supersede_prior_runs(
+    db: Session,
+    session_id: str,
+    *,
+    exclude_run_id: str | None = None,
+    reason: str = "Superseded by session reset",
+) -> int:
+    """Mark prior non-superseded runs as SUPERSEDED instead of deleting their audit rows."""
+    now = datetime.now(UTC)
+    stmt = select(SimScenarioRun).where(
+        SimScenarioRun.session_id == session_id,
+        SimScenarioRun.status != "SUPERSEDED",
+    )
+    if exclude_run_id:
+        stmt = stmt.where(SimScenarioRun.id != exclude_run_id)
+    prior_runs = list(db.scalars(stmt.with_for_update()).all())
+    for prior in prior_runs:
+        prior.status = "SUPERSEDED"
+        if not prior.error_message:
+            prior.error_message = reason
+        prior.updated_at = now
+    if prior_runs:
+        db.flush()
+    return len(prior_runs)
 
 
 def reset_demo_session_world(db: Session, session_id: str) -> dict[str, int]:
-    """Cleanly delete all synthetic simulator & domain records for `session_id` (QA I05)."""
+    """Cleanly delete synthetic world entities for `session_id` and mark prior runs SUPERSEDED."""
     demo_session = db.scalar(
         select(DemoSession).where(DemoSession.id == session_id).with_for_update()
     )
@@ -123,9 +194,26 @@ def reset_demo_session_world(db: Session, session_id: str) -> dict[str, int]:
             status_code=404,
         )
 
+    recover_stale_runs(db, session_id)
+    active_run = db.scalar(
+        select(SimScenarioRun).where(
+            SimScenarioRun.session_id == session_id,
+            SimScenarioRun.status == "RUNNING",
+        )
+    )
+    if active_run is not None:
+        raise AppError(
+            ErrorCode.CONFLICT,
+            f"Cannot reset session while scenario run '{active_run.id}' is actively RUNNING",
+            status_code=409,
+            details={"active_run_id": active_run.id},
+        )
+
     counts: dict[str, int] = {}
+    counts["superseded_runs"] = _supersede_prior_runs(
+        db, session_id, reason="Superseded by session reset"
+    )
     for label, model in (
-        ("scenario_runs", SimScenarioRun),
         ("agent_tasks", AgentTask),
         ("incident_cases", IncidentCase),
         ("incidents", Incident),
@@ -185,7 +273,93 @@ class ScenarioRegistry:
         session_id: str,
         scenario_id: str,
         seed: int,
+        reset_before_run: bool = False,
     ) -> SimScenarioRun:
+        demo_session = db.scalar(
+            select(DemoSession).where(DemoSession.id == session_id).with_for_update()
+        )
+        if demo_session is None:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                f"Session '{session_id}' not found",
+                status_code=404,
+            )
+
+        # 1. Recover any stale/interrupted background runs before checking active lock
+        recover_stale_runs(db, session_id)
+
+        # 2. Active-run protection: only one RUNNING scenario per session at a time
+        active_run = db.scalar(
+            select(SimScenarioRun).where(
+                SimScenarioRun.session_id == session_id,
+                SimScenarioRun.status == "RUNNING",
+            )
+        )
+        if active_run is not None:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"Another scenario run ('{active_run.id}') is currently RUNNING in this session",
+                status_code=409,
+                details={"active_run_id": active_run.id},
+            )
+
+        # 3. Per-session scenario run quota
+        max_runs = get_settings().demo_max_scenario_runs_per_session
+        total_runs = (
+            db.scalar(
+                select(func.count(SimScenarioRun.id)).where(SimScenarioRun.session_id == session_id)
+            )
+            or 0
+        )
+        if total_runs >= max_runs:
+            raise AppError(
+                ErrorCode.RATE_LIMITED,
+                f"Per-session scenario run quota exceeded ({total_runs}/{max_runs}). "
+                "Create a new demo session to continue.",
+                status_code=429,
+                details={"total_runs": total_runs, "max_runs": max_runs},
+            )
+
+        # 4. Per-session Case quota (never silently expand max_cases)
+        expected_cases = SCENARIO_EXPECTED_CASES.get(scenario_id, 1)
+        effective_case_count = 0 if reset_before_run else demo_session.case_count
+        if effective_case_count + expected_cases > demo_session.max_cases:
+            raise AppError(
+                ErrorCode.RATE_LIMITED,
+                f"Session case quota exceeded ({effective_case_count} + {expected_cases} > "
+                f"{demo_session.max_cases}). Pass reset_before_run=true or call "
+                "POST /api/v1/demo/sessions/reset.",
+                status_code=429,
+                details={
+                    "case_count": effective_case_count,
+                    "expected_new_cases": expected_cases,
+                    "max_cases": demo_session.max_cases,
+                },
+            )
+
+        # 5. Safe repeated-run protection: prevent deterministic PK collisions when not resetting
+        if not reset_before_run:
+            dup_run = db.scalar(
+                select(SimScenarioRun).where(
+                    SimScenarioRun.session_id == session_id,
+                    SimScenarioRun.scenario_id == scenario_id,
+                    SimScenarioRun.seed == seed,
+                    SimScenarioRun.status == "COMPLETED",
+                )
+            )
+            if dup_run is not None:
+                raise AppError(
+                    ErrorCode.CONFLICT,
+                    f"Scenario '{scenario_id}' with seed {seed} already exists in this session "
+                    f"(run '{dup_run.id}'). Pass reset_before_run=true or choose a different seed.",
+                    status_code=409,
+                    details={
+                        "existing_run_id": dup_run.id,
+                        "scenario_id": scenario_id,
+                        "seed": seed,
+                    },
+                )
+
         now = datetime.now(UTC)
         run = SimScenarioRun(
             id=f"RUN-{scenario_id.upper()}-{uuid.uuid4().hex[:8].upper()}",
@@ -214,6 +388,7 @@ class ScenarioRegistry:
         run: SimScenarioRun,
         order_count: int,
         reset_before_run: bool = False,
+        investigate_selected_exception: bool = False,
     ) -> SimScenarioRun:
         """Execute a scenario run synchronously within `db` and persist metrics + Oracle truth."""
         t0 = time.perf_counter_ns()
@@ -230,7 +405,13 @@ class ScenarioRegistry:
             )
 
         if reset_before_run:
-            # Keep the current SimScenarioRun row while clearing prior world entities
+            # Mark prior runs SUPERSEDED while keeping the current SimScenarioRun row active
+            _supersede_prior_runs(
+                db,
+                session_id,
+                exclude_run_id=run.id,
+                reason=f"Superseded by reset_before_run for '{run.id}'",
+            )
             for model in (
                 AgentTask,
                 IncidentCase,
@@ -251,10 +432,6 @@ class ScenarioRegistry:
             demo_session.case_count = 0
             db.flush()
 
-        # Ensure guest session quota accommodates the scenario's exception Cases
-        if demo_session.case_count + 20 > demo_session.max_cases:
-            demo_session.max_cases = max(demo_session.max_cases, demo_session.case_count + 25)
-
         try:
             if scenario_id == "payment_sync":
                 result = self._run_payment_sync(db, session_id=session_id, seed=seed)
@@ -268,11 +445,32 @@ class ScenarioRegistry:
                     order_count=order_count,
                 )
 
-            total_ms = max(1, int((time.perf_counter_ns() - t0) / 1_000_000))
+            demo_session.case_count += len(result["case_ids"])
             metrics = dict(result["metrics"])
+            recommended_ids = list(result.get("recommended_investigation_case_ids") or [])
+            metrics["recommended_investigation_case_ids"] = recommended_ids
+            metrics["investigated_case_ids"] = []
+            metrics["llm_calls_for_selected_exceptions"] = 0
+
+            # Optional selected-exception AI investigation (max 1 Case, 0 bulk LLM calls)
+            if investigate_selected_exception and recommended_ids:
+                selected_case_id = recommended_ids[0]
+                db.flush()
+                runtime = BoundedAgentRuntime(db, max_steps=6)
+                inv_result = runtime.investigate_case(
+                    case_id=selected_case_id,
+                    session_id=session_id,
+                )
+                metrics["investigated_case_ids"] = [selected_case_id]
+                metrics["selected_exception_ai_mode"] = inv_result.model_mode.value
+                metrics["selected_exception_adapter"] = inv_result.adapter_name
+                metrics["llm_calls_for_selected_exceptions"] = (
+                    1 if inv_result.model_mode.value == "LLM_API" else 0
+                )
+
+            total_ms = max(1, int((time.perf_counter_ns() - t0) / 1_000_000))
             metrics["total_run_ms"] = total_ms
 
-            demo_session.case_count += len(result["case_ids"])
             run.status = "COMPLETED"
             run.progress_pct = 100
             run.orders_generated = int(result["orders_generated"])
@@ -287,7 +485,7 @@ class ScenarioRegistry:
         except Exception as exc:
             db.rollback()
             failed_run = db.get(SimScenarioRun, run.id)
-            if failed_run is not None:
+            if failed_run is not None and failed_run.status == "RUNNING":
                 failed_run.status = "FAILED"
                 failed_run.error_message = str(exc)[:500]
                 failed_run.updated_at = datetime.now(UTC)
@@ -387,17 +585,28 @@ class ScenarioRegistry:
             "orders_generated": 1,
             "case_ids": [case_id],
             "incident_ids": [],
-            "metrics": {"order_count": 1, "generation_ms": gen_ms, "correlation_ms": 0},
+            "recommended_investigation_case_ids": [case_id],
+            "metrics": {
+                "order_count": 1,
+                "generation_ms": gen_ms,
+                "correlation_ms": 0,
+                "llm_calls_for_bulk_orders": 0,
+            },
             "oracle_truth": {
                 "scenario_id": "payment_sync",
                 "seed": seed,
+                "scoped_order_ids": [ord_id],
+                "scoped_payment_ids": [pay_id],
+                "scoped_inventory_level_ids": [],
                 "expected_sync_order_ids": [ord_id],
                 "expected_sync_case_ids": [case_id],
+                "expected_actionable_case_ids": [case_id],
                 "expected_blocked_refund_case_ids": [],
                 "expected_lookalike_case_ids": [],
                 "expected_incident_case_ids": [],
                 "stock_contention_sku": None,
-                "duplicate_ipn_deduplicated": True,
+                "expects_duplicate_ipn_check": False,
+                "duplicate_ipn_deduplicated": False,
             },
         }
 
@@ -617,19 +826,30 @@ class ScenarioRegistry:
             "orders_generated": 2,
             "case_ids": [elig_case_id, dup_case_id],
             "incident_ids": [],
-            "metrics": {"order_count": 2, "generation_ms": gen_ms, "correlation_ms": 0},
+            "recommended_investigation_case_ids": [],
+            "metrics": {
+                "order_count": 2,
+                "generation_ms": gen_ms,
+                "correlation_ms": 0,
+                "llm_calls_for_bulk_orders": 0,
+            },
             "oracle_truth": {
                 "scenario_id": "refund_risk",
                 "seed": seed,
+                "scoped_order_ids": [elig_ord_id, dup_ord_id],
+                "scoped_payment_ids": [elig_pay_id, dup_pay_id],
+                "scoped_inventory_level_ids": [],
                 "expected_sync_order_ids": [],
                 "expected_sync_case_ids": [],
+                "expected_actionable_case_ids": [elig_case_id],
                 "expected_valid_partial_refund_case_id": elig_case_id,
                 "expected_valid_partial_refund_proposal_id": elig_prop.id,
                 "expected_blocked_refund_case_ids": [dup_case_id],
                 "expected_lookalike_case_ids": [],
                 "expected_incident_case_ids": [],
                 "stock_contention_sku": None,
-                "duplicate_ipn_deduplicated": True,
+                "expects_duplicate_ipn_check": False,
+                "duplicate_ipn_deduplicated": False,
             },
         }
 
@@ -711,6 +931,13 @@ class ScenarioRegistry:
         dropped_sync_order_ids: list[str] = []
         lookalike_case_ids: list[str] = []
         all_case_ids: list[str] = []
+        all_order_ids: list[str] = []
+        all_payment_ids: list[str] = []
+        dup_ipn_order_id = ""
+        dup_ipn_payment_id = ""
+        dup_ipn_request_id = f"REQ_IPN_{tag}"
+        duplicate_ipn_dedup_ok = False
+        stock_contention_rejected = False
 
         # 2. Generate `order_count` synthetic orders deterministically
         # Indices:
@@ -723,6 +950,8 @@ class ScenarioRegistry:
         for idx in range(1, order_count + 1):
             ord_id = f"ORD-{tag}-{idx:03d}"
             pay_id = f"PAY-{tag}-{idx:03d}"
+            all_order_ids.append(ord_id)
+            all_payment_ids.append(pay_id)
             amount = 250000 if idx <= 16 else rng.choice([190000, 250000, 320000, 450000])
             ev_ts = base_ts + timedelta(seconds=idx * 20)
             cust_name = f"Khách MegaLive #{idx:03d} (SAMPLE)"
@@ -895,6 +1124,8 @@ class ScenarioRegistry:
                     adapter_verified=True,
                 )
                 duplicate_ipn_dedup_ok = is_new_1 is True and is_new_2 is False
+                dup_ipn_order_id = ord_id
+                dup_ipn_payment_id = pay_id
 
             elif idx == 12:
                 # Duplicate refund attempt on already-refunded order (QA T07)
@@ -1190,20 +1421,38 @@ class ScenarioRegistry:
         outcome = correlator.correlate_session_cases()
         tf_manager = TaskforceManager(db, session_id)
         incident_ids: list[str] = []
+        dropped_set = set(dropped_sync_case_ids)
+        taskforce_mode = "DETERMINISTIC_TASKFORCE"
         for inc in outcome.incidents:
-            tf_manager.assign_and_run_taskforce(inc)
-            incident_ids.append(inc.id)
+            linked_ids = set(
+                db.scalars(
+                    select(IncidentCase.case_id).where(
+                        IncidentCase.session_id == session_id,
+                        IncidentCase.incident_id == inc.id,
+                    )
+                ).all()
+            )
+            if linked_ids & dropped_set:
+                tf_tasks = tf_manager.assign_and_run_taskforce(inc)
+                if tf_tasks:
+                    first_mode = (tf_tasks[0].handoff_json or {}).get("reasoning_mode")
+                    if isinstance(first_mode, str) and first_mode:
+                        taskforce_mode = first_mode
+                incident_ids.append(inc.id)
         corr_ms = max(1, int((time.perf_counter_ns() - t_corr) / 1_000_000))
 
+        recommended_ids = dropped_sync_case_ids[:1]
         return {
             "orders_generated": order_count,
             "case_ids": all_case_ids,
             "incident_ids": incident_ids,
+            "recommended_investigation_case_ids": recommended_ids,
             "metrics": {
                 "order_count": order_count,
                 "healthy_orders_processed_in_batch": order_count - 16,
                 "exception_cases_created": len(all_case_ids),
                 "llm_calls_for_bulk_orders": 0,
+                "taskforce_mode": taskforce_mode,
                 "generation_ms": gen_ms,
                 "correlation_ms": corr_ms,
             },
@@ -1211,15 +1460,23 @@ class ScenarioRegistry:
                 "scenario_id": "mega_live",
                 "seed": seed,
                 "order_count": order_count,
+                "scoped_order_ids": all_order_ids,
+                "scoped_payment_ids": all_payment_ids,
+                "scoped_inventory_level_ids": [inv_hot.id, inv_std.id],
                 "expected_sync_order_ids": dropped_sync_order_ids,
                 "expected_sync_case_ids": dropped_sync_case_ids,
+                "expected_actionable_case_ids": dropped_sync_case_ids,
                 "expected_incident_case_ids": dropped_sync_case_ids,
                 "expected_blocked_refund_case_ids": [f"CASE-{tag}-DUPREF"],
                 "expected_lookalike_case_ids": lookalike_case_ids,
                 "stock_contention_sku": prod_hot.sku,
                 "stock_contention_product_id": prod_hot.id,
                 "stock_contention_second_rejected": stock_contention_rejected,
+                "expects_duplicate_ipn_check": True,
                 "duplicate_ipn_deduplicated": duplicate_ipn_dedup_ok,
+                "expected_duplicate_ipn_order_id": dup_ipn_order_id,
+                "expected_duplicate_ipn_payment_id": dup_ipn_payment_id,
+                "expected_duplicate_ipn_request_id": dup_ipn_request_id,
             },
         }
 
@@ -1229,16 +1486,18 @@ def run_scenario_background_task(
     run_id: str,
     order_count: int,
     reset_before_run: bool,
+    investigate_selected_exception: bool = False,
 ) -> None:
     """Async background runner executing ScenarioRegistry in a fresh PostgreSQL session."""
     maker = get_sessionmaker()
     with maker() as db:
         run = db.get(SimScenarioRun, run_id)
-        if run is None:
+        if run is None or run.status != "RUNNING":
             return
         ScenarioRegistry().execute_run(
             db,
             run=run,
             order_count=order_count,
             reset_before_run=reset_before_run,
+            investigate_selected_exception=investigate_selected_exception,
         )

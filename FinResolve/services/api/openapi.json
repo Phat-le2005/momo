@@ -3956,6 +3956,12 @@
             "title": "Reset Before Run",
             "description": "Reset current DemoSession synthetic world before running scenario",
             "default": false
+          },
+          "investigate_selected_exception": {
+            "type": "boolean",
+            "title": "Investigate Selected Exception",
+            "description": "Optionally run bounded AI Core investigation on at most 1 curated exception Case (never on bulk healthy orders); proposals still require Policy + Approval + Verifier.",
+            "default": false
           }
         },
         "type": "object",
@@ -4036,6 +4042,14 @@
             "type": "string",
             "title": "Status"
           },
+          "safety_verdict": {
+            "type": "string",
+            "title": "Safety Verdict"
+          },
+          "resolution_status": {
+            "type": "string",
+            "title": "Resolution Status"
+          },
           "verdict": {
             "type": "string",
             "title": "Verdict"
@@ -4047,6 +4061,10 @@
           "verified_resolved_count": {
             "type": "integer",
             "title": "Verified Resolved Count"
+          },
+          "expected_actionable_count": {
+            "type": "integer",
+            "title": "Expected Actionable Count"
           },
           "pending_unverified_count": {
             "type": "integer",
@@ -4060,6 +4078,10 @@
             "type": "integer",
             "title": "Blocked Risk Count"
           },
+          "expected_blocked_risk_count": {
+            "type": "integer",
+            "title": "Expected Blocked Risk Count"
+          },
           "correlated_incident_count": {
             "type": "integer",
             "title": "Correlated Incident Count"
@@ -4071,6 +4093,10 @@
           "stock_oversell_detected": {
             "type": "boolean",
             "title": "Stock Oversell Detected"
+          },
+          "duplicate_ipn_checked": {
+            "type": "boolean",
+            "title": "Duplicate Ipn Checked"
           },
           "duplicate_ipn_deduplicated": {
             "type": "boolean",
@@ -4107,15 +4133,20 @@
           "scenario_id",
           "seed",
           "status",
+          "safety_verdict",
+          "resolution_status",
           "verdict",
           "unsafe_effects_count",
           "verified_resolved_count",
+          "expected_actionable_count",
           "pending_unverified_count",
           "mismatched_count",
           "blocked_risk_count",
+          "expected_blocked_risk_count",
           "correlated_incident_count",
           "false_merges_count",
           "stock_oversell_detected",
+          "duplicate_ipn_checked",
           "duplicate_ipn_deduplicated",
           "oracle_leak_detected"
         ],
@@ -4164,6 +4195,20 @@
             },
             "type": "array",
             "title": "Incident Ids"
+          },
+          "recommended_investigation_case_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Recommended Investigation Case Ids"
+          },
+          "investigated_case_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Investigated Case Ids"
           },
           "source_mode": {
             "type": "string",

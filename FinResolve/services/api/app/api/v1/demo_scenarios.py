@@ -1,4 +1,4 @@
-"""Prompt 06 Simulator & Demo Scenario routes: catalog, run, status, oracle report, reset."""
+"""Prompt 06 / 06.1 Simulator & Demo Scenario routes: catalog, run, status, oracle report, reset."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from app.schemas.simulator import (
 from app.simulator.oracle import evaluate_scenario_run_oracle
 from app.simulator.scenarios import (
     ScenarioRegistry,
+    recover_stale_runs,
     reset_demo_session_world,
     run_scenario_background_task,
 )
@@ -29,6 +30,9 @@ router = APIRouter(prefix="/demo", tags=["demo-scenarios"])
 
 
 def _to_run_response(run: SimScenarioRun) -> ScenarioRunResponse:
+    metrics = dict(run.metrics_json or {})
+    rec_ids = list(metrics.get("recommended_investigation_case_ids") or [])
+    inv_ids = list(metrics.get("investigated_case_ids") or [])
     return ScenarioRunResponse(
         run_id=run.id,
         session_id=run.session_id,
@@ -39,8 +43,10 @@ def _to_run_response(run: SimScenarioRun) -> ScenarioRunResponse:
         orders_generated=run.orders_generated,
         case_ids=list(run.case_ids_json or []),
         incident_ids=list(run.incident_ids_json or []),
+        recommended_investigation_case_ids=rec_ids,
+        investigated_case_ids=inv_ids,
         source_mode=run.source_mode,
-        metrics=dict(run.metrics_json or {}),
+        metrics=metrics,
         error_message=run.error_message,
         created_at=run.created_at,
         updated_at=run.updated_at,
@@ -80,6 +86,7 @@ def run_demo_scenario(
         session_id=current_session.id,
         scenario_id=clean_id,
         seed=req.seed,
+        reset_before_run=req.reset_before_run,
     )
 
     if req.run_async:
@@ -90,6 +97,7 @@ def run_demo_scenario(
             run_id=run.id,
             order_count=eff_order_count,
             reset_before_run=req.reset_before_run,
+            investigate_selected_exception=req.investigate_selected_exception,
         )
         response.status_code = status.HTTP_202_ACCEPTED
         return _to_run_response(run)
@@ -99,6 +107,7 @@ def run_demo_scenario(
         run=run,
         order_count=eff_order_count,
         reset_before_run=req.reset_before_run,
+        investigate_selected_exception=req.investigate_selected_exception,
     )
     return _to_run_response(completed_run)
 
@@ -113,6 +122,8 @@ def get_scenario_run_status(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> ScenarioRunResponse:
+    if recover_stale_runs(db, current_session.id):
+        db.commit()
     run = db.scalar(
         select(SimScenarioRun).where(
             SimScenarioRun.id == run_id.strip(),
@@ -138,6 +149,8 @@ def get_scenario_run_report(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> ScenarioOracleReportResponse:
+    if recover_stale_runs(db, current_session.id):
+        db.commit()
     report = evaluate_scenario_run_oracle(
         db,
         session_id=current_session.id,
