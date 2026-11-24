@@ -12,6 +12,7 @@ from app.api.v1.demo_scenarios import router as demo_scenarios_router
 from app.api.v1.incidents import router as incidents_router
 from app.api.v1.risks import router as risks_router
 from app.api.v1.sessions import router as sessions_router
+from app.api.v1.supervisor import router as supervisor_router
 from app.core.config import ModelMode, SourceMode, get_settings
 
 api_v1_router = APIRouter(prefix="/api/v1")
@@ -21,6 +22,7 @@ api_v1_router.include_router(cases_router)
 api_v1_router.include_router(actions_router)
 api_v1_router.include_router(risks_router)
 api_v1_router.include_router(incidents_router)
+api_v1_router.include_router(supervisor_router)
 
 
 class ApiMeta(BaseModel):

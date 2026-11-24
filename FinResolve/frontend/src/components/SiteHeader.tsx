@@ -3,10 +3,10 @@ import { ApiHealthIndicator } from "./ApiHealth";
 import { MockBadge } from "./MockBadge";
 
 const NAV = [
-  { href: "/demo", label: "Demo" },
-  { href: "/cases", label: "Case" },
-  { href: "/risks", label: "Rủi ro" },
-  { href: "/live", label: "Mega Live" },
+  { href: "/demo", label: "Mission Control" },
+  { href: "/cases", label: "Hồ sơ (Cases)" },
+  { href: "/risks", label: "Rủi ro (Risks)" },
+  { href: "/live", label: "Sự cố & Taskforce" },
 ];
 
 export function SiteHeader() {

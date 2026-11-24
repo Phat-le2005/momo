@@ -3,9 +3,11 @@ import test from "node:test";
 import {
   clearSessionRunId,
   loadSessionRunId,
+  mergeSupervisorActivities,
   resolveCaseAiModeLabel,
   resolveRestoredInvestigationJob,
   resolveSelectedCaseId,
+  resolveSupervisorExecutionBadge,
   resolveTaskforceModeLabel,
   saveSessionRunId,
   type StorageLike,
@@ -123,4 +125,58 @@ test("Prompt 08.3.2 Scenario E: terminal/idle/missing statuses never poll or aut
     shouldPoll: false,
     notice: null,
   });
+});
+
+test("Prompt 09 Part A.3: resolveSupervisorExecutionBadge honestly distinguishes configured vs invoked LLM", () => {
+  // Configured key before any invocation must NOT claim LLM_CALL_SUCCEEDED or isThinking
+  const configured = resolveSupervisorExecutionBadge("LLM_API_CONFIGURED", "LLM_API");
+  assert.equal(configured.code, "LLM_API_CONFIGURED");
+  assert.equal(configured.isLlmConfirmed, false);
+  assert.equal(configured.isThinking, false);
+
+  // Active reasoning call sets isThinking = true
+  const started = resolveSupervisorExecutionBadge("LLM_CALL_STARTED", "LLM_API");
+  assert.equal(started.code, "LLM_CALL_STARTED");
+  assert.equal(started.isThinking, true);
+
+  // Only actual completed LLM call sets isLlmConfirmed = true
+  const succeeded = resolveSupervisorExecutionBadge("LLM_CALL_SUCCEEDED", "LLM_API");
+  assert.equal(succeeded.code, "LLM_CALL_SUCCEEDED");
+  assert.equal(succeeded.isLlmConfirmed, true);
+  assert.equal(succeeded.isThinking, false);
+
+  // Failed LLM call clearly reports fallback
+  const failed = resolveSupervisorExecutionBadge("LLM_CALL_FAILED", "LLM_API");
+  assert.equal(failed.code, "LLM_CALL_FAILED");
+  assert.equal(failed.isLlmConfirmed, false);
+
+  // Default deterministic fallback
+  const fallback = resolveSupervisorExecutionBadge("DEMO_RULES_FALLBACK", "DEMO_RULES");
+  assert.equal(fallback.code, "DEMO_RULES_FALLBACK");
+  assert.equal(fallback.isLlmConfirmed, false);
+});
+
+test("Prompt 09 Part D: mergeSupervisorActivities deduplicates by seq and filters stale world_epoch", () => {
+  const existing = [
+    { id: "ACT-1", seq: 1, world_epoch: 1 },
+    { id: "ACT-2", seq: 2, world_epoch: 1 },
+  ];
+  const incoming = [
+    { id: "ACT-2", seq: 2, world_epoch: 1 },
+    { id: "ACT-3", seq: 3, world_epoch: 1 },
+  ];
+  const merged = mergeSupervisorActivities(existing, incoming, 1);
+  assert.deepEqual(
+    merged.map((x) => x.seq),
+    [3, 2, 1],
+  );
+
+  // After world reset (world_epoch = 2), epoch 1 events are dropped
+  const epoch2 = mergeSupervisorActivities(
+    merged,
+    [{ id: "ACT-10", seq: 1, world_epoch: 2 }],
+    2,
+  );
+  assert.equal(epoch2.length, 1);
+  assert.equal(epoch2[0]?.id, "ACT-10");
 });

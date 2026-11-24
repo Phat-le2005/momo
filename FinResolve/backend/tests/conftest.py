@@ -13,6 +13,7 @@ TEST_DB_URL = os.environ.get(
     "TEST_DATABASE_URL",
     "postgresql+psycopg://finresolve@127.0.0.1:5544/finresolve_test",
 )
+os.environ["APP_ENV"] = "test"
 os.environ["DATABASE_URL"] = TEST_DB_URL
 os.environ["WEB_ORIGIN"] = "http://localhost:3000"
 os.environ["SOURCE_MODE"] = "MOCK"
@@ -48,7 +49,9 @@ def clean_database() -> Iterator[None]:
                         "action_proposals, approvals, action_executions, verifications, "
                         "risk_signals, sim_orders, sim_payments, sim_refunds, "
                         "products, warehouses, inventory_levels, order_items, "
-                        "inventory_reservations, inventory_movements, sim_payment_events CASCADE"
+                        "inventory_reservations, inventory_movements, sim_payment_events, "
+                        "supervisor_states, supervisor_jobs, challenges, "
+                        "supervisor_activities CASCADE"
                     )
                 )
         except Exception:

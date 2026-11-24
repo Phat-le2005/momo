@@ -4,13 +4,14 @@
 .EXAMPLE
   .\scripts\dev.ps1 setup     # create venv, install backend + frontend deps
   .\scripts\dev.ps1 api       # run FastAPI on :8000 (reload)
+  .\scripts\dev.ps1 worker    # run standalone Autonomous Agent Supervisor worker
   .\scripts\dev.ps1 web       # run Next.js on :3000
   .\scripts\dev.ps1 check     # ruff + mypy + pytest + eslint + tsc + next build
   .\scripts\dev.ps1 up        # docker compose up --build
 #>
 param(
   [Parameter(Position = 0)]
-  [ValidateSet("setup", "api", "web", "migrate", "test", "lint", "typecheck", "check", "openapi", "up", "down", "compose-config")]
+  [ValidateSet("setup", "api", "worker", "web", "migrate", "test", "lint", "typecheck", "check", "openapi", "up", "down", "compose-config")]
   [string]$Task = "check"
 )
 
@@ -37,6 +38,7 @@ switch ($Task) {
     Invoke-Step $Web { npm ci }
   }
   "api" { Invoke-Step $Api { & $Py -m uvicorn app.main:app --reload --port 8000 } }
+  "worker" { Invoke-Step $Api { & $Py -m app.supervisor.worker } }
   "web" { Invoke-Step $Web { npm run dev } }
   "migrate" { Invoke-Step $Api { & $Py -m alembic upgrade head } }
   "test" { Invoke-Step $Api { & $Py -m pytest } }

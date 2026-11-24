@@ -30,6 +30,12 @@ class CreateCaseRequest(BaseModel):
         max_length=128,
         description="Khóa chống trùng lặp từ client khi gửi lại request",
     )
+    auto_investigate: bool = Field(
+        default=False,
+        description=(
+            "Nếu bật cùng Autopilot, AI Supervisor sẽ tự động xử lý ngay tác vụ điều tra vừa tạo"
+        ),
+    )
 
 
 class EvidenceResponse(BaseModel):

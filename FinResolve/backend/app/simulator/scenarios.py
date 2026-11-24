@@ -234,6 +234,9 @@ def reset_demo_session_world(db: Session, session_id: str) -> dict[str, int]:
         counts[label] = int(getattr(res, "rowcount", 0) or 0)
 
     demo_session.case_count = 0
+    from app.supervisor.service import bump_world_epoch_on_reset
+
+    counts["world_epoch"] = bump_world_epoch_on_reset(db, session_id)
     db.flush()
     return counts
 

@@ -174,3 +174,88 @@ export function resolveRestoredInvestigationJob(
   }
   return { jobId: null, shouldPoll: false, notice: null };
 }
+
+export type SupervisorExecutionBadge = {
+  code:
+    | "LLM_API_CONFIGURED"
+    | "LLM_CALL_STARTED"
+    | "LLM_CALL_SUCCEEDED"
+    | "LLM_CALL_FAILED"
+    | "DEMO_RULES_FALLBACK";
+  badge: string;
+  note: string;
+  isLlmConfirmed: boolean;
+  isThinking: boolean;
+};
+
+/** Honest AI execution state badge for Mission Control (Prompt 09 Part A.3).
+ * Never claims an LLM model was invoked solely because an API key is configured,
+ * and never claims the Agent is thinking when no reasoning call is active.
+ */
+export function resolveSupervisorExecutionBadge(
+  llmExecutionState: string | null | undefined,
+  configuredMode?: string | null,
+): SupervisorExecutionBadge {
+  const norm = (llmExecutionState || "").trim().toUpperCase();
+  if (norm === "LLM_CALL_STARTED") {
+    return {
+      code: "LLM_CALL_STARTED",
+      badge: "ĐANG SUY LUẬN LLM",
+      note: "Agent đang thực hiện lượt gọi mô hình LLM có giới hạn bước và ngân sách token.",
+      isLlmConfirmed: false,
+      isThinking: true,
+    };
+  }
+  if (norm === "LLM_CALL_SUCCEEDED") {
+    return {
+      code: "LLM_CALL_SUCCEEDED",
+      badge: "LLM_CALL_SUCCEEDED",
+      note: "Đã xác nhận gọi LLM API thành công trong phiên này — mọi hành động vẫn qua Policy & Approval.",
+      isLlmConfirmed: true,
+      isThinking: false,
+    };
+  }
+  if (norm === "LLM_CALL_FAILED") {
+    return {
+      code: "LLM_CALL_FAILED",
+      badge: "LLM_CALL_FAILED → DEMO_RULES",
+      note: "Lượt gọi LLM gần nhất gặp lỗi hoặc quá thời gian chờ; hệ thống đã chuyển về DEMO_RULES an toàn.",
+      isLlmConfirmed: false,
+      isThinking: false,
+    };
+  }
+  if (norm === "LLM_API_CONFIGURED" || (configuredMode || "").toUpperCase() === "LLM_API") {
+    return {
+      code: "LLM_API_CONFIGURED",
+      badge: "LLM_API_CONFIGURED (CHƯA GỌI)",
+      note: "Đã cấu hình khoá LLM API nhưng chưa phát sinh lượt gọi mô hình nào trong phiên hiện tại.",
+      isLlmConfirmed: false,
+      isThinking: false,
+    };
+  }
+  return {
+    code: "DEMO_RULES_FALLBACK",
+    badge: "DEMO_RULES_FALLBACK",
+    note: "Đang chạy bộ luật xác định (0 LLM calls) — không phải suy luận từ mô hình ngôn ngữ.",
+    isLlmConfirmed: false,
+    isThinking: false,
+  };
+}
+
+/** Merge & deduplicate incremental Supervisor activity items scoped to the current world_epoch. */
+export function mergeSupervisorActivities<
+  T extends { id: string; seq: number; world_epoch: number },
+>(existing: readonly T[], incoming: readonly T[], activeWorldEpoch: number): T[] {
+  const bySeq = new Map<number, T>();
+  for (const item of existing) {
+    if (item.world_epoch === activeWorldEpoch) {
+      bySeq.set(item.seq, item);
+    }
+  }
+  for (const item of incoming) {
+    if (item.world_epoch === activeWorldEpoch) {
+      bySeq.set(item.seq, item);
+    }
+  }
+  return Array.from(bySeq.values()).sort((a, b) => b.seq - a.seq);
+}

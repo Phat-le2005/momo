@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +16,20 @@ from app.core.body_limit import MaxBodySizeMiddleware
 from app.core.config import get_settings
 from app.core.errors import register_error_handlers
 from app.core.request_id import REQUEST_ID_HEADER, RequestIdMiddleware
+from app.supervisor.worker import (
+    start_embedded_supervisor_worker,
+    stop_embedded_supervisor_worker,
+)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    if get_settings().app_env.strip().lower() != "test":
+        start_embedded_supervisor_worker()
+    try:
+        yield
+    finally:
+        stop_embedded_supervisor_worker()
 
 
 def create_app() -> FastAPI:
@@ -30,6 +46,7 @@ def create_app() -> FastAPI:
         openapi_url="/api/v1/openapi.json",
         docs_url="/docs",
         redoc_url=None,
+        lifespan=_lifespan,
     )
 
     app.add_middleware(

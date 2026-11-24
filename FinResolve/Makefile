@@ -5,7 +5,7 @@ VENV    := $(API_DIR)/.venv
 PY      := $(VENV)/bin/python
 COMPOSE := docker compose -f infra/docker-compose.yml
 
-.PHONY: setup setup-api setup-web api web migrate test lint typecheck check web-check \
+.PHONY: setup setup-api setup-web api worker web migrate test lint typecheck check web-check \
         openapi up down logs compose-config
 
 setup: setup-api setup-web
@@ -20,6 +20,9 @@ setup-web:
 
 api:
 	cd $(API_DIR) && .venv/bin/uvicorn app.main:app --reload --port 8000
+
+worker:
+	cd $(API_DIR) && .venv/bin/python -m app.supervisor.worker
 
 web:
 	cd $(WEB_DIR) && npm run dev

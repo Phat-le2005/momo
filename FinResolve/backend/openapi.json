@@ -779,6 +779,65 @@
         }
       }
     },
+    "/api/v1/actions/{proposal_id}/simulate-demo-reject": {
+      "post": {
+        "tags": [
+          "actions"
+        ],
+        "summary": "Self-serve MOCK demonstration rejection of a proposed action",
+        "operationId": "simulate_demo_action_rejection_api_v1_actions__proposal_id__simulate_demo_reject_post",
+        "parameters": [
+          {
+            "name": "proposal_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Proposal Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/SimulateDemoApprovalRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/actions/{proposal_id}/execute": {
       "post": {
         "tags": [
@@ -1355,6 +1414,422 @@
         }
       }
     },
+    "/api/v1/supervisor/status": {
+      "get": {
+        "tags": [
+          "supervisor",
+          "challenges"
+        ],
+        "summary": "Get session-scoped Autonomous Agent Supervisor status, telemetry, and queue depth",
+        "operationId": "get_supervisor_status_api_v1_supervisor_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SupervisorStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/supervisor/pause": {
+      "post": {
+        "tags": [
+          "supervisor",
+          "challenges"
+        ],
+        "summary": "Pause Autonomous Agent Supervisor for the current session",
+        "operationId": "pause_session_supervisor_api_v1_supervisor_pause_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SupervisorStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/supervisor/resume": {
+      "post": {
+        "tags": [
+          "supervisor",
+          "challenges"
+        ],
+        "summary": "Resume Autonomous Agent Supervisor and process pending queued jobs",
+        "operationId": "resume_session_supervisor_api_v1_supervisor_resume_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SupervisorStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/supervisor/tick": {
+      "post": {
+        "tags": [
+          "supervisor",
+          "challenges"
+        ],
+        "summary": "Recover stale jobs and process the next queued Supervisor job if Autopilot is enabled",
+        "operationId": "tick_session_supervisor_api_v1_supervisor_tick_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SupervisorStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/supervisor/activity": {
+      "get": {
+        "tags": [
+          "supervisor",
+          "challenges"
+        ],
+        "summary": "Get ordered, persisted Agent activity timeline events (supports after_seq cursor)",
+        "operationId": "list_supervisor_activity_api_v1_supervisor_activity_get",
+        "parameters": [
+          {
+            "name": "after_seq",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "After Seq"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 60,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SupervisorActivityItemResponse"
+                  },
+                  "title": "Response List Supervisor Activity Api V1 Supervisor Activity Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/supervisor/overview": {
+      "get": {
+        "tags": [
+          "supervisor",
+          "challenges"
+        ],
+        "summary": "Get complete AI Mission Control snapshot (status, challenges, activity, inbox)",
+        "operationId": "get_mission_control_overview_api_v1_supervisor_overview_get",
+        "parameters": [
+          {
+            "name": "after_seq",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "After Seq"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MissionControlOverviewResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/challenges/catalog": {
+      "get": {
+        "tags": [
+          "supervisor",
+          "challenges"
+        ],
+        "summary": "List Adversarial Challenge Lab types and presets",
+        "operationId": "get_challenge_catalog_api_v1_challenges_catalog_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ChallengeCatalogItemResponse"
+                  },
+                  "type": "array",
+                  "title": "Response Get Challenge Catalog Api V1 Challenges Catalog Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/challenges/receipt-extract": {
+      "post": {
+        "tags": [
+          "supervisor",
+          "challenges"
+        ],
+        "summary": "Extract structured fields from a synthetic MOCK / TEST receipt (untrusted CLAIM)",
+        "operationId": "extract_receipt_sample_api_v1_challenges_receipt_extract_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtractReceiptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Extract Receipt Sample Api V1 Challenges Receipt Extract Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/challenges": {
+      "get": {
+        "tags": [
+          "supervisor",
+          "challenges"
+        ],
+        "summary": "List executed challenges in the current session",
+        "operationId": "list_session_challenges_api_v1_challenges_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ChallengeRunResponse"
+                  },
+                  "type": "array",
+                  "title": "Response List Session Challenges Api V1 Challenges Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "supervisor",
+          "challenges"
+        ],
+        "summary": "Launch a Challenge Lab anomaly and automatically trigger Autonomous Supervisor",
+        "operationId": "create_and_run_challenge_api_v1_challenges_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LaunchChallengeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChallengeRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/challenges/{challenge_id}": {
+      "get": {
+        "tags": [
+          "supervisor",
+          "challenges"
+        ],
+        "summary": "Get detail and evidence-backed outcome of a challenge",
+        "operationId": "get_challenge_detail_api_v1_challenges__challenge_id__get",
+        "parameters": [
+          {
+            "name": "challenge_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Challenge Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChallengeRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/challenges/{challenge_id}/cancel": {
+      "post": {
+        "tags": [
+          "supervisor",
+          "challenges"
+        ],
+        "summary": "Stop/cancel an active challenge and its pending Supervisor jobs",
+        "operationId": "cancel_session_challenge_api_v1_challenges__challenge_id__cancel_post",
+        "parameters": [
+          {
+            "name": "challenge_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Challenge Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChallengeRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1": {
       "get": {
         "tags": [
@@ -1791,6 +2266,84 @@
         ],
         "title": "ApprovalDecision"
       },
+      "ApprovalInboxItemResponse": {
+        "properties": {
+          "proposal_id": {
+            "type": "string",
+            "title": "Proposal Id"
+          },
+          "case_id": {
+            "type": "string",
+            "title": "Case Id"
+          },
+          "case_goal": {
+            "type": "string",
+            "title": "Case Goal"
+          },
+          "case_state": {
+            "type": "string",
+            "title": "Case State"
+          },
+          "action_type": {
+            "type": "string",
+            "title": "Action Type"
+          },
+          "action_label_vi": {
+            "type": "string",
+            "title": "Action Label Vi"
+          },
+          "summary_vi": {
+            "type": "string",
+            "title": "Summary Vi"
+          },
+          "params_json": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Params Json"
+          },
+          "evidence_refs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Evidence Refs"
+          },
+          "risk_level": {
+            "type": "string",
+            "title": "Risk Level"
+          },
+          "expected_version": {
+            "type": "integer",
+            "title": "Expected Version"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "proposal_id",
+          "case_id",
+          "case_goal",
+          "case_state",
+          "action_type",
+          "action_label_vi",
+          "summary_vi",
+          "params_json",
+          "evidence_refs",
+          "risk_level",
+          "expected_version",
+          "status",
+          "created_at"
+        ],
+        "title": "ApprovalInboxItemResponse"
+      },
       "ApprovalResponse": {
         "properties": {
           "approval_id": {
@@ -2200,6 +2753,181 @@
         ],
         "title": "CaseStatusResponse"
       },
+      "ChallengeCatalogItemResponse": {
+        "properties": {
+          "challenge_type": {
+            "type": "string",
+            "title": "Challenge Type"
+          },
+          "title_vi": {
+            "type": "string",
+            "title": "Title Vi"
+          },
+          "subtitle_vi": {
+            "type": "string",
+            "title": "Subtitle Vi"
+          },
+          "is_advanced": {
+            "type": "boolean",
+            "title": "Is Advanced",
+            "default": false
+          },
+          "presets": {
+            "items": {
+              "$ref": "#/components/schemas/ChallengePresetItem"
+            },
+            "type": "array",
+            "title": "Presets"
+          }
+        },
+        "type": "object",
+        "required": [
+          "challenge_type",
+          "title_vi",
+          "subtitle_vi"
+        ],
+        "title": "ChallengeCatalogItemResponse"
+      },
+      "ChallengePresetItem": {
+        "properties": {
+          "preset_id": {
+            "type": "string",
+            "title": "Preset Id"
+          },
+          "label_vi": {
+            "type": "string",
+            "title": "Label Vi"
+          },
+          "description_vi": {
+            "type": "string",
+            "title": "Description Vi"
+          },
+          "defaults": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Defaults"
+          }
+        },
+        "type": "object",
+        "required": [
+          "preset_id",
+          "label_vi",
+          "description_vi"
+        ],
+        "title": "ChallengePresetItem"
+      },
+      "ChallengeRunResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "world_epoch": {
+            "type": "integer",
+            "title": "World Epoch"
+          },
+          "challenge_type": {
+            "type": "string",
+            "title": "Challenge Type"
+          },
+          "preset_id": {
+            "type": "string",
+            "title": "Preset Id"
+          },
+          "title_vi": {
+            "type": "string",
+            "title": "Title Vi"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "status_label_vi": {
+            "type": "string",
+            "title": "Status Label Vi"
+          },
+          "input_json": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Input Json"
+          },
+          "generated_refs_json": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Generated Refs Json"
+          },
+          "linked_case_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Linked Case Ids"
+          },
+          "linked_incident_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Linked Incident Ids"
+          },
+          "agent_run_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Agent Run Ids"
+          },
+          "outcome_json": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Outcome Json"
+          },
+          "safety_verdict": {
+            "type": "string",
+            "title": "Safety Verdict"
+          },
+          "source_mode": {
+            "type": "string",
+            "title": "Source Mode"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "session_id",
+          "world_epoch",
+          "challenge_type",
+          "preset_id",
+          "title_vi",
+          "status",
+          "status_label_vi",
+          "input_json",
+          "generated_refs_json",
+          "linked_case_ids",
+          "linked_incident_ids",
+          "agent_run_ids",
+          "outcome_json",
+          "safety_verdict",
+          "source_mode",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "ChallengeRunResponse"
+      },
       "CreateCaseRequest": {
         "properties": {
           "text": {
@@ -2241,6 +2969,12 @@
             ],
             "title": "Idempotency Key",
             "description": "Khóa chống trùng lặp từ client khi gửi lại request"
+          },
+          "auto_investigate": {
+            "type": "boolean",
+            "title": "Auto Investigate",
+            "description": "Nếu bật cùng Autopilot, AI Supervisor sẽ tự động xử lý ngay tác vụ điều tra vừa tạo",
+            "default": false
           }
         },
         "type": "object",
@@ -2655,6 +3389,27 @@
           "executed_at"
         ],
         "title": "ExecuteActionResponse"
+      },
+      "ExtractReceiptRequest": {
+        "properties": {
+          "raw_content": {
+            "type": "string",
+            "maxLength": 64000,
+            "minLength": 5,
+            "title": "Raw Content"
+          },
+          "filename": {
+            "type": "string",
+            "maxLength": 120,
+            "title": "Filename",
+            "default": "mock_receipt.txt"
+          }
+        },
+        "type": "object",
+        "required": [
+          "raw_content"
+        ],
+        "title": "ExtractReceiptRequest"
       },
       "HTTPValidationError": {
         "properties": {
@@ -3391,6 +4146,91 @@
         ],
         "title": "InvestigationStepTrace",
         "description": "Single step trace in a bounded investigation run."
+      },
+      "LaunchChallengeRequest": {
+        "properties": {
+          "challenge_type": {
+            "type": "string",
+            "title": "Challenge Type",
+            "description": "SUSPICIOUS_RECEIPT | TRAFFIC_BURST | DUPLICATE_REFUND | BULK_ORDER_SYNC | PROMPT_INJECTION"
+          },
+          "preset_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preset Id"
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Parameters"
+          },
+          "auto_process": {
+            "type": "boolean",
+            "title": "Auto Process",
+            "description": "Nếu Autopilot đang bật, tự động xử lý ngay tác vụ trong hàng đợi",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "challenge_type"
+        ],
+        "title": "LaunchChallengeRequest"
+      },
+      "MissionControlOverviewResponse": {
+        "properties": {
+          "supervisor": {
+            "$ref": "#/components/schemas/SupervisorStatusResponse"
+          },
+          "latest_challenge": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChallengeRunResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "recent_challenges": {
+            "items": {
+              "$ref": "#/components/schemas/ChallengeRunResponse"
+            },
+            "type": "array",
+            "title": "Recent Challenges"
+          },
+          "activities": {
+            "items": {
+              "$ref": "#/components/schemas/SupervisorActivityItemResponse"
+            },
+            "type": "array",
+            "title": "Activities"
+          },
+          "approval_inbox": {
+            "items": {
+              "$ref": "#/components/schemas/ApprovalInboxItemResponse"
+            },
+            "type": "array",
+            "title": "Approval Inbox"
+          },
+          "latest_seq": {
+            "type": "integer",
+            "title": "Latest Seq",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "supervisor"
+        ],
+        "title": "MissionControlOverviewResponse"
       },
       "ModelMode": {
         "type": "string",
@@ -4507,6 +5347,293 @@
         ],
         "title": "SourceMode",
         "description": "Where business/payment data comes from. Only MOCK is implemented in the MVP."
+      },
+      "SupervisorActivityItemResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "seq": {
+            "type": "integer",
+            "title": "Seq"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "world_epoch": {
+            "type": "integer",
+            "title": "World Epoch"
+          },
+          "challenge_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Challenge Id"
+          },
+          "case_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Id"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "title_vi": {
+            "type": "string",
+            "title": "Title Vi"
+          },
+          "detail_vi": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail Vi"
+          },
+          "metadata_json": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata Json"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "seq",
+          "session_id",
+          "world_epoch",
+          "kind",
+          "title_vi",
+          "created_at"
+        ],
+        "title": "SupervisorActivityItemResponse"
+      },
+      "SupervisorStatusResponse": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "status_label_vi": {
+            "type": "string",
+            "title": "Status Label Vi"
+          },
+          "autopilot_enabled": {
+            "type": "boolean",
+            "title": "Autopilot Enabled"
+          },
+          "world_epoch": {
+            "type": "integer",
+            "title": "World Epoch"
+          },
+          "active_job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Job Id"
+          },
+          "active_case_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Case Id"
+          },
+          "configured_model_mode": {
+            "type": "string",
+            "title": "Configured Model Mode"
+          },
+          "configured_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configured Provider"
+          },
+          "configured_model_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configured Model Name"
+          },
+          "llm_execution_state": {
+            "type": "string",
+            "title": "Llm Execution State"
+          },
+          "llm_execution_label_vi": {
+            "type": "string",
+            "title": "Llm Execution Label Vi"
+          },
+          "last_llm_succeeded_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Llm Succeeded At"
+          },
+          "last_llm_failed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Llm Failed At"
+          },
+          "last_llm_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Llm Error"
+          },
+          "llm_calls_count": {
+            "type": "integer",
+            "title": "Llm Calls Count"
+          },
+          "llm_tokens_used": {
+            "type": "integer",
+            "title": "Llm Tokens Used"
+          },
+          "llm_budget_calls": {
+            "type": "integer",
+            "title": "Llm Budget Calls"
+          },
+          "llm_budget_tokens": {
+            "type": "integer",
+            "title": "Llm Budget Tokens"
+          },
+          "queue_depth": {
+            "type": "integer",
+            "title": "Queue Depth"
+          },
+          "active_cases_count": {
+            "type": "integer",
+            "title": "Active Cases Count"
+          },
+          "total_cases_count": {
+            "type": "integer",
+            "title": "Total Cases Count"
+          },
+          "waiting_approvals_count": {
+            "type": "integer",
+            "title": "Waiting Approvals Count"
+          },
+          "jobs_processed_count": {
+            "type": "integer",
+            "title": "Jobs Processed Count"
+          },
+          "monitoring_note_vi": {
+            "type": "string",
+            "title": "Monitoring Note Vi"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id",
+          "status",
+          "status_label_vi",
+          "autopilot_enabled",
+          "world_epoch",
+          "configured_model_mode",
+          "llm_execution_state",
+          "llm_execution_label_vi",
+          "llm_calls_count",
+          "llm_tokens_used",
+          "llm_budget_calls",
+          "llm_budget_tokens",
+          "queue_depth",
+          "active_cases_count",
+          "total_cases_count",
+          "waiting_approvals_count",
+          "jobs_processed_count",
+          "monitoring_note_vi",
+          "updated_at"
+        ],
+        "title": "SupervisorStatusResponse"
       },
       "ToolObservationRecord": {
         "properties": {

@@ -163,7 +163,92 @@ def simulate_demo_action_approval(
         expiry_minutes=req.expiry_minutes,
     )
     contract = get_action_contract(proposal.action_type)
+    from app.supervisor.service import ensure_supervisor_state, record_activity
 
+    sup_state = ensure_supervisor_state(db, current_session.id)
+    record_activity(
+        db,
+        session_id=current_session.id,
+        world_epoch=sup_state.world_epoch,
+        case_id=proposal.case_id,
+        kind="WAITING_APPROVAL",
+        title_vi=f"Người vận hành đã phê duyệt đề xuất {contract.action_type} ({proposal.id})",
+        detail_vi=req.reason,
+        metadata_json={"proposal_id": proposal.id, "approval_id": approval.id},
+    )
+    db.commit()
+
+    return ApprovalResponse(
+        approval_id=approval.id,
+        proposal_id=proposal.id,
+        case_id=proposal.case_id,
+        action_type=contract.action_type,
+        decision=approval.decision,
+        approval_mode="SIMULATED_DEMO_APPROVAL",
+        is_simulated_demo_approval=True,
+        approver_role=approval.approver_role,
+        approver_id=approval.approver_id,
+        reason=req.reason,
+        digest=approval.digest,
+        policy_version=approval.policy_version,
+        expiry=approval.expiry,
+        proposal_status=proposal.status,
+        case_state=case_obj.state if case_obj else None,
+        case_version=case_obj.version if case_obj else None,
+        created_at=approval.created_at,
+    )
+
+
+@router.post(
+    "/{proposal_id}/simulate-demo-reject",
+    response_model=ApprovalResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Self-serve MOCK demonstration rejection of a proposed action",
+)
+def simulate_demo_action_rejection(
+    proposal_id: str,
+    payload: SimulateDemoApprovalRequest | None = None,
+    current_session: DemoSession = Depends(get_current_session),
+    db: Session = Depends(get_db),
+) -> ApprovalResponse:
+    from app.models.enums import ApprovalDecision
+    from app.supervisor.service import (
+        ensure_supervisor_state,
+        recompute_supervisor_idle_status,
+        record_activity,
+    )
+
+    req = payload or SimulateDemoApprovalRequest(
+        reason="Người vận hành từ chối đề xuất từ Hộp thư phê duyệt Mission Control"
+    )
+    principal = ApproverPrincipal(
+        session_id=current_session.id,
+        role="DEMO_MANAGER",
+        principal_id=f"mgr_demo_{current_session.id[-8:]}",
+        source_mode="MOCK",
+    )
+    gateway = ApprovalGateway(db, current_session.id)
+    approval, proposal, case_obj = gateway.decide_proposal(
+        proposal_id=proposal_id,
+        principal=principal,
+        decision=ApprovalDecision.REJECTED,
+        reason=req.reason,
+        expiry_minutes=req.expiry_minutes,
+    )
+    contract = get_action_contract(proposal.action_type)
+    sup_state = ensure_supervisor_state(db, current_session.id)
+    record_activity(
+        db,
+        session_id=current_session.id,
+        world_epoch=sup_state.world_epoch,
+        case_id=proposal.case_id,
+        kind="DECISION_FINALIZED",
+        title_vi=f"Người vận hành đã từ chối đề xuất {contract.action_type} ({proposal.id})",
+        detail_vi=req.reason,
+        metadata_json={"proposal_id": proposal.id, "decision": "REJECTED"},
+    )
+    recompute_supervisor_idle_status(db, sup_state)
+    db.commit()
     return ApprovalResponse(
         approval_id=approval.id,
         proposal_id=proposal.id,
@@ -208,6 +293,62 @@ def execute_action_proposal(
         simulate_timeout=req.simulate_timeout,
         simulate_verification_failure=req.simulate_verification_failure,
     )
+    from app.models.supervisor import ChallengeRun
+    from app.supervisor.service import (
+        ensure_supervisor_state,
+        recompute_supervisor_idle_status,
+        record_activity,
+    )
+
+    sup_state = ensure_supervisor_state(db, current_session.id)
+    verdict_val = outcome.verification.verdict if outcome.verification else "NONE"
+    case_state_val = outcome.case.state if outcome.case else None
+    record_activity(
+        db,
+        session_id=current_session.id,
+        world_epoch=sup_state.world_epoch,
+        case_id=outcome.proposal.case_id,
+        kind="DECISION_FINALIZED",
+        title_vi=(
+            f"Thực thi & Kiểm chứng độc lập {outcome.proposal.action_type}: "
+            f"verdict={verdict_val} (Case -> {case_state_val})"
+        ),
+        detail_vi=(
+            "Verifier đọc lại trạng thái cơ sở dữ liệu sau commit để đảm bảo "
+            "hậu điều kiện đạt 100%."
+        ),
+        metadata_json={
+            "proposal_id": outcome.proposal.id,
+            "execution_state": outcome.execution.state,
+            "verification_verdict": verdict_val,
+            "case_state": case_state_val,
+        },
+    )
+    if outcome.proposal.case_id and verdict_val == "PASSED":
+        challenges = list(
+            db.scalars(
+                select(ChallengeRun).where(
+                    ChallengeRun.session_id == current_session.id,
+                    ChallengeRun.world_epoch == sup_state.world_epoch,
+                )
+            ).all()
+        )
+        for ch in challenges:
+            if outcome.proposal.case_id in (ch.linked_case_ids_json or []):
+                ch.status = "COMPLETED"
+                ch.safety_verdict = "VERIFIED_RESOLVED"
+                ch.outcome_json = {
+                    **(ch.outcome_json or {}),
+                    "postconditions_verified": True,
+                    "requires_human_approval": False,
+                    "case_state": case_state_val,
+                    "summary_vi": (
+                        f"Đã phê duyệt, thực thi {outcome.proposal.action_type} và Verifier "
+                        "kiểm chứng hậu điều kiện thành công (PASSED) — hồ sơ chuyển sang RESOLVED."
+                    ),
+                }
+    recompute_supervisor_idle_status(db, sup_state)
+    db.commit()
     return _to_execute_response(outcome)
 
 

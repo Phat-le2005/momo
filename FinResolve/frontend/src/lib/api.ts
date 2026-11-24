@@ -123,6 +123,122 @@ export type IncidentDetail = IncidentSummary & {
   taskforce_execution_mode: string; llm_invoked: boolean;
 };
 
+export type SupervisorStatus = {
+  session_id: string;
+  status: "MONITORING" | "INVESTIGATING" | "WAITING_EVIDENCE" | "WAITING_APPROVAL" | "PAUSED" | "DEGRADED" | "STOPPED";
+  status_label_vi: string;
+  autopilot_enabled: boolean;
+  world_epoch: number;
+  active_job_id: string | null;
+  active_case_id: string | null;
+  configured_model_mode: "DEMO_RULES" | "LLM_API";
+  configured_provider: string | null;
+  configured_model_name: string | null;
+  llm_execution_state:
+    | "LLM_API_CONFIGURED"
+    | "LLM_CALL_STARTED"
+    | "LLM_CALL_SUCCEEDED"
+    | "LLM_CALL_FAILED"
+    | "DEMO_RULES_FALLBACK";
+  llm_execution_label_vi: string;
+  last_llm_succeeded_at: string | null;
+  last_llm_failed_at: string | null;
+  last_llm_error: string | null;
+  llm_calls_count: number;
+  llm_tokens_used: number;
+  llm_budget_calls: number;
+  llm_budget_tokens: number;
+  queue_depth: number;
+  active_cases_count: number;
+  total_cases_count: number;
+  waiting_approvals_count: number;
+  jobs_processed_count: number;
+  monitoring_note_vi: string;
+  updated_at: string;
+};
+
+export type SupervisorActivityItem = {
+  id: string;
+  seq: number;
+  session_id: string;
+  world_epoch: number;
+  challenge_id: string | null;
+  case_id: string | null;
+  job_id: string | null;
+  run_id: string | null;
+  kind: string;
+  title_vi: string;
+  detail_vi: string | null;
+  metadata_json: JsonObject;
+  created_at: string;
+};
+
+export type ChallengePreset = {
+  preset_id: string;
+  label_vi: string;
+  description_vi: string;
+  defaults: JsonObject;
+};
+
+export type ChallengeCatalogItem = {
+  challenge_type:
+    | "SUSPICIOUS_RECEIPT"
+    | "TRAFFIC_BURST"
+    | "DUPLICATE_REFUND"
+    | "BULK_ORDER_SYNC"
+    | "PROMPT_INJECTION";
+  title_vi: string;
+  subtitle_vi: string;
+  is_advanced: boolean;
+  presets: ChallengePreset[];
+};
+
+export type ChallengeRunRecord = {
+  id: string;
+  session_id: string;
+  world_epoch: number;
+  challenge_type: string;
+  preset_id: string;
+  title_vi: string;
+  status: string;
+  status_label_vi: string;
+  input_json: JsonObject;
+  generated_refs_json: JsonObject;
+  linked_case_ids: string[];
+  linked_incident_ids: string[];
+  agent_run_ids: string[];
+  outcome_json: JsonObject;
+  safety_verdict: string;
+  source_mode: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ApprovalInboxItem = {
+  proposal_id: string;
+  case_id: string;
+  case_goal: string;
+  case_state: string;
+  action_type: string;
+  action_label_vi: string;
+  summary_vi: string;
+  params_json: JsonObject;
+  evidence_refs: string[];
+  risk_level: string;
+  expected_version: number;
+  status: string;
+  created_at: string;
+};
+
+export type MissionControlOverview = {
+  supervisor: SupervisorStatus;
+  latest_challenge: ChallengeRunRecord | null;
+  recent_challenges: ChallengeRunRecord[];
+  activities: SupervisorActivityItem[];
+  approval_inbox: ApprovalInboxItem[];
+  latest_seq: number;
+};
+
 type RequestOptions = {
   session?: DemoSession;
   method?: "GET" | "POST";

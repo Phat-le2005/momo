@@ -23,13 +23,15 @@ Trong thực tế bán hàng online (đặc biệt các đợt Flash Sale / Mega
 
 ## Các chức năng nổi bật
 
-### 1. Trang trải nghiệm nhanh (`/demo`)
-- Cho phép tạo phiên dùng thử tách biệt ngay trên trình duyệt, không cần đăng nhập.
-- Cung cấp sẵn **3 kịch bản thực tế** để bấm chạy thử ngay:
-  - **Thanh toán chưa cập nhật**: Giao dịch đã thành công nhưng đơn hàng vẫn chờ đồng bộ.
-  - **Yêu cầu hoàn tiền bất thường**: Phân biệt giữa yêu cầu hoàn tiền một phần hợp lệ và yêu cầu hoàn tiền trùng lặp.
-  - **Mega Live (50–100 đơn hàng)**: Mô phỏng phiên bán hàng cao điểm có xen kẽ nhiều lỗi thực tế (nghẽn đồng bộ hàng loạt, trùng IPN, hoàn tiền lặp, tranh chấp tồn kho).
-- Hỗ trợ nhập tự do nội dung khiếu nại bằng tiếng Việt để tạo hồ sơ xử lý (Case) mới và nút reset phiên mô phỏng bất cứ lúc nào.
+### 1. Trung tâm Điều hành & Thử nghiệm Tự hành — AI Mission Control (`/demo`)
+- **AI Supervisor tự động giám sát theo sự kiện (Event-Driven Autopilot)**: Tự động phát hiện khiếu nại, hóa đơn đáng ngờ, yêu cầu hoàn tiền trùng hoặc cụm đơn hàng nghẽn đồng bộ để điều tra ngay mà không cần người dùng bấm nút điều tra thủ công cho từng hồ sơ. Khi hệ thống rảnh, AI không gọi LLM lặp vô hạn và không tiêu tốn token.
+- **Phòng thử nghiệm tình huống đối kháng (Challenge Lab)**: Cho phép tạo nhanh các tình huống kiểm thử chỉ với 1–2 thao tác:
+  - **Hóa đơn đáng ngờ**: Biên lai báo thành công nhưng không có trong sổ cái, sửa số tiền trên hóa đơn, dùng biên lai của đơn hàng khác hoặc giao dịch đã hoàn tiền.
+  - **Request tăng đột biến**: Mô phỏng đợt lưu lượng tăng cao trong giới hạn an toàn, đo lường số request được nhận, bị chặn trùng lặp hoặc bị giới hạn tốc độ (Rate Limit) và để AI phân tích số liệu tổng hợp.
+  - **Hoàn tiền trùng**: Phân biệt giữa yêu cầu hoàn tiền lặp/vượt số dư bị chặn (`HOLD_ACTION`) và yêu cầu hoàn tiền một phần hợp lệ.
+  - **Nghẽn đơn hàng**: Mô phỏng cụm đơn hàng đã thanh toán nhưng lỗi đồng bộ tại cùng một worker, tự động gom `Incident`, kích hoạt `Taskforce` và đưa đề xuất vào hộp thư chờ duyệt.
+  - **Tấn công Prompt Injection**: Kiểm thử khả năng kháng các câu lệnh giả mạo quyền hệ thống trong nội dung khiếu nại.
+- **Dòng thời gian hoạt động Agent & Hộp thư phê duyệt của con người**: Hiển thị trực tiếp các công cụ đọc dữ liệu AI vừa gọi, bằng chứng thu thập được và danh sách các đề xuất (`ActionProposal`) đang chờ con người phê duyệt trước khi thực thi và kiểm chứng hậu điều kiện (`Verifier`).
 
 ### 2. Trung tâm xử lý hồ sơ — Case Center (`/cases`)
 - **Điều tra dựa trên bằng chứng**: Phân tách rõ giữa *lời khai của khách hàng (`CLAIM`)*, *dữ liệu đối chiếu thực tế từ hệ thống (`OBSERVED_FACT`)* và *các điểm chưa rõ (`UNKNOWN`)*.
