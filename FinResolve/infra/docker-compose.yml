@@ -113,5 +113,88 @@ services:
       start_period: 20s
       retries: 10
 
+  # --- Independent FinShop LIVE Commerce Stack (Prompt 10) ---
+  commerce-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${COMMERCE_POSTGRES_DB:-finshop_commerce}
+      POSTGRES_USER: ${COMMERCE_POSTGRES_USER:-finshop}
+      POSTGRES_PASSWORD: ${COMMERCE_POSTGRES_PASSWORD:-change-me-commerce-local}
+    ports:
+      - "${COMMERCE_POSTGRES_PORT:-5434}:5432"
+    volumes:
+      - finshop_commerce_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  commerce-api:
+    build:
+      context: ../commerce/backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      COMMERCE_APP_ENV: docker
+      COMMERCE_DATABASE_URL: postgresql+psycopg://${COMMERCE_POSTGRES_USER:-finshop}:${COMMERCE_POSTGRES_PASSWORD:-change-me-commerce-local}@commerce-db:5432/${COMMERCE_POSTGRES_DB:-finshop_commerce}
+      COMMERCE_WEB_ORIGIN: ${COMMERCE_WEB_ORIGIN:-http://localhost:3100}
+      COMMERCE_SOURCE_MODE: MOCK
+      COMMERCE_AUTH_SECRET: ${COMMERCE_AUTH_SECRET:?COMMERCE_AUTH_SECRET must be set to a strong random >=32-char secret}
+      COMMERCE_SERVICE_API_KEY: ${COMMERCE_SERVICE_API_KEY:?COMMERCE_SERVICE_API_KEY must be set to a strong random >=32-char secret}
+    ports:
+      - "${COMMERCE_API_PORT:-8100}:8100"
+    depends_on:
+      commerce-db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8100/readyz', timeout=4).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+
+  commerce-worker:
+    build:
+      context: ../commerce/backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.worker"]
+    restart: unless-stopped
+    environment:
+      COMMERCE_APP_ENV: docker
+      COMMERCE_DATABASE_URL: postgresql+psycopg://${COMMERCE_POSTGRES_USER:-finshop}:${COMMERCE_POSTGRES_PASSWORD:-change-me-commerce-local}@commerce-db:5432/${COMMERCE_POSTGRES_DB:-finshop_commerce}
+      COMMERCE_WEB_ORIGIN: ${COMMERCE_WEB_ORIGIN:-http://localhost:3100}
+      COMMERCE_SOURCE_MODE: MOCK
+      COMMERCE_AUTH_SECRET: ${COMMERCE_AUTH_SECRET:?COMMERCE_AUTH_SECRET must be set to a strong random >=32-char secret}
+      COMMERCE_SERVICE_API_KEY: ${COMMERCE_SERVICE_API_KEY:?COMMERCE_SERVICE_API_KEY must be set to a strong random >=32-char secret}
+    depends_on:
+      commerce-api:
+        condition: service_healthy
+
+  commerce-web:
+    build:
+      context: ../commerce/frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_COMMERCE_API_BASE_URL: ${NEXT_PUBLIC_COMMERCE_API_BASE_URL:-http://localhost:8100}
+    restart: unless-stopped
+    ports:
+      - "${COMMERCE_WEB_PORT:-3100}:3100"
+    depends_on:
+      commerce-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3100/ > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+
 volumes:
   finresolve_pgdata:
+  finshop_commerce_pgdata:

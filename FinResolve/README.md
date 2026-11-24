@@ -83,3 +83,21 @@ python -m app.supervisor.worker
 cd FinResolve/frontend
 npm run dev
 ```
+
+### 3. FinShop LIVE — Cửa hàng & Live Commerce độc lập (`FinResolve/commerce/`)
+`infra/docker-compose.yml` cũng tích hợp đầy đủ 4 dịch vụ độc lập của FinShop LIVE (`commerce-db` cổng `5434`, `commerce-api` cổng `8100`, `commerce-worker`, và `commerce-web` cổng `3100`). Chạy cục bộ:
+
+```powershell
+# Commerce Backend API (cổng 8100)
+cd FinResolve/commerce/backend
+alembic upgrade head
+uvicorn app.main:app --host 127.0.0.1 --port 8100
+
+# Commerce Background Worker (đồng bộ đơn, hết hạn giữ chỗ, outbox)
+cd FinResolve/commerce/backend
+python -m app.worker
+
+# Commerce Frontend — FinShop LIVE Storefront & Merchant Center (cổng 3100)
+cd FinResolve/commerce/frontend
+npm run dev
+```

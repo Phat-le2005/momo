@@ -1,0 +1,847 @@
+"""Merchant Center API routes (desktop-first seller dashboard) for FinShop LIVE."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from fastapi import APIRouter, Depends, Query, status
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, selectinload
+
+from app.core.auth import MerchantPrincipal, get_current_merchant, issue_merchant_token
+from app.core.config import get_settings
+from app.core.errors import CommerceError, ErrorCode
+from app.db.session import get_db
+from app.models.entities import (
+    CommerceEvent,
+    Complaint,
+    EventOutbox,
+    Inventory,
+    LiveProduct,
+    LiveSession,
+    Order,
+    Payment,
+    Product,
+    ProductVariant,
+    RefundRequest,
+    Voucher,
+)
+from app.models.enums import (
+    OrderStatus,
+    PaymentStatus,
+    RefundRequestStatus,
+    can_transition_order,
+)
+from app.payments.adapter import MockPaymentAdapter
+from app.schemas.commerce import (
+    CommerceEventItemResponse,
+    ComplaintResponse,
+    MerchantAdjustInventoryRequest,
+    MerchantCreateProductRequest,
+    MerchantCreateVariantRequest,
+    MerchantCreateVoucherRequest,
+    MerchantRefundDecisionRequest,
+    MerchantUpdateComplaintRequest,
+    MerchantUpdateLiveProductRequest,
+    MerchantUpdateOrderStatusRequest,
+    MerchantUpdateProductRequest,
+    OrderResponse,
+    PaymentResponse,
+    ProductResponse,
+    RefundRequestResponse,
+    VoucherResponse,
+)
+from app.services.events import record_commerce_event
+from app.services.seed import (
+    DEFAULT_MERCHANT_ID,
+    DEFAULT_SESSION_ID,
+    seed_commerce_data,
+)
+from app.services.sync import sync_confirmed_payments_to_orders
+
+router = APIRouter(prefix="/merchant", tags=["merchant"])
+
+
+@router.post(
+    "/session",
+    summary="Issue server-signed Merchant token for local MOCK Merchant Center",
+)
+def create_merchant_demo_session(db: Session = Depends(get_db)) -> dict[str, Any]:
+    if get_settings().source_mode != "MOCK":
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "Demo merchant session issuance is restricted to SOURCE_MODE=MOCK",
+            status_code=403,
+        )
+    seed_commerce_data(db)
+    token = issue_merchant_token(
+        merchant_id=DEFAULT_MERCHANT_ID,
+        commerce_session_id=DEFAULT_SESSION_ID,
+        role="MERCHANT_OWNER",
+        operator_id="merchant_finshop_owner",
+    )
+    return {
+        "merchant_id": DEFAULT_MERCHANT_ID,
+        "commerce_session_id": DEFAULT_SESSION_ID,
+        "role": "MERCHANT_OWNER",
+        "merchant_token": token,
+        "source_mode": "MOCK",
+    }
+
+
+@router.get("/overview", summary="Real database-derived merchant operational metrics")
+def get_merchant_overview(
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    mid = principal.merchant_id
+    confirmed_revenue_vnd = int(
+        db.scalar(
+            select(
+                func.coalesce(func.sum(Payment.amount_vnd - Payment.refunded_amount_vnd), 0)
+            ).where(
+                Payment.merchant_id == mid,
+                Payment.status.in_(
+                    [
+                        PaymentStatus.SUCCEEDED.value,
+                        PaymentStatus.PARTIALLY_REFUNDED.value,
+                        PaymentStatus.REFUNDED.value,
+                    ]
+                ),
+            )
+        )
+        or 0
+    )
+    order_count = int(db.scalar(select(func.count(Order.id)).where(Order.merchant_id == mid)) or 0)
+    pending_payments = int(
+        db.scalar(
+            select(func.count(Payment.id)).where(
+                Payment.merchant_id == mid,
+                Payment.status.in_([PaymentStatus.INITIATED.value, PaymentStatus.PENDING.value]),
+            )
+        )
+        or 0
+    )
+    pending_fulfillment = int(
+        db.scalar(
+            select(func.count(Order.id)).where(
+                Order.merchant_id == mid,
+                Order.status.in_([OrderStatus.CONFIRMED.value, OrderStatus.PROCESSING.value]),
+            )
+        )
+        or 0
+    )
+    refund_requests = int(
+        db.scalar(
+            select(func.count(RefundRequest.id)).where(
+                RefundRequest.merchant_id == mid,
+                RefundRequest.status == RefundRequestStatus.REQUESTED.value,
+            )
+        )
+        or 0
+    )
+    open_complaints = int(
+        db.scalar(
+            select(func.count(Complaint.id)).where(
+                Complaint.merchant_id == mid,
+                Complaint.status.in_(["OPEN", "UNDER_REVIEW"]),
+            )
+        )
+        or 0
+    )
+    invs = list(db.scalars(select(Inventory).where(Inventory.merchant_id == mid)).all())
+    total_available_inventory = sum(i.available_qty for i in invs)
+    low_stock_count = sum(1 for i in invs if i.available_qty <= i.low_stock_threshold)
+
+    live_orders = int(
+        db.scalar(
+            select(func.count(Order.id)).where(
+                Order.merchant_id == mid, Order.live_session_id.is_not(None)
+            )
+        )
+        or 0
+    )
+    unsynced_payments = int(
+        db.scalar(
+            select(func.count(Payment.id)).where(
+                Payment.merchant_id == mid,
+                Payment.status == PaymentStatus.SUCCEEDED.value,
+                Payment.is_synced_to_order.is_(False),
+            )
+        )
+        or 0
+    )
+
+    return {
+        "merchant_id": mid,
+        "commerce_session_id": principal.commerce_session_id,
+        "source_mode": "MOCK",
+        "metrics_note_vi": (
+            "Toàn bộ số liệu được truy vấn trực tiếp từ PostgreSQL (dữ liệu thử nghiệm MOCK)."
+        ),
+        "confirmed_revenue_vnd": confirmed_revenue_vnd,
+        "order_count": order_count,
+        "pending_payments": pending_payments,
+        "pending_fulfillment": pending_fulfillment,
+        "unsynced_payments": unsynced_payments,
+        "refund_requests": refund_requests,
+        "open_complaints": open_complaints,
+        "total_available_inventory": total_available_inventory,
+        "low_stock_products_count": low_stock_count,
+        "live_session_orders_count": live_orders,
+    }
+
+
+@router.get("/products", response_model=list[ProductResponse])
+def merchant_list_products(
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> list[ProductResponse]:
+    from app.api.storefront import _serialize_product
+
+    rows = list(
+        db.scalars(
+            select(Product)
+            .options(selectinload(Product.variants).selectinload(ProductVariant.inventory))
+            .where(Product.merchant_id == principal.merchant_id)
+            .order_by(Product.created_at.desc())
+        ).all()
+    )
+    return [_serialize_product(db, p) for p in rows]
+
+
+@router.post("/products", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
+def merchant_create_product(
+    payload: MerchantCreateProductRequest,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> ProductResponse:
+    from app.api.storefront import _serialize_product
+
+    pid = f"PROD-{uuid.uuid4().hex[:8].upper()}"
+    vid = f"VAR-{uuid.uuid4().hex[:8].upper()}"
+    slug = f"{payload.sku.lower()}-{uuid.uuid4().hex[:4]}"
+    prod = Product(
+        id=pid,
+        merchant_id=principal.merchant_id,
+        slug=slug,
+        title=payload.title.strip(),
+        category=payload.category.strip(),
+        description=payload.description.strip(),
+        image_urls_json=[payload.image_url.strip()],
+        is_featured=payload.is_featured,
+        is_active=True,
+        is_test_data=True,
+    )
+    db.add(prod)
+    db.flush()
+
+    var = ProductVariant(
+        id=vid,
+        product_id=pid,
+        merchant_id=principal.merchant_id,
+        sku=payload.sku.strip().upper(),
+        title=payload.variant_title.strip(),
+        price_vnd=payload.price_vnd,
+        compare_at_price_vnd=payload.compare_at_price_vnd,
+        image_url=payload.image_url.strip(),
+        is_active=True,
+    )
+    db.add(var)
+    db.flush()
+
+    db.add(
+        Inventory(
+            id=f"INV-{vid}",
+            variant_id=vid,
+            merchant_id=principal.merchant_id,
+            on_hand_qty=payload.initial_stock,
+            reserved_qty=0,
+            low_stock_threshold=5,
+            version=1,
+        )
+    )
+    record_commerce_event(
+        db,
+        merchant_id=principal.merchant_id,
+        commerce_session_id=principal.commerce_session_id,
+        world_epoch=principal.world_epoch,
+        event_type="INVENTORY_UPDATED",
+        payload={"product_id": pid, "variant_id": vid, "on_hand_qty": payload.initial_stock},
+    )
+    db.commit()
+    loaded = db.scalar(
+        select(Product)
+        .options(selectinload(Product.variants).selectinload(ProductVariant.inventory))
+        .where(Product.id == pid)
+    )
+    assert loaded is not None  # noqa: S101
+    return _serialize_product(db, loaded)
+
+
+@router.patch("/products/{product_id}", response_model=ProductResponse)
+def merchant_update_product(
+    product_id: str,
+    payload: MerchantUpdateProductRequest,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> ProductResponse:
+    from app.api.storefront import _serialize_product
+
+    prod = db.scalar(
+        select(Product)
+        .options(selectinload(Product.variants).selectinload(ProductVariant.inventory))
+        .where(Product.id == product_id, Product.merchant_id == principal.merchant_id)
+    )
+    if prod is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Product not found", status_code=404)
+    if payload.title is not None:
+        prod.title = payload.title.strip()
+    if payload.category is not None:
+        prod.category = payload.category.strip()
+    if payload.description is not None:
+        prod.description = payload.description.strip()
+    if payload.is_featured is not None:
+        prod.is_featured = payload.is_featured
+    if payload.is_active is not None:
+        prod.is_active = payload.is_active
+    db.commit()
+    db.refresh(prod)
+    return _serialize_product(db, prod)
+
+
+@router.post("/products/{product_id}/variants", status_code=status.HTTP_201_CREATED)
+def merchant_add_variant(
+    product_id: str,
+    payload: MerchantCreateVariantRequest,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    prod = db.scalar(
+        select(Product).where(
+            Product.id == product_id, Product.merchant_id == principal.merchant_id
+        )
+    )
+    if prod is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Product not found", status_code=404)
+    vid = f"VAR-{uuid.uuid4().hex[:8].upper()}"
+    var = ProductVariant(
+        id=vid,
+        product_id=prod.id,
+        merchant_id=principal.merchant_id,
+        sku=payload.sku.strip().upper(),
+        title=payload.title.strip(),
+        price_vnd=payload.price_vnd,
+        compare_at_price_vnd=payload.compare_at_price_vnd,
+        image_url=(prod.image_urls_json[0] if prod.image_urls_json else ""),
+        is_active=True,
+    )
+    db.add(var)
+    db.flush()
+    db.add(
+        Inventory(
+            id=f"INV-{vid}",
+            variant_id=vid,
+            merchant_id=principal.merchant_id,
+            on_hand_qty=payload.initial_stock,
+            reserved_qty=0,
+            low_stock_threshold=5,
+            version=1,
+        )
+    )
+    db.commit()
+    return {"variant_id": vid, "sku": var.sku, "on_hand_qty": payload.initial_stock}
+
+
+@router.patch("/inventory/{variant_id}")
+def merchant_adjust_inventory(
+    variant_id: str,
+    payload: MerchantAdjustInventoryRequest,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    inv = db.scalar(
+        select(Inventory)
+        .where(Inventory.variant_id == variant_id, Inventory.merchant_id == principal.merchant_id)
+        .with_for_update()
+    )
+    if inv is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Inventory record not found", status_code=404)
+    if payload.on_hand_qty < inv.reserved_qty:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            (
+                f"Tồn kho mới ({payload.on_hand_qty}) không được nhỏ hơn "
+                f"số lượng đang giữ chỗ ({inv.reserved_qty})"
+            ),
+            status_code=409,
+        )
+    prev = inv.on_hand_qty
+    inv.on_hand_qty = payload.on_hand_qty
+    if payload.low_stock_threshold is not None:
+        inv.low_stock_threshold = payload.low_stock_threshold
+    inv.version += 1
+    inv.updated_at = datetime.now(UTC)
+
+    record_commerce_event(
+        db,
+        merchant_id=principal.merchant_id,
+        commerce_session_id=principal.commerce_session_id,
+        world_epoch=principal.world_epoch,
+        event_type="INVENTORY_UPDATED",
+        payload={
+            "variant_id": variant_id,
+            "previous_on_hand_qty": prev,
+            "new_on_hand_qty": inv.on_hand_qty,
+            "available_qty": inv.available_qty,
+        },
+    )
+    db.commit()
+    return {
+        "variant_id": inv.variant_id,
+        "on_hand_qty": inv.on_hand_qty,
+        "reserved_qty": inv.reserved_qty,
+        "available_qty": inv.available_qty,
+        "low_stock_threshold": inv.low_stock_threshold,
+    }
+
+
+@router.get("/orders", response_model=list[OrderResponse])
+def merchant_list_orders(
+    status_filter: str | None = Query(default=None, alias="status"),
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> list[OrderResponse]:
+    from app.api.storefront import _to_order_response
+
+    stmt = (
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.payments))
+        .where(Order.merchant_id == principal.merchant_id)
+        .order_by(Order.created_at.desc())
+        .limit(100)
+    )
+    if status_filter and status_filter.strip():
+        stmt = stmt.where(Order.status == status_filter.strip().upper())
+    return [_to_order_response(o) for o in db.scalars(stmt).all()]
+
+
+@router.patch("/orders/{order_id}/status", response_model=OrderResponse)
+def merchant_update_order_status(
+    order_id: str,
+    payload: MerchantUpdateOrderStatusRequest,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> OrderResponse:
+    from app.api.storefront import _to_order_response
+
+    order = db.scalar(
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.payments))
+        .where(Order.id == order_id, Order.merchant_id == principal.merchant_id)
+        .with_for_update()
+    )
+    if order is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Order not found", status_code=404)
+
+    curr = OrderStatus(order.status)
+    try:
+        target = OrderStatus(payload.status.strip().upper())
+    except ValueError as err:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST, f"Invalid status '{payload.status}'", status_code=400
+        ) from err
+
+    if not can_transition_order(curr, target):
+        raise CommerceError(
+            ErrorCode.INVALID_STATE_TRANSITION,
+            f"Invalid order transition: {curr.value} -> {target.value}",
+            status_code=409,
+        )
+    if target in (OrderStatus.PROCESSING, OrderStatus.SHIPPED, OrderStatus.DELIVERED):
+        if order.payment_status not in (
+            PaymentStatus.SUCCEEDED.value,
+            PaymentStatus.PARTIALLY_REFUNDED.value,
+        ):
+            raise CommerceError(
+                ErrorCode.CONFLICT,
+                (
+                    "PAYMENT_REQUIRED_BEFORE_FULFILLMENT: "
+                    "Không thể giao hàng khi thanh toán chưa SUCCEEDED"
+                ),
+                status_code=409,
+            )
+
+    order.status = target.value
+    order.version += 1
+    order.updated_at = datetime.now(UTC)
+    record_commerce_event(
+        db,
+        merchant_id=order.merchant_id,
+        commerce_session_id=order.commerce_session_id,
+        world_epoch=order.world_epoch,
+        event_type="ORDER_UPDATED",
+        order_id=order.id,
+        correlation_id=order.correlation_id,
+        payload={
+            "previous_status": curr.value,
+            "new_status": target.value,
+            "actor": f"merchant:{principal.operator_id}",
+        },
+    )
+    db.commit()
+    db.refresh(order)
+    return _to_order_response(order)
+
+
+@router.get("/payments", response_model=list[PaymentResponse])
+def merchant_list_payments(
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> list[PaymentResponse]:
+    from app.api.storefront import _to_payment_response
+
+    rows = list(
+        db.scalars(
+            select(Payment)
+            .where(Payment.merchant_id == principal.merchant_id)
+            .order_by(Payment.created_at.desc())
+            .limit(100)
+        ).all()
+    )
+    return [_to_payment_response(p) for p in rows]
+
+
+@router.post("/payments/sync-now")
+def merchant_sync_payments_now(
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> dict[str, int]:
+    _ = principal
+    synced = sync_confirmed_payments_to_orders(db, limit=50)
+    return {"synced_orders": synced}
+
+
+@router.get("/refunds", response_model=list[RefundRequestResponse])
+def merchant_list_refunds(
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> list[RefundRequestResponse]:
+    rows = list(
+        db.scalars(
+            select(RefundRequest)
+            .where(RefundRequest.merchant_id == principal.merchant_id)
+            .order_by(RefundRequest.created_at.desc())
+            .limit(100)
+        ).all()
+    )
+    return [
+        RefundRequestResponse(
+            id=r.id,
+            order_id=r.order_id,
+            payment_id=r.payment_id,
+            customer_id=r.customer_id,
+            requested_amount_vnd=r.requested_amount_vnd,
+            reason=r.reason,
+            status=r.status,
+            merchant_note=r.merchant_note,
+            created_at=r.created_at,
+            updated_at=r.updated_at,
+        )
+        for r in rows
+    ]
+
+
+@router.post("/refunds/{refund_request_id}/decision")
+def merchant_decide_refund(
+    refund_request_id: str,
+    payload: MerchantRefundDecisionRequest,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    req = db.scalar(
+        select(RefundRequest)
+        .where(
+            RefundRequest.id == refund_request_id,
+            RefundRequest.merchant_id == principal.merchant_id,
+        )
+        .with_for_update()
+    )
+    if req is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Refund request not found", status_code=404)
+    if req.status != RefundRequestStatus.REQUESTED.value:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            f"Refund request already decided (status={req.status})",
+            status_code=409,
+        )
+
+    req.merchant_note = payload.merchant_note.strip()
+    if payload.decision == "REJECT":
+        req.status = RefundRequestStatus.REJECTED.value
+        req.updated_at = datetime.now(UTC)
+        db.commit()
+        return {"refund_request_id": req.id, "status": req.status, "refund_transaction_id": None}
+
+    adapter = MockPaymentAdapter()
+    txn = adapter.request_refund(
+        db,
+        refund_request=req,
+        idempotency_key=f"IDEMP-REF-{req.id}",
+    )
+    return {
+        "refund_request_id": req.id,
+        "status": req.status,
+        "refund_transaction_id": txn.id,
+        "provider_refund_ref": txn.provider_refund_ref,
+        "amount_vnd": txn.amount_vnd,
+    }
+
+
+@router.get("/vouchers", response_model=list[VoucherResponse])
+def merchant_list_vouchers(
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> list[VoucherResponse]:
+    rows = list(
+        db.scalars(
+            select(Voucher)
+            .where(Voucher.merchant_id == principal.merchant_id)
+            .order_by(Voucher.created_at.desc())
+        ).all()
+    )
+    return [
+        VoucherResponse(
+            id=v.id,
+            code=v.code,
+            title=v.title,
+            discount_type=v.discount_type,
+            discount_value=v.discount_value,
+            max_discount_vnd=v.max_discount_vnd,
+            min_order_vnd=v.min_order_vnd,
+            usage_limit=v.usage_limit,
+            used_count=v.used_count,
+            per_customer_limit=v.per_customer_limit,
+            starts_at=v.starts_at,
+            ends_at=v.ends_at,
+            is_active=v.is_active,
+        )
+        for v in rows
+    ]
+
+
+@router.post("/vouchers", response_model=VoucherResponse, status_code=status.HTTP_201_CREATED)
+def merchant_create_voucher(
+    payload: MerchantCreateVoucherRequest,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> VoucherResponse:
+    now = datetime.now(UTC)
+    v = Voucher(
+        id=f"VCH-{uuid.uuid4().hex[:8].upper()}",
+        merchant_id=principal.merchant_id,
+        code=payload.code.strip().upper(),
+        title=payload.title.strip(),
+        discount_type=payload.discount_type,
+        discount_value=payload.discount_value,
+        max_discount_vnd=payload.max_discount_vnd,
+        min_order_vnd=payload.min_order_vnd,
+        usage_limit=payload.usage_limit,
+        used_count=0,
+        per_customer_limit=payload.per_customer_limit,
+        starts_at=now - timedelta(minutes=1),
+        ends_at=now + timedelta(days=payload.duration_days),
+        is_active=True,
+    )
+    db.add(v)
+    db.commit()
+    db.refresh(v)
+    return VoucherResponse(
+        id=v.id,
+        code=v.code,
+        title=v.title,
+        discount_type=v.discount_type,
+        discount_value=v.discount_value,
+        max_discount_vnd=v.max_discount_vnd,
+        min_order_vnd=v.min_order_vnd,
+        usage_limit=v.usage_limit,
+        used_count=v.used_count,
+        per_customer_limit=v.per_customer_limit,
+        starts_at=v.starts_at,
+        ends_at=v.ends_at,
+        is_active=v.is_active,
+    )
+
+
+@router.patch("/live/{live_id}/products/{live_product_id}")
+def merchant_update_live_product(
+    live_id: str,
+    live_product_id: str,
+    payload: MerchantUpdateLiveProductRequest,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    live = db.scalar(
+        select(LiveSession).where(
+            LiveSession.id == live_id, LiveSession.merchant_id == principal.merchant_id
+        )
+    )
+    if live is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "LiveSession not found", status_code=404)
+    lp = db.scalar(
+        select(LiveProduct).where(
+            LiveProduct.id == live_product_id, LiveProduct.live_session_id == live.id
+        )
+    )
+    if lp is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "LiveProduct not found", status_code=404)
+
+    now = datetime.now(UTC)
+    if payload.is_pinned is True:
+        others = list(
+            db.scalars(select(LiveProduct).where(LiveProduct.live_session_id == live.id)).all()
+        )
+        for o in others:
+            o.is_pinned = o.id == lp.id
+    elif payload.is_pinned is False:
+        lp.is_pinned = False
+
+    if payload.flash_sale_price_vnd is not None:
+        lp.flash_sale_price_vnd = payload.flash_sale_price_vnd
+    if payload.flash_sale_stock_limit is not None:
+        lp.flash_sale_stock_limit = payload.flash_sale_stock_limit
+    if payload.flash_sale_duration_minutes is not None:
+        lp.flash_sale_starts_at = now
+        lp.flash_sale_ends_at = now + timedelta(minutes=payload.flash_sale_duration_minutes)
+        record_commerce_event(
+            db,
+            merchant_id=principal.merchant_id,
+            commerce_session_id=principal.commerce_session_id,
+            world_epoch=principal.world_epoch,
+            event_type="FLASH_SALE_STARTED",
+            payload={
+                "live_session_id": live.id,
+                "live_product_id": lp.id,
+                "variant_id": lp.variant_id,
+                "flash_sale_price_vnd": lp.flash_sale_price_vnd,
+                "flash_sale_stock_limit": lp.flash_sale_stock_limit,
+            },
+        )
+    db.commit()
+    return {
+        "live_product_id": lp.id,
+        "is_pinned": lp.is_pinned,
+        "flash_sale_price_vnd": lp.flash_sale_price_vnd,
+        "flash_sale_stock_limit": lp.flash_sale_stock_limit,
+    }
+
+
+@router.get("/complaints", response_model=list[ComplaintResponse])
+def merchant_list_complaints(
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> list[ComplaintResponse]:
+    rows = list(
+        db.scalars(
+            select(Complaint)
+            .where(Complaint.merchant_id == principal.merchant_id)
+            .order_by(Complaint.created_at.desc())
+            .limit(100)
+        ).all()
+    )
+    return [
+        ComplaintResponse(
+            id=c.id,
+            order_id=c.order_id,
+            customer_id=c.customer_id,
+            category=c.category,
+            description=c.description,
+            claimed_receipt_ref=c.claimed_receipt_ref,
+            evidence_kind=c.evidence_kind,
+            status=c.status,
+            merchant_response=c.merchant_response,
+            created_at=c.created_at,
+            updated_at=c.updated_at,
+        )
+        for c in rows
+    ]
+
+
+@router.patch("/complaints/{complaint_id}", response_model=ComplaintResponse)
+def merchant_update_complaint(
+    complaint_id: str,
+    payload: MerchantUpdateComplaintRequest,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> ComplaintResponse:
+    comp = db.scalar(
+        select(Complaint).where(
+            Complaint.id == complaint_id, Complaint.merchant_id == principal.merchant_id
+        )
+    )
+    if comp is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Complaint not found", status_code=404)
+    comp.status = payload.status
+    comp.merchant_response = payload.merchant_response.strip()
+    comp.updated_at = datetime.now(UTC)
+    db.commit()
+    db.refresh(comp)
+    return ComplaintResponse(
+        id=comp.id,
+        order_id=comp.order_id,
+        customer_id=comp.customer_id,
+        category=comp.category,
+        description=comp.description,
+        claimed_receipt_ref=comp.claimed_receipt_ref,
+        evidence_kind=comp.evidence_kind,
+        status=comp.status,
+        merchant_response=comp.merchant_response,
+        created_at=comp.created_at,
+        updated_at=comp.updated_at,
+    )
+
+
+@router.get("/events", response_model=list[CommerceEventItemResponse])
+def merchant_list_events(
+    limit: int = Query(default=60, ge=1, le=200),
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> list[CommerceEventItemResponse]:
+    events = list(
+        db.scalars(
+            select(CommerceEvent)
+            .where(CommerceEvent.merchant_id == principal.merchant_id)
+            .order_by(CommerceEvent.occurred_at.desc())
+            .limit(limit)
+        ).all()
+    )
+    ev_ids = [e.id for e in events]
+    outbox_map: dict[str, EventOutbox] = {}
+    if ev_ids:
+        for ob in db.scalars(
+            select(EventOutbox).where(EventOutbox.commerce_event_id.in_(ev_ids))
+        ).all():
+            outbox_map[ob.commerce_event_id] = ob
+    return [
+        CommerceEventItemResponse(
+            id=e.id,
+            event_id=e.event_id,
+            event_type=e.event_type,
+            source=e.source,
+            merchant_id=e.merchant_id,
+            commerce_session_id=e.commerce_session_id,
+            world_epoch=e.world_epoch,
+            order_id=e.order_id,
+            payment_id=e.payment_id,
+            correlation_id=e.correlation_id,
+            occurred_at=e.occurred_at,
+            payload_json=dict(e.payload_json or {}),
+            outbox_status=outbox_map[e.id].status if e.id in outbox_map else None,
+            finresolve_mapped_type=(
+                outbox_map[e.id].finresolve_mapped_type if e.id in outbox_map else None
+            ),
+        )
+        for e in events
+    ]

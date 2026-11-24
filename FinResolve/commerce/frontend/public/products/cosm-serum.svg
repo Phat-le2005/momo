@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600">
+  <rect width="600" height="600" rx="36" fill="#fdf2f8"/>
+  <circle cx="300" cy="245" r="120" fill="#db2777" fill-opacity="0.12"/>
+  <rect x="210" y="155" width="180" height="180" rx="28" fill="#db2777" fill-opacity="0.18" stroke="#db2777" stroke-width="6"/>
+  <circle cx="300" cy="245" r="46" fill="#db2777"/>
+  <text x="300" y="256" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="28" font-weight="800" fill="#ffffff">FS</text>
+  <text x="300" y="425" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="28" font-weight="800" fill="#db2777">SERUM B5 + HA</text>
+  <text x="300" y="468" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="600" fill="#64748b">My pham · Test Data</text>
+</svg>
