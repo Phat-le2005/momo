@@ -1,11 +1,11 @@
-"""Persistent models for Autonomous Agent Supervisor and Challenge Lab (Prompt 09)."""
+"""Persistent models for Supervisor, Worker Heartbeats, and Challenge Lab (Prompt 09.1)."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -17,8 +17,33 @@ from app.models.enums import (
 )
 
 
+class SupervisorWorker(Base):
+    """Registered background Supervisor worker process with live heartbeat health tracking."""
+
+    __tablename__ = "supervisor_workers"
+
+    worker_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    worker_mode: Mapped[str] = mapped_column(String(32), default="STANDALONE", nullable=False)
+    hostname: Mapped[str] = mapped_column(String(128), default="localhost", nullable=False)
+    pid: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="IDLE", nullable=False)
+    active_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True, nullable=False
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+
 class SupervisorState(Base):
-    """Session-scoped Autonomous Agent Supervisor state and LLM execution telemetry."""
+    """Session-scoped Autonomous Agent Supervisor state and truthful LLM execution telemetry."""
 
     __tablename__ = "supervisor_states"
 
@@ -34,6 +59,7 @@ class SupervisorState(Base):
     )
     autopilot_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     world_epoch: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    activity_seq: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     active_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     active_case_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     llm_execution_state: Mapped[str] = mapped_column(
@@ -49,6 +75,12 @@ class SupervisorState(Base):
     )
     last_llm_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
     llm_calls_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_attempts_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_succeeded_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_timeout_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_fallback_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_tokens_unknown_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     llm_tokens_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     llm_budget_calls: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     llm_budget_tokens: Mapped[int] = mapped_column(Integer, default=40000, nullable=False)
@@ -65,12 +97,20 @@ class SupervisorState(Base):
 
 
 class SupervisorJob(Base):
-    """Durable PostgreSQL-backed work queue item with leases, heartbeats, and deduplication."""
+    """Durable PostgreSQL work queue item with fencing token, lease renewal, backoff, and dedupe."""
 
     __tablename__ = "supervisor_jobs"
     __table_args__ = (
         Index("ix_supervisor_jobs_session_status", "session_id", "status"),
         Index("ix_supervisor_jobs_dedupe", "session_id", "dedupe_key"),
+        Index(
+            "uq_supervisor_jobs_active_dedupe",
+            "session_id",
+            "world_epoch",
+            "dedupe_key",
+            unique=True,
+            postgresql_where=text("status IN ('QUEUED', 'RUNNING', 'CANCELLING')"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -95,10 +135,17 @@ class SupervisorJob(Base):
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     max_attempts: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
     worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     locked_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), index=True, nullable=True
     )
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True, nullable=True
+    )
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     error_message: Mapped[str | None] = mapped_column(String(1024), nullable=True)
@@ -160,7 +207,9 @@ class SupervisorActivity(Base):
     """Persisted, ordered, human-readable Agent activity event for Mission Control feed."""
 
     __tablename__ = "supervisor_activities"
-    __table_args__ = (Index("ix_supervisor_activities_session_seq", "session_id", "seq"),)
+    __table_args__ = (
+        Index("ix_supervisor_activities_session_seq", "session_id", "seq", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     seq: Mapped[int] = mapped_column(Integer, index=True, nullable=False)

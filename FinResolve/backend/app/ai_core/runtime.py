@@ -41,6 +41,13 @@ from app.ai_core.schemas import (
     ToolObservationRecord,
     is_strict_int,
 )
+from app.ai_core.telemetry import (
+    BudgetExhaustedError,
+    JobCancelledError,
+    JobSupersededError,
+    LlmInvocationRecord,
+    get_execution_context,
+)
 from app.ai_core.understanding import analyze_vietnamese_complaint
 from app.cases.state_machine import can_transition, transition_case
 from app.connectors.read_tools import ReadToolRegistry
@@ -622,6 +629,24 @@ class BoundedAgentRuntime:
                 )
                 break
 
+            exec_ctx = get_execution_context()
+            if exec_ctx is not None:
+                exec_ctx.check_guard(f"before_plan_step_{steps_executed + 1}")
+                if steps_executed == 0:
+                    exec_ctx.emit_activity(
+                        "INVESTIGATION_STARTED",
+                        f"Bắt đầu điều tra hồ sơ {case_id}",
+                        f"Mục tiêu: {case.goal[:240]}",
+                        {"case_id": case_id, "run_id": effective_run_id},
+                    )
+                elif validation_feedback:
+                    exec_ctx.emit_activity(
+                        "PLAN_REVISED",
+                        f"AI điều chỉnh kế hoạch điều tra (bước {steps_executed + 1})",
+                        validation_feedback[:240],
+                        {"case_id": case_id, "step": steps_executed + 1},
+                    )
+
             current_step_num = steps_executed + 1
             case_snapshot = self._db.scalar(
                 select(Case).where(Case.id == case_id, Case.session_id == session_id)
@@ -657,9 +682,27 @@ class BoundedAgentRuntime:
                         f"Planner case_id mismatch: expected '{case_id}', "
                         f"got '{invocation.plan.case_id}'"
                     )
+                if exec_ctx is not None and invocation.is_fallback:
+                    exec_ctx.record_llm_outcome(
+                        LlmInvocationRecord(
+                            provider=invocation.provider,
+                            model_name=invocation.model_name,
+                            succeeded=True,
+                            is_fallback=True,
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            total_tokens=0,
+                            tokens_unknown=False,
+                        )
+                    )
                 validation_feedback = None
+            except (JobCancelledError, JobSupersededError, BudgetExhaustedError):
+                raise
             except Exception as exc:  # noqa: BLE001
                 plan_error = str(exc)[:300]
+
+            if exec_ctx is not None:
+                exec_ctx.check_guard(f"after_plan_step_{current_step_num}")
 
             # Re-acquire Case in a short write transaction and validate optimistic version
             case = self._reacquire_investigating_case(
@@ -794,12 +837,32 @@ class BoundedAgentRuntime:
                         break
                     continue
 
+                if exec_ctx is not None:
+                    exec_ctx.check_guard(f"before_tool_{tool_name}")
+                    exec_ctx.emit_activity(
+                        "TOOL_INVOKED",
+                        f"AI gọi công cụ đọc dữ liệu ({tool_name})",
+                        f"Đang đối chiếu nguồn xác thực cho hồ sơ {case.id}.",
+                        {"tool_name": tool_name, "step": steps_executed},
+                    )
                 executed_tool_signatures.add(signature)
                 tool_result = tool_registry.execute(
                     tool_name,
                     tool_args,
                     simulate_timeout=simulate_timeout,
                 )
+                if exec_ctx is not None:
+                    exec_ctx.check_guard(f"after_tool_{tool_name}")
+                    exec_ctx.emit_activity(
+                        "TOOL_RESULT_RECEIVED",
+                        f"Nhận kết quả công cụ {tool_name} ({tool_result.status})",
+                        f"Nguồn: {tool_result.source} ({tool_result.source_ref})",
+                        {
+                            "tool_name": tool_name,
+                            "status": tool_result.status,
+                            "source_ref": tool_result.source_ref,
+                        },
+                    )
 
                 ev_kind = (
                     EvidenceKind.UNKNOWN.value

@@ -19,7 +19,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError, ErrorCode
@@ -45,7 +45,7 @@ from app.supervisor.service import (
     enqueue_incident_correlation_job,
     ensure_supervisor_state,
     recompute_supervisor_idle_status,
-    record_activity,
+    request_job_cancellation,
 )
 
 HARD_MAX_BURST_EVENTS = 120
@@ -323,15 +323,17 @@ def extract_mock_receipt_claim(
         "filename": filename[:120],
         "watermark_verified": True,
         "authority_level": "UNTRUSTED_CLAIM",
-        "extraction_mode": "STRUCTURED_MOCK_TEXT_PARSER",
+        "extraction_mode": "STRUCTURED_TEXT_PARSER_NOT_OCR",
+        "ocr_available": False,
         "claimed_payment_id": claimed_payment_id,
         "claimed_order_id": claimed_order_id,
         "claimed_amount": claimed_amount,
         "claimed_status": "SUCCESS",
         "raw_excerpt": raw_content.strip()[:280],
         "notice_vi": (
-            "Đã trích xuất thông tin từ biên lai MOCK / TEST. Mọi trường trích xuất chỉ được "
-            "ghi nhận là lời khai chưa xác thực (CLAIM) — AI bắt buộc phải đối chiếu với sổ cái."
+            "Đã phân tích trường văn bản từ mẫu MOCK / TEST (bộ phân tích văn bản có cấu trúc, "
+            "KHÔNG phải OCR ảnh hay xác thực ngân hàng). Mọi trường đều là lời khai chưa xác thực "
+            "(UNTRUSTED_CLAIM)."
         ),
     }
 
@@ -787,6 +789,12 @@ def _launch_traffic_burst_challenge(
 
     burst_metrics = {
         "preset_id": preset_id,
+        "metrics_source": "SIMULATED_FORMULA_ESTIMATE",
+        "is_simulated_metrics": True,
+        "disclaimer_vi": (
+            "Số liệu lưu lượng được tính theo mô hình mô phỏng cục bộ "
+            "(không phải HTTP 429 thực tế từ mạng hay độ trễ thực)."
+        ),
         "generated_events": raw_count,
         "accepted_events": accepted_events,
         "rate_limited_events": rate_limited_events,
@@ -797,11 +805,13 @@ def _launch_traffic_burst_challenge(
         "processing_outcomes": {
             "accepted": accepted_events,
             "deduplicated": duplicate_events,
-            "rate_limited_429": rate_limited_events,
+            "rate_limited_simulated": rate_limited_events,
         },
         "safety_signals": [
-            "RATE_LIMIT_GUARD_ACTIVE" if rate_limited_events > 0 else "WITHIN_RATE_QUOTA",
-            "DUPLICATE_EVENT_DEDUPLICATION_ACTIVE" if duplicate_events > 0 else "NO_DUPLICATES",
+            "SIMULATED_RATE_LIMIT_THRESHOLD_CROSSED"
+            if rate_limited_events > 0
+            else "WITHIN_SIMULATED_QUOTA",
+            "SIMULATED_DUPLICATE_EVENTS_PRESENT" if duplicate_events > 0 else "NO_DUPLICATES",
             "SINGLE_AGGREGATED_AGENT_INVESTIGATION",
         ],
     }
@@ -1355,45 +1365,47 @@ def cancel_challenge_run(
         )
 
     now = datetime.now(UTC)
-    db.execute(
-        update(SupervisorJob)
-        .where(
-            SupervisorJob.session_id == session_id,
-            SupervisorJob.challenge_id == challenge_id,
-            SupervisorJob.status.in_(
-                [SupervisorJobStatus.QUEUED.value, SupervisorJobStatus.RUNNING.value]
-            ),
-        )
-        .values(
-            status=SupervisorJobStatus.CANCELLED.value,
-            error_message="Cancelled by user from Mission Control",
-            completed_at=now,
-            updated_at=now,
-        )
+    linked_jobs = list(
+        db.scalars(
+            select(SupervisorJob).where(
+                SupervisorJob.session_id == session_id,
+                SupervisorJob.challenge_id == challenge_id,
+                SupervisorJob.status.in_(
+                    [SupervisorJobStatus.QUEUED.value, SupervisorJobStatus.RUNNING.value]
+                ),
+            )
+        ).all()
     )
+    has_running = False
+    for job in linked_jobs:
+        updated_job = request_job_cancellation(
+            db,
+            session_id=session_id,
+            job_id=job.id,
+            reason="Cancelled by user from Mission Control",
+        )
+        if updated_job.status == SupervisorJobStatus.CANCELLING.value:
+            has_running = True
+
     challenge.status = ChallengeStatus.CANCELLED.value
     challenge.safety_verdict = "CANCELLED_BY_USER"
     challenge.outcome_json = {
         **(challenge.outcome_json or {}),
         "summary_vi": (
-            "Đã dừng thử thách theo yêu cầu người dùng — "
-            "không có thay đổi tài chính nào được thực hiện."
+            "Đã gửi yêu cầu dừng hợp tác cho tác vụ đang chạy — worker sẽ dừng trước bước "
+            "tiếp theo; mọi hành động đã commit trước đó vẫn giữ nguyên dấu vết kiểm toán."
+            if has_running
+            else (
+                "Đã dừng thử thách và hủy tác vụ đang chờ — "
+                "không có thay đổi tài chính nào được thực hiện."
+            )
         ),
+        "cancellation_mode": "COOPERATIVE_RUNNING_STOP" if has_running else "IMMEDIATE_QUEUED",
         "cancelled_at": now.isoformat(),
     }
     challenge.updated_at = now
 
     state = ensure_supervisor_state(db, session_id)
-    record_activity(
-        db,
-        session_id=session_id,
-        world_epoch=state.world_epoch,
-        challenge_id=challenge.id,
-        kind="SUPERVISOR_STATE",
-        title_vi=f"Đã hủy thử thách {challenge.title_vi}",
-        detail_vi="Mọi tác vụ đang chờ của thử thách này đã được dừng an toàn.",
-        metadata_json={"challenge_id": challenge.id, "status": "CANCELLED"},
-    )
     recompute_supervisor_idle_status(db, state)
     db.commit()
     db.refresh(challenge)

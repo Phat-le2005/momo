@@ -1,4 +1,4 @@
-"""Autonomous Agent Supervisor, Challenge Lab, and Mission Control routes (Prompt 09)."""
+"""Autonomous Supervisor, Event Ingestion, and Mission Control routes (Prompt 09.1)."""
 
 from __future__ import annotations
 
@@ -13,12 +13,13 @@ from app.core.errors import AppError, ErrorCode
 from app.core.rate_limit import enforce_ai_investigation_rate_limit
 from app.core.session import get_current_session
 from app.db.session import get_db
-from app.models.actions import ActionProposal
+from app.models.actions import ActionProposal, Verification
 from app.models.cases import Case
 from app.models.enums import (
     ActionProposalStatus,
     CaseState,
     SupervisorJobStatus,
+    SupervisorStatus,
 )
 from app.models.session import DemoSession
 from app.models.supervisor import (
@@ -34,7 +35,9 @@ from app.schemas.supervisor import (
     ExtractReceiptRequest,
     LaunchChallengeRequest,
     MissionControlOverviewResponse,
+    RecentVerificationItemResponse,
     SupervisorActivityItemResponse,
+    SupervisorJobSummaryResponse,
     SupervisorStatusResponse,
 )
 from app.supervisor.challenges import (
@@ -43,17 +46,22 @@ from app.supervisor.challenges import (
     launch_challenge,
     list_challenge_catalog,
 )
+from app.supervisor.events import (
+    IngestEventResponse,
+    NormalizedBusinessEvent,
+    ingest_normalized_business_event,
+)
 from app.supervisor.service import (
-    drain_session_supervisor_jobs,
     ensure_supervisor_state,
+    get_worker_health,
     pause_supervisor,
     recompute_supervisor_idle_status,
-    recover_stale_supervisor_jobs,
+    request_job_cancellation,
     resume_supervisor,
 )
 from app.supervisor.worker import notify_supervisor_worker
 
-router = APIRouter(tags=["supervisor", "challenges"])
+router = APIRouter(tags=["supervisor", "challenges", "events"])
 
 SUPERVISOR_STATUS_LABELS_VI: dict[str, str] = {
     "MONITORING": "Đang giám sát",
@@ -61,7 +69,7 @@ SUPERVISOR_STATUS_LABELS_VI: dict[str, str] = {
     "WAITING_EVIDENCE": "Chờ bổ sung bằng chứng",
     "WAITING_APPROVAL": "Chờ con người phê duyệt",
     "PAUSED": "Tạm dừng",
-    "DEGRADED": "Suy giảm / Cảnh báo",
+    "DEGRADED": "Suy giảm / Worker ngoại tuyến",
     "STOPPED": "Đã dừng",
 }
 
@@ -71,10 +79,11 @@ LLM_EXECUTION_LABELS_VI: dict[str, str] = {
     "LLM_CALL_SUCCEEDED": "Đã gọi LLM API thành công",
     "LLM_CALL_FAILED": "Gọi LLM lỗi — đã chuyển sang DEMO_RULES an toàn",
     "DEMO_RULES_FALLBACK": "Chế độ luật xác định (DEMO_RULES — 0 LLM calls)",
+    "BUDGET_EXHAUSTED": "Đã đạt giới hạn ngân sách LLM của phiên",
 }
 
 CHALLENGE_STATUS_LABELS_VI: dict[str, str] = {
-    "QUEUED": "Đang chờ xử lý",
+    "QUEUED": "Đang chờ worker xử lý",
     "RUNNING": "AI đang điều tra",
     "COMPLETED": "Đã hoàn tất",
     "WAITING_APPROVAL": "Chờ con người phê duyệt",
@@ -89,6 +98,17 @@ def build_supervisor_status_response(
 ) -> SupervisorStatusResponse:
     recompute_supervisor_idle_status(db, state)
     settings = get_settings()
+    health = get_worker_health(db)
+    worker_healthy = bool(health["worker_healthy"])
+
+    effective_status = state.status
+    if (
+        state.autopilot_enabled
+        and not worker_healthy
+        and effective_status == SupervisorStatus.MONITORING.value
+    ):
+        # Never report MONITORING as healthy if no background worker heartbeat is fresh!
+        effective_status = SupervisorStatus.DEGRADED.value
 
     queue_depth = (
         db.scalar(
@@ -96,7 +116,11 @@ def build_supervisor_status_response(
                 SupervisorJob.session_id == state.session_id,
                 SupervisorJob.world_epoch == state.world_epoch,
                 SupervisorJob.status.in_(
-                    [SupervisorJobStatus.QUEUED.value, SupervisorJobStatus.RUNNING.value]
+                    [
+                        SupervisorJobStatus.QUEUED.value,
+                        SupervisorJobStatus.RUNNING.value,
+                        SupervisorJobStatus.CANCELLING.value,
+                    ]
                 ),
             )
         )
@@ -133,9 +157,12 @@ def build_supervisor_status_response(
 
     return SupervisorStatusResponse(
         session_id=state.session_id,
-        status=state.status,
-        status_label_vi=SUPERVISOR_STATUS_LABELS_VI.get(state.status, state.status),
+        status=effective_status,
+        status_label_vi=SUPERVISOR_STATUS_LABELS_VI.get(effective_status, effective_status),
         autopilot_enabled=state.autopilot_enabled,
+        worker_healthy=worker_healthy,
+        active_workers_count=int(health["active_workers_count"]),
+        latest_worker_heartbeat_at=health["latest_worker_heartbeat_at"],
         world_epoch=state.world_epoch,
         active_job_id=state.active_job_id,
         active_case_id=state.active_case_id,
@@ -150,6 +177,12 @@ def build_supervisor_status_response(
         last_llm_failed_at=state.last_llm_failed_at,
         last_llm_error=state.last_llm_error,
         llm_calls_count=state.llm_calls_count,
+        llm_attempts_count=state.llm_attempts_count,
+        llm_succeeded_count=state.llm_succeeded_count,
+        llm_failed_count=state.llm_failed_count,
+        llm_timeout_count=state.llm_timeout_count,
+        llm_fallback_count=state.llm_fallback_count,
+        llm_tokens_unknown_count=state.llm_tokens_unknown_count,
         llm_tokens_used=state.llm_tokens_used,
         llm_budget_calls=state.llm_budget_calls,
         llm_budget_tokens=state.llm_budget_tokens,
@@ -159,8 +192,13 @@ def build_supervisor_status_response(
         waiting_approvals_count=int(waiting_approvals),
         jobs_processed_count=state.jobs_processed_count,
         monitoring_note_vi=(
-            "Giám sát theo sự kiện (Event-Driven): khi không có sự kiện mới, "
-            "AI không gọi LLM liên tục và không tiêu tốn token."
+            "Giám sát theo sự kiện bởi Worker nền độc lập — khi không có sự kiện mới, "
+            "AI không gọi LLM và không tiêu tốn token."
+            if worker_healthy
+            else (
+                "Cảnh báo: chưa ghi nhận nhịp tim từ Supervisor Worker nền. "
+                "Hãy chạy `python -m app.supervisor.worker` để xử lý hàng đợi tự động."
+            )
         ),
         updated_at=state.updated_at,
     )
@@ -204,6 +242,23 @@ def _to_activity_response(act: SupervisorActivity) -> SupervisorActivityItemResp
         detail_vi=act.detail_vi,
         metadata_json=dict(act.metadata_json or {}),
         created_at=act.created_at,
+    )
+
+
+def _to_job_summary(job: SupervisorJob) -> SupervisorJobSummaryResponse:
+    return SupervisorJobSummaryResponse(
+        id=job.id,
+        job_type=job.job_type,
+        status=job.status,
+        target_case_id=job.target_case_id,
+        challenge_id=job.challenge_id,
+        attempt_count=job.attempt_count,
+        max_attempts=job.max_attempts,
+        worker_id=job.worker_id,
+        cancel_requested_at=job.cancel_requested_at,
+        error_message=job.error_message,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
     )
 
 
@@ -265,13 +320,12 @@ def _build_approval_inbox(db: Session, session_id: str) -> list[ApprovalInboxIte
 @router.get(
     "/supervisor/status",
     response_model=SupervisorStatusResponse,
-    summary="Get session-scoped Autonomous Agent Supervisor status, telemetry, and queue depth",
+    summary="Read-only Supervisor status, worker health, LLM telemetry, and queue depth",
 )
 def get_supervisor_status(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> SupervisorStatusResponse:
-    recover_stale_supervisor_jobs(db, session_id=current_session.id)
     state = ensure_supervisor_state(db, current_session.id)
     resp = build_supervisor_status_response(db, state)
     db.commit()
@@ -294,38 +348,31 @@ def pause_session_supervisor(
 @router.post(
     "/supervisor/resume",
     response_model=SupervisorStatusResponse,
-    summary="Resume Autonomous Agent Supervisor and process pending queued jobs",
+    summary="Resume Autonomous Agent Supervisor and wake background worker (non-blocking)",
 )
 def resume_session_supervisor(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> SupervisorStatusResponse:
-    resume_supervisor(db, current_session.id)
-    drain_session_supervisor_jobs(current_session.id, max_jobs=5)
+    state = resume_supervisor(db, current_session.id)
     notify_supervisor_worker()
-    db.expire_all()
-    state = ensure_supervisor_state(db, current_session.id)
-    resp = build_supervisor_status_response(db, state)
-    db.commit()
-    return resp
+    return build_supervisor_status_response(db, state)
 
 
 @router.post(
-    "/supervisor/tick",
-    response_model=SupervisorStatusResponse,
-    summary="Recover stale jobs and process the next queued Supervisor job if Autopilot is enabled",
+    "/supervisor/jobs/{job_id}/cancel",
+    response_model=SupervisorJobSummaryResponse,
+    summary="Cooperatively cancel a queued or running Supervisor job",
 )
-def tick_session_supervisor(
+def cancel_supervisor_job(
+    job_id: str,
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
-) -> SupervisorStatusResponse:
-    recover_stale_supervisor_jobs(db, session_id=current_session.id)
-    drain_session_supervisor_jobs(current_session.id, max_jobs=3)
-    db.expire_all()
-    state = ensure_supervisor_state(db, current_session.id)
-    resp = build_supervisor_status_response(db, state)
+) -> SupervisorJobSummaryResponse:
+    job = request_job_cancellation(db, session_id=current_session.id, job_id=job_id)
     db.commit()
-    return resp
+    db.refresh(job)
+    return _to_job_summary(job)
 
 
 @router.get(
@@ -359,30 +406,16 @@ def list_supervisor_activity(
 @router.get(
     "/supervisor/overview",
     response_model=MissionControlOverviewResponse,
-    summary="Get complete AI Mission Control snapshot (status, challenges, activity, inbox)",
+    summary="Read-only AI Mission Control snapshot (never executes Agent jobs synchronously)",
 )
 def get_mission_control_overview(
     after_seq: int = Query(default=0, ge=0),
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> MissionControlOverviewResponse:
-    recover_stale_supervisor_jobs(db, session_id=current_session.id)
     state = ensure_supervisor_state(db, current_session.id)
-    if state.autopilot_enabled:
-        has_queued = db.scalar(
-            select(func.count(SupervisorJob.id)).where(
-                SupervisorJob.session_id == current_session.id,
-                SupervisorJob.world_epoch == state.world_epoch,
-                SupervisorJob.status == SupervisorJobStatus.QUEUED.value,
-            )
-        )
-        if has_queued:
-            db.commit()
-            drain_session_supervisor_jobs(current_session.id, max_jobs=2)
-            db.expire_all()
-            state = ensure_supervisor_state(db, current_session.id)
-
     sup_status = build_supervisor_status_response(db, state)
+
     challenges = list(
         db.scalars(
             select(ChallengeRun)
@@ -394,6 +427,17 @@ def get_mission_control_overview(
             .limit(10)
         ).all()
     )
+    active_jobs = list(
+        db.scalars(
+            select(SupervisorJob)
+            .where(
+                SupervisorJob.session_id == current_session.id,
+                SupervisorJob.world_epoch == state.world_epoch,
+            )
+            .order_by(SupervisorJob.created_at.desc())
+            .limit(15)
+        ).all()
+    )
     activities = list(
         db.scalars(
             select(SupervisorActivity)
@@ -403,10 +447,19 @@ def get_mission_control_overview(
                 SupervisorActivity.seq > after_seq,
             )
             .order_by(SupervisorActivity.seq.desc())
-            .limit(50)
+            .limit(60)
         ).all()
     )
     inbox = _build_approval_inbox(db, current_session.id)
+    verifs = list(
+        db.scalars(
+            select(Verification)
+            .join(Case, Case.id == Verification.case_id)
+            .where(Case.session_id == current_session.id)
+            .order_by(Verification.checked_at.desc())
+            .limit(10)
+        ).all()
+    )
     latest_seq = (
         db.scalar(
             select(func.max(SupervisorActivity.seq)).where(
@@ -423,16 +476,45 @@ def get_mission_control_overview(
         supervisor=sup_status,
         latest_challenge=ch_responses[0] if ch_responses else None,
         recent_challenges=ch_responses,
+        active_jobs=[_to_job_summary(j) for j in active_jobs],
         activities=[_to_activity_response(a) for a in activities],
         approval_inbox=inbox,
+        recent_verifications=[
+            RecentVerificationItemResponse(
+                verification_id=v.id,
+                case_id=v.case_id,
+                action_execution_id=v.action_execution_id,
+                verdict=v.verdict,
+                postconditions_json=dict(v.postconditions_json or {}),
+                checked_at=v.checked_at,
+            )
+            for v in verifs
+        ],
         latest_seq=int(latest_seq),
     )
+
+
+@router.post(
+    "/events/ingest",
+    response_model=IngestEventResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Ingest a normalized Commerce/Payment event and enqueue Supervisor investigation (202)",
+)
+def ingest_business_event(
+    payload: NormalizedBusinessEvent,
+    _rate_limit: None = Depends(enforce_ai_investigation_rate_limit),
+    current_session: DemoSession = Depends(get_current_session),
+    db: Session = Depends(get_db),
+) -> IngestEventResponse:
+    res = ingest_normalized_business_event(db, session_obj=current_session, event=payload)
+    notify_supervisor_worker()
+    return res
 
 
 @router.get(
     "/challenges/catalog",
     response_model=list[ChallengeCatalogItemResponse],
-    summary="List Adversarial Challenge Lab types and presets",
+    summary="List Adversarial Challenge Lab regression fixtures and presets",
 )
 def get_challenge_catalog() -> list[ChallengeCatalogItemResponse]:
     return [ChallengeCatalogItemResponse(**item) for item in list_challenge_catalog()]
@@ -441,7 +523,7 @@ def get_challenge_catalog() -> list[ChallengeCatalogItemResponse]:
 @router.post(
     "/challenges/receipt-extract",
     status_code=status.HTTP_200_OK,
-    summary="Extract structured fields from a synthetic MOCK / TEST receipt (untrusted CLAIM)",
+    summary="Structured text parser for synthetic MOCK / TEST receipts (not OCR, untrusted CLAIM)",
 )
 def extract_receipt_sample(
     payload: ExtractReceiptRequest,
@@ -457,10 +539,10 @@ def extract_receipt_sample(
 @router.post(
     "/challenges",
     response_model=ChallengeRunResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Launch a Challenge Lab anomaly and automatically trigger Autonomous Supervisor",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Enqueue a Challenge Lab anomaly asynchronously (returns 202 Accepted immediately)",
 )
-def create_and_run_challenge(
+def create_and_enqueue_challenge(
     payload: LaunchChallengeRequest,
     _rate_limit: None = Depends(enforce_ai_investigation_rate_limit),
     current_session: DemoSession = Depends(get_current_session),
@@ -473,16 +555,8 @@ def create_and_run_challenge(
         preset_id=payload.preset_id,
         parameters=payload.parameters,
     )
-    state = ensure_supervisor_state(db, current_session.id)
-    if payload.auto_process and state.autopilot_enabled:
-        drain_session_supervisor_jobs(current_session.id, max_jobs=3)
-    else:
-        notify_supervisor_worker()
-
-    db.expire_all()
-    updated = db.get(ChallengeRun, challenge.id)
-    assert updated is not None  # noqa: S101
-    return _to_challenge_response(updated)
+    notify_supervisor_worker()
+    return _to_challenge_response(challenge)
 
 
 @router.get(
@@ -536,7 +610,7 @@ def get_challenge_detail(
 @router.post(
     "/challenges/{challenge_id}/cancel",
     response_model=ChallengeRunResponse,
-    summary="Stop/cancel an active challenge and its pending Supervisor jobs",
+    summary="Cooperatively cancel an active or queued challenge and its Supervisor jobs",
 )
 def cancel_session_challenge(
     challenge_id: str,

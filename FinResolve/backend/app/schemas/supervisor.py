@@ -1,4 +1,4 @@
-"""Pydantic schemas for Autonomous Agent Supervisor and Challenge Lab (Prompt 09)."""
+"""Pydantic schemas for Supervisor, Worker Health, and Challenge Lab (Prompt 09.1)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,9 @@ class SupervisorStatusResponse(BaseModel):
     status: str
     status_label_vi: str
     autopilot_enabled: bool
+    worker_healthy: bool
+    active_workers_count: int
+    latest_worker_heartbeat_at: datetime | None = None
     world_epoch: int
     active_job_id: str | None = None
     active_case_id: str | None = None
@@ -25,6 +28,12 @@ class SupervisorStatusResponse(BaseModel):
     last_llm_failed_at: datetime | None = None
     last_llm_error: str | None = None
     llm_calls_count: int
+    llm_attempts_count: int
+    llm_succeeded_count: int
+    llm_failed_count: int
+    llm_timeout_count: int
+    llm_fallback_count: int
+    llm_tokens_unknown_count: int
     llm_tokens_used: int
     llm_budget_calls: int
     llm_budget_tokens: int
@@ -34,6 +43,21 @@ class SupervisorStatusResponse(BaseModel):
     waiting_approvals_count: int
     jobs_processed_count: int
     monitoring_note_vi: str
+    updated_at: datetime
+
+
+class SupervisorJobSummaryResponse(BaseModel):
+    id: str
+    job_type: str
+    status: str
+    target_case_id: str | None = None
+    challenge_id: str | None = None
+    attempt_count: int
+    max_attempts: int
+    worker_id: str | None = None
+    cancel_requested_at: datetime | None = None
+    error_message: str | None = None
+    created_at: datetime
     updated_at: datetime
 
 
@@ -78,10 +102,6 @@ class LaunchChallengeRequest(BaseModel):
     )
     preset_id: str | None = Field(default=None, max_length=64)
     parameters: dict[str, Any] = Field(default_factory=dict)
-    auto_process: bool = Field(
-        default=True,
-        description="Nếu Autopilot đang bật, tự động xử lý ngay tác vụ trong hàng đợi",
-    )
 
 
 class ExtractReceiptRequest(BaseModel):
@@ -126,10 +146,21 @@ class ApprovalInboxItemResponse(BaseModel):
     created_at: datetime
 
 
+class RecentVerificationItemResponse(BaseModel):
+    verification_id: str
+    case_id: str
+    action_execution_id: str
+    verdict: str
+    postconditions_json: dict[str, Any]
+    checked_at: datetime
+
+
 class MissionControlOverviewResponse(BaseModel):
     supervisor: SupervisorStatusResponse
     latest_challenge: ChallengeRunResponse | None = None
     recent_challenges: list[ChallengeRunResponse] = Field(default_factory=list)
+    active_jobs: list[SupervisorJobSummaryResponse] = Field(default_factory=list)
     activities: list[SupervisorActivityItemResponse] = Field(default_factory=list)
     approval_inbox: list[ApprovalInboxItemResponse] = Field(default_factory=list)
+    recent_verifications: list[RecentVerificationItemResponse] = Field(default_factory=list)
     latest_seq: int = 0

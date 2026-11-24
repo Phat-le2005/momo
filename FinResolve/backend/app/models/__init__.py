@@ -53,6 +53,7 @@ from app.models.supervisor import (
     SupervisorActivity,
     SupervisorJob,
     SupervisorState,
+    SupervisorWorker,
 )
 
 __all__ = [
@@ -107,6 +108,7 @@ __all__ = [
     "SupervisorJobType",
     "SupervisorState",
     "SupervisorStatus",
+    "SupervisorWorker",
     "TaskforceRole",
     "Verification",
     "VerificationVerdict",

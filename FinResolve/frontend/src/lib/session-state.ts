@@ -181,14 +181,15 @@ export type SupervisorExecutionBadge = {
     | "LLM_CALL_STARTED"
     | "LLM_CALL_SUCCEEDED"
     | "LLM_CALL_FAILED"
-    | "DEMO_RULES_FALLBACK";
+    | "DEMO_RULES_FALLBACK"
+    | "BUDGET_EXHAUSTED";
   badge: string;
   note: string;
   isLlmConfirmed: boolean;
   isThinking: boolean;
 };
 
-/** Honest AI execution state badge for Mission Control (Prompt 09 Part A.3).
+/** Honest AI execution state badge for Mission Control (Prompt 09 / 09.1).
  * Never claims an LLM model was invoked solely because an API key is configured,
  * and never claims the Agent is thinking when no reasoning call is active.
  */
@@ -197,6 +198,15 @@ export function resolveSupervisorExecutionBadge(
   configuredMode?: string | null,
 ): SupervisorExecutionBadge {
   const norm = (llmExecutionState || "").trim().toUpperCase();
+  if (norm === "BUDGET_EXHAUSTED") {
+    return {
+      code: "BUDGET_EXHAUSTED",
+      badge: "BUDGET_EXHAUSTED",
+      note: "Phiên đã đạt giới hạn lượt gọi hoặc ngân sách token LLM — đã dừng gọi mô hình an toàn.",
+      isLlmConfirmed: false,
+      isThinking: false,
+    };
+  }
   if (norm === "LLM_CALL_STARTED") {
     return {
       code: "LLM_CALL_STARTED",
@@ -239,6 +249,59 @@ export function resolveSupervisorExecutionBadge(
     note: "Đang chạy bộ luật xác định (0 LLM calls) — không phải suy luận từ mô hình ngôn ngữ.",
     isLlmConfirmed: false,
     isThinking: false,
+  };
+}
+
+export type WorkerHealthDisplay = {
+  healthy: boolean;
+  badge: string;
+  tone: "ok" | "warn" | "paused";
+  detail: string;
+};
+
+/** Honest Worker Health display: never reports MONITORING as healthy if worker heartbeat is stale. */
+export function resolveWorkerHealthDisplay(
+  supervisor:
+    | {
+        autopilot_enabled?: boolean;
+        worker_healthy?: boolean;
+        active_workers_count?: number;
+        status?: string;
+      }
+    | null
+    | undefined,
+): WorkerHealthDisplay {
+  if (!supervisor) {
+    return {
+      healthy: false,
+      badge: "ĐANG KIỂM TRA WORKER",
+      tone: "warn",
+      detail: "Đang tải trạng thái Supervisor Worker từ backend…",
+    };
+  }
+  if (!supervisor.autopilot_enabled) {
+    return {
+      healthy: Boolean(supervisor.worker_healthy),
+      badge: supervisor.worker_healthy ? "TẠM DỪNG (WORKER SẴN SÀNG)" : "TẠM DỪNG (WORKER NGOẠI TUYẾN)",
+      tone: "paused",
+      detail: "Autopilot đang tạm dừng theo yêu cầu người vận hành.",
+    };
+  }
+  if (!supervisor.worker_healthy) {
+    return {
+      healthy: false,
+      badge: "WORKER NGOẠI TUYẾN (DEGRADED)",
+      tone: "warn",
+      detail:
+        "Chưa ghi nhận nhịp tim từ Supervisor Worker nền. Tác vụ đã lưu bền vững vào hàng đợi PostgreSQL và sẽ chạy ngay khi khởi động `python -m app.supervisor.worker`.",
+    };
+  }
+  const count = supervisor.active_workers_count ?? 1;
+  return {
+    healthy: true,
+    badge: `WORKER HOẠT ĐỘNG (${count})`,
+    tone: "ok",
+    detail: "Supervisor Worker nền đang khỏe mạnh và liên tục cập nhật nhịp tim (heartbeat).",
   };
 }
 

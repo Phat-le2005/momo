@@ -28,6 +28,11 @@ from app.ai_core.schemas import (
     Plan,
     PlanStepKind,
 )
+from app.ai_core.telemetry import (
+    LlmInvocationRecord,
+    get_execution_context,
+    sanitize_provider_error,
+)
 from app.core.config import ModelMode, Settings, get_settings
 from app.core.rate_limit import llm_concurrency_guard
 
@@ -111,24 +116,62 @@ class LLMModelAdapter:
         system_prompt: str,
         user_message: str,
     ) -> tuple[str, int, int, int]:
-        """Single shared external LLM provider boundary protected by `llm_concurrency_guard()`.
+        """Single shared external LLM provider boundary protected by `llm_concurrency_guard()`
+        and session/worker `RuntimeExecutionContext` budgets and telemetry."""
+        exec_ctx = get_execution_context()
+        if exec_ctx is not None:
+            exec_ctx.before_llm_call()
 
-        Covers OpenAI-compatible, Gemini, and Anthropic providers for both `generate_plan()`
-        and `generate_structured_json()`, ensuring bounded concurrency without double-acquiring
-        the semaphore and guaranteed release on success, timeout, or exception.
-        """
         with llm_concurrency_guard():
             client = self._http_client or httpx.Client(timeout=self._timeout)
             close_client = self._http_client is None
             try:
                 if self._provider in ("gemini", "google", "google_gemini"):
-                    return self._call_gemini(client, system_prompt, user_message)
-                if self._provider == "anthropic":
-                    return self._call_anthropic(client, system_prompt, user_message)
-                return self._call_openai_compatible(client, system_prompt, user_message)
+                    content, p_tok, c_tok, t_tok = self._call_gemini(
+                        client, system_prompt, user_message
+                    )
+                elif self._provider == "anthropic":
+                    content, p_tok, c_tok, t_tok = self._call_anthropic(
+                        client, system_prompt, user_message
+                    )
+                else:
+                    content, p_tok, c_tok, t_tok = self._call_openai_compatible(
+                        client, system_prompt, user_message
+                    )
+            except Exception as exc:
+                if exec_ctx is not None:
+                    is_timeout = isinstance(exc, (httpx.TimeoutException, TimeoutError))
+                    exec_ctx.record_llm_outcome(
+                        LlmInvocationRecord(
+                            provider=self._provider,
+                            model_name=self._model_name,
+                            succeeded=False,
+                            timed_out=is_timeout,
+                            is_fallback=False,
+                            error_summary=sanitize_provider_error(exc),
+                        )
+                    )
+                raise
             finally:
                 if close_client:
                     client.close()
+
+        if exec_ctx is not None:
+            tokens_unknown = t_tok <= 0 and p_tok <= 0 and c_tok <= 0
+            exec_ctx.record_llm_outcome(
+                LlmInvocationRecord(
+                    provider=self._provider,
+                    model_name=self._model_name,
+                    succeeded=True,
+                    timed_out=False,
+                    is_fallback=False,
+                    prompt_tokens=p_tok if not tokens_unknown else None,
+                    completion_tokens=c_tok if not tokens_unknown else None,
+                    total_tokens=t_tok if not tokens_unknown else None,
+                    tokens_unknown=tokens_unknown,
+                )
+            )
+        return content, p_tok, c_tok, t_tok
 
     def generate_plan(self, context: InvestigationContext) -> ModelInvocationResult:
         start_ns = time.perf_counter_ns()

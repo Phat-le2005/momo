@@ -24,7 +24,8 @@ from app.supervisor.worker import (
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    if get_settings().app_env.strip().lower() != "test":
+    settings = get_settings()
+    if settings.enable_embedded_supervisor_worker and settings.app_env.strip().lower() != "test":
         start_embedded_supervisor_worker()
     try:
         yield

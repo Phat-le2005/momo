@@ -9,6 +9,7 @@ import {
   resolveSelectedCaseId,
   resolveSupervisorExecutionBadge,
   resolveTaskforceModeLabel,
+  resolveWorkerHealthDisplay,
   saveSessionRunId,
   type StorageLike,
 } from "./session-state.ts";
@@ -171,7 +172,7 @@ test("Prompt 09 Part D: mergeSupervisorActivities deduplicates by seq and filter
     [3, 2, 1],
   );
 
-  // After world reset (world_epoch = 2), epoch 1 events are dropped
+  // Epoch 2
   const epoch2 = mergeSupervisorActivities(
     merged,
     [{ id: "ACT-10", seq: 1, world_epoch: 2 }],
@@ -179,4 +180,41 @@ test("Prompt 09 Part D: mergeSupervisorActivities deduplicates by seq and filter
   );
   assert.equal(epoch2.length, 1);
   assert.equal(epoch2[0]?.id, "ACT-10");
+});
+
+test("Prompt 09.1: BUDGET_EXHAUSTED badge and honest Worker Health display", () => {
+  const budget = resolveSupervisorExecutionBadge("BUDGET_EXHAUSTED", "LLM_API");
+  assert.equal(budget.code, "BUDGET_EXHAUSTED");
+  assert.equal(budget.isLlmConfirmed, false);
+  assert.equal(budget.isThinking, false);
+
+  // Never show MONITORING as healthy when worker_healthy is false
+  const offline = resolveWorkerHealthDisplay({
+    autopilot_enabled: true,
+    worker_healthy: false,
+    active_workers_count: 0,
+    status: "DEGRADED",
+  });
+  assert.equal(offline.healthy, false);
+  assert.equal(offline.tone, "warn");
+  assert.match(offline.badge, /NGOẠI TUYẾN|DEGRADED/);
+
+  // Healthy worker
+  const healthy = resolveWorkerHealthDisplay({
+    autopilot_enabled: true,
+    worker_healthy: true,
+    active_workers_count: 1,
+    status: "MONITORING",
+  });
+  assert.equal(healthy.healthy, true);
+  assert.equal(healthy.tone, "ok");
+
+  // Paused supervisor
+  const paused = resolveWorkerHealthDisplay({
+    autopilot_enabled: false,
+    worker_healthy: true,
+    active_workers_count: 1,
+    status: "PAUSED",
+  });
+  assert.equal(paused.tone, "paused");
 });

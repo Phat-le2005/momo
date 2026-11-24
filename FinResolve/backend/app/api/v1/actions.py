@@ -121,6 +121,19 @@ def approve_action_proposal(
         claimed_id=req.approver_id,
     )
     contract = get_action_contract(proposal.action_type)
+    if approval.decision == "APPROVED":
+        from app.supervisor.service import enqueue_approved_action_execution_job
+        from app.supervisor.worker import notify_supervisor_worker
+
+        enqueue_approved_action_execution_job(
+            db,
+            session_id=current_session.id,
+            proposal_id=proposal.id,
+            case_id=proposal.case_id,
+            action_type=contract.action_type,
+        )
+        db.commit()
+        notify_supervisor_worker()
 
     return ApprovalResponse(
         approval_id=approval.id,
@@ -163,7 +176,12 @@ def simulate_demo_action_approval(
         expiry_minutes=req.expiry_minutes,
     )
     contract = get_action_contract(proposal.action_type)
-    from app.supervisor.service import ensure_supervisor_state, record_activity
+    from app.supervisor.service import (
+        enqueue_approved_action_execution_job,
+        ensure_supervisor_state,
+        record_activity,
+    )
+    from app.supervisor.worker import notify_supervisor_worker
 
     sup_state = ensure_supervisor_state(db, current_session.id)
     record_activity(
@@ -176,7 +194,15 @@ def simulate_demo_action_approval(
         detail_vi=req.reason,
         metadata_json={"proposal_id": proposal.id, "approval_id": approval.id},
     )
+    enqueue_approved_action_execution_job(
+        db,
+        session_id=current_session.id,
+        proposal_id=proposal.id,
+        case_id=proposal.case_id,
+        action_type=contract.action_type,
+    )
     db.commit()
+    notify_supervisor_worker()
 
     return ApprovalResponse(
         approval_id=approval.id,

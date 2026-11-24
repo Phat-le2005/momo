@@ -128,6 +128,9 @@ export type SupervisorStatus = {
   status: "MONITORING" | "INVESTIGATING" | "WAITING_EVIDENCE" | "WAITING_APPROVAL" | "PAUSED" | "DEGRADED" | "STOPPED";
   status_label_vi: string;
   autopilot_enabled: boolean;
+  worker_healthy: boolean;
+  active_workers_count: number;
+  latest_worker_heartbeat_at: string | null;
   world_epoch: number;
   active_job_id: string | null;
   active_case_id: string | null;
@@ -139,12 +142,19 @@ export type SupervisorStatus = {
     | "LLM_CALL_STARTED"
     | "LLM_CALL_SUCCEEDED"
     | "LLM_CALL_FAILED"
-    | "DEMO_RULES_FALLBACK";
+    | "DEMO_RULES_FALLBACK"
+    | "BUDGET_EXHAUSTED";
   llm_execution_label_vi: string;
   last_llm_succeeded_at: string | null;
   last_llm_failed_at: string | null;
   last_llm_error: string | null;
   llm_calls_count: number;
+  llm_attempts_count: number;
+  llm_succeeded_count: number;
+  llm_failed_count: number;
+  llm_timeout_count: number;
+  llm_fallback_count: number;
+  llm_tokens_unknown_count: number;
   llm_tokens_used: number;
   llm_budget_calls: number;
   llm_budget_tokens: number;
@@ -155,6 +165,30 @@ export type SupervisorStatus = {
   jobs_processed_count: number;
   monitoring_note_vi: string;
   updated_at: string;
+};
+
+export type SupervisorJobSummary = {
+  id: string;
+  job_type: string;
+  status: string;
+  target_case_id: string | null;
+  challenge_id: string | null;
+  attempt_count: number;
+  max_attempts: number;
+  worker_id: string | null;
+  cancel_requested_at: string | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type RecentVerificationItem = {
+  verification_id: string;
+  case_id: string;
+  action_execution_id: string;
+  verdict: string;
+  postconditions_json: JsonObject;
+  checked_at: string;
 };
 
 export type SupervisorActivityItem = {
@@ -234,8 +268,10 @@ export type MissionControlOverview = {
   supervisor: SupervisorStatus;
   latest_challenge: ChallengeRunRecord | null;
   recent_challenges: ChallengeRunRecord[];
+  active_jobs: SupervisorJobSummary[];
   activities: SupervisorActivityItem[];
   approval_inbox: ApprovalInboxItem[];
+  recent_verifications: RecentVerificationItem[];
   latest_seq: number;
 };
 

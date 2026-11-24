@@ -235,37 +235,17 @@ def create_case(
         session_obj.case_count += 1
         session_obj.updated_at = now
         db.flush()
-        from app.supervisor.service import (
-            drain_session_supervisor_jobs,
-            enqueue_case_investigation_job,
-            ensure_supervisor_state,
-        )
+        from app.supervisor.service import enqueue_case_investigation_job
+        from app.supervisor.worker import notify_supervisor_worker
 
         enqueue_case_investigation_job(
             db,
             session_id=session_obj.id,
             case_id=new_case.id,
-            reason_vi=f"Phát hiện khiếu nại mới ({new_case.id})",
+            reason_vi=f"Phát hiện khiếu nại mới ({new_case.id}) — xếp hàng đợi điều tra",
         )
         db.commit()
-        if payload.auto_investigate:
-            sup_state = ensure_supervisor_state(db, session_obj.id)
-            if sup_state.autopilot_enabled:
-                drain_session_supervisor_jobs(session_obj.id, max_jobs=2)
-                db.expire_all()
-        reloaded = db.scalar(
-            select(Case)
-            .options(
-                selectinload(Case.evidence),
-                selectinload(Case.action_proposals),
-                selectinload(Case.risk_signals),
-                selectinload(Case.verifications),
-                selectinload(Case.events),
-            )
-            .where(Case.id == new_case.id, Case.session_id == session_obj.id)
-        )
-        if reloaded is not None:
-            return _to_case_response(reloaded)
+        notify_supervisor_worker()
         db.refresh(new_case)
         return _to_case_response(new_case, [initial_evidence])
     except IntegrityError:

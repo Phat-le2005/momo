@@ -92,6 +92,8 @@ class Settings(BaseSettings):
     rate_limit_sessions_per_minute: int = Field(default=60, ge=1, le=10_000)
     rate_limit_ai_calls_per_minute: int = Field(default=60, ge=1, le=10_000)
     max_concurrent_llm_calls: int = Field(default=4, ge=1, le=100)
+    enable_embedded_supervisor_worker: bool = False
+    worker_heartbeat_ttl_seconds: int = Field(default=15, ge=3, le=300)
 
     @field_validator("web_origin")
     @classmethod
