@@ -1,6 +1,6 @@
-"""Write the current OpenAPI schema to services/api/openapi.json (frozen contract snapshot).
+"""Write the current OpenAPI schema to backend/openapi.json (frozen contract snapshot).
 
-Usage (from services/api):  python -m scripts.export_openapi
+Usage (from backend):  python -m scripts.export_openapi
 """
 
 from __future__ import annotations

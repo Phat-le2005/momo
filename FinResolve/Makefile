@@ -1,6 +1,6 @@
 # FinResolve AI — dev tasks (Linux/macOS/Git Bash). Windows PowerShell: scripts/dev.ps1
-API_DIR := services/api
-WEB_DIR := apps/web
+API_DIR := backend
+WEB_DIR := frontend
 VENV    := $(API_DIR)/.venv
 PY      := $(VENV)/bin/python
 COMPOSE := docker compose -f infra/docker-compose.yml

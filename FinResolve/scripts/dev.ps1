@@ -16,8 +16,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
-$Api = Join-Path $Root "services/api"
-$Web = Join-Path $Root "apps/web"
+$Api = Join-Path $Root "backend"
+$Web = Join-Path $Root "frontend"
 $Py = Join-Path $Api ".venv/Scripts/python.exe"
 $Compose = @("compose", "-f", (Join-Path $Root "infra/docker-compose.yml"))
 

@@ -606,7 +606,7 @@ def test_docker_and_production_secret_validation() -> None:
                 )
 
     # 3. Verify infra/docker-compose.yml has no hardcoded fallback for DEMO_APPROVAL_SECRET
-    compose_path = Path(__file__).resolve().parents[3] / "infra" / "docker-compose.yml"
+    compose_path = Path(__file__).resolve().parents[2] / "infra" / "docker-compose.yml"
     compose_text = compose_path.read_text(encoding="utf-8")
     assert hardcoded_docker_key not in compose_text
     assert "${DEMO_APPROVAL_SECRET:?" in compose_text

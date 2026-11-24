@@ -12,14 +12,14 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: FinResolve/apps/web
+        working-directory: FinResolve/frontend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: FinResolve/apps/web/package-lock.json
+          cache-dependency-path: FinResolve/frontend/package-lock.json
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
@@ -45,7 +45,7 @@ jobs:
           --health-retries 10
     defaults:
       run:
-        working-directory: FinResolve/services/api
+        working-directory: FinResolve/backend
     env:
       APP_ENV: test
       SOURCE_MODE: MOCK

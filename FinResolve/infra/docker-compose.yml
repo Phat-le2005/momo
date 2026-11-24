@@ -24,7 +24,7 @@ services:
 
   api:
     build:
-      context: ../services/api
+      context: ../backend
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
@@ -56,7 +56,7 @@ services:
 
   web:
     build:
-      context: ../apps/web
+      context: ../frontend
       dockerfile: Dockerfile
       args:
         # Browser-visible API URL (the browser runs on the host, not inside the network).

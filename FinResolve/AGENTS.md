@@ -4,7 +4,7 @@
 Build a Vietnamese-first, self-serve, online AI-native agentic operations MVP for payment/commerce exceptions. Prioritize an honest, functional end-to-end Case pipeline, fast UX, reliable policy enforcement, and real state verification. First read `docs/PRODUCT_OVERVIEW.md` and then `docs/PRODUCT_CONTRACT.md`, `docs/DELIVERY_PLAN.md`, and `docs/QA_MATRIX.md` before editing.
 
 ### Core architecture
-- Monorepo: `apps/web` Next.js + TypeScript + Tailwind; `services/api` Python 3.12+ + FastAPI + Pydantic v2 + SQLAlchemy/Alembic; PostgreSQL as source of truth. Docker Compose for local development.
+- Monorepo: `frontend` Next.js + TypeScript + Tailwind; `backend` Python 3.12+ + FastAPI + Pydantic v2 + SQLAlchemy/Alembic; PostgreSQL as source of truth. Docker Compose for local development.
 - In-house modules: case/evidence/context, bounded AI planner, agent runtime, incident correlator/taskforce, policy/approval/action executor, verifier, simulator.
 - External LLM API allowed behind swappable `ModelAdapter`; `MOCK` must always be visibly labeled. MCP SDK may be used as TRANSPORT only; use adapters/HTTPX when faster for MVP. Do not depend on an agent orchestration framework such as LangChain/LangGraph/CrewAI/AutoGen.
 - Modular monolith. No Kafka, Kubernetes, vector DB, GPU model serving, complex microservices, or multi-tenant SaaS unless explicitly justified.
