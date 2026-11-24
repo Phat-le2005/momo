@@ -70,14 +70,14 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: FinResolve/commerce/frontend
+        working-directory: MiniStore/frontend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: FinResolve/commerce/frontend/package-lock.json
+          cache-dependency-path: MiniStore/frontend/package-lock.json
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
@@ -103,7 +103,7 @@ jobs:
           --health-retries 10
     defaults:
       run:
-        working-directory: FinResolve/commerce/backend
+        working-directory: MiniStore/backend
     env:
       COMMERCE_APP_ENV: test
       COMMERCE_SOURCE_MODE: MOCK
