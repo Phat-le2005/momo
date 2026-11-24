@@ -38,6 +38,10 @@ services:
       MODEL_API_KEY: ${MODEL_API_KEY:-}
       MODEL_TIMEOUT_SECONDS: ${MODEL_TIMEOUT_SECONDS:-20}
       MODEL_BUDGET_TOKENS: ${MODEL_BUDGET_TOKENS:-20000}
+      ENABLE_EMBEDDED_SUPERVISOR_WORKER: "false"
+      WORKER_HEARTBEAT_TTL_SECONDS: ${WORKER_HEARTBEAT_TTL_SECONDS:-25}
+      SUPERVISOR_JOB_LEASE_SECONDS: ${SUPERVISOR_JOB_LEASE_SECONDS:-30}
+      SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS: ${SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS:-5}
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
@@ -53,6 +57,41 @@ services:
       timeout: 5s
       start_period: 20s
       retries: 10
+
+  worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.supervisor.worker"]
+    restart: unless-stopped
+    environment:
+      APP_ENV: docker
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-finresolve}:${POSTGRES_PASSWORD:-change-me-local-only}@db:5432/${POSTGRES_DB:-finresolve}
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
+      SOURCE_MODE: MOCK
+      DEMO_APPROVAL_SECRET: ${DEMO_APPROVAL_SECRET:?DEMO_APPROVAL_SECRET must be set to a strong random >=32-char secret via environment or infra/.env}
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-}
+      MODEL_NAME: ${MODEL_NAME:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MODEL_TIMEOUT_SECONDS: ${MODEL_TIMEOUT_SECONDS:-20}
+      MODEL_BUDGET_TOKENS: ${MODEL_BUDGET_TOKENS:-20000}
+      ENABLE_EMBEDDED_SUPERVISOR_WORKER: "false"
+      WORKER_HEARTBEAT_TTL_SECONDS: ${WORKER_HEARTBEAT_TTL_SECONDS:-25}
+      SUPERVISOR_JOB_LEASE_SECONDS: ${SUPERVISOR_JOB_LEASE_SECONDS:-30}
+      SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS: ${SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS:-5}
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys; from app.db.session import get_sessionmaker; from app.supervisor.service import get_worker_health; m = get_sessionmaker(); db = m(); h = get_worker_health(db); db.close(); sys.exit(0 if h['worker_healthy'] else 1)"
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 6
 
   web:
     build:

@@ -1352,10 +1352,12 @@ def cancel_challenge_run(
 ) -> ChallengeRun:
     """Cancel an active or queued challenge and any pending Supervisor jobs linked to it."""
     challenge = db.scalar(
-        select(ChallengeRun).where(
+        select(ChallengeRun)
+        .where(
             ChallengeRun.id == challenge_id,
             ChallengeRun.session_id == session_id,
         )
+        .with_for_update()
     )
     if challenge is None:
         raise AppError(
@@ -1364,6 +1366,17 @@ def cancel_challenge_run(
             status_code=404,
         )
 
+    terminal_statuses = {
+        ChallengeStatus.COMPLETED.value,
+        ChallengeStatus.PARTIALLY_RESOLVED.value,
+        ChallengeStatus.BLOCKED_SAFELY.value,
+        ChallengeStatus.FAILED.value,
+        ChallengeStatus.CANCELLED.value,
+    }
+    if challenge.status in terminal_statuses:
+        # Never overwrite an already-terminal challenge (e.g. COMPLETED -> CANCELLED)
+        return challenge
+
     now = datetime.now(UTC)
     linked_jobs = list(
         db.scalars(
@@ -1371,7 +1384,11 @@ def cancel_challenge_run(
                 SupervisorJob.session_id == session_id,
                 SupervisorJob.challenge_id == challenge_id,
                 SupervisorJob.status.in_(
-                    [SupervisorJobStatus.QUEUED.value, SupervisorJobStatus.RUNNING.value]
+                    [
+                        SupervisorJobStatus.QUEUED.value,
+                        SupervisorJobStatus.RUNNING.value,
+                        SupervisorJobStatus.CANCELLING.value,
+                    ]
                 ),
             )
         ).all()
@@ -1387,16 +1404,21 @@ def cancel_challenge_run(
         if updated_job.status == SupervisorJobStatus.CANCELLING.value:
             has_running = True
 
-    challenge.status = ChallengeStatus.CANCELLED.value
-    challenge.safety_verdict = "CANCELLED_BY_USER"
+    if has_running:
+        challenge.status = ChallengeStatus.CANCELLING.value
+        challenge.safety_verdict = "CANCELLATION_REQUESTED"
+    else:
+        challenge.status = ChallengeStatus.CANCELLED.value
+        challenge.safety_verdict = "CANCELLED_BY_USER"
+
     challenge.outcome_json = {
         **(challenge.outcome_json or {}),
         "summary_vi": (
-            "Đã gửi yêu cầu dừng hợp tác cho tác vụ đang chạy — worker sẽ dừng trước bước "
-            "tiếp theo; mọi hành động đã commit trước đó vẫn giữ nguyên dấu vết kiểm toán."
+            "Đã gửi yêu cầu dừng hợp tác cho tác vụ đang chạy (CANCELLING) — worker sẽ dừng "
+            "trước bước tiếp theo và xác nhận CANCELLED; mọi hành động đã commit vẫn giữ kiểm toán."
             if has_running
             else (
-                "Đã dừng thử thách và hủy tác vụ đang chờ — "
+                "Đã dừng thử thách và hủy tác vụ đang chờ (CANCELLED) — "
                 "không có thay đổi tài chính nào được thực hiện."
             )
         ),

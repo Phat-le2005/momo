@@ -46,6 +46,7 @@ from app.ai_core.telemetry import (
     JobCancelledError,
     JobSupersededError,
     LlmInvocationRecord,
+    assert_execution_fencing_in_txn,
     get_execution_context,
 )
 from app.ai_core.understanding import analyze_vietnamese_complaint
@@ -293,6 +294,7 @@ class BoundedAgentRuntime:
         run_id: str,
     ) -> Case:
         """Re-lock Case in a short write transaction after LLM I/O and verify optimistic version."""
+        assert_execution_fencing_in_txn(self._db, session_id=session_id)
         try:
             fresh = self._db.scalar(
                 select(Case)
@@ -358,6 +360,7 @@ class BoundedAgentRuntime:
         effective_run_id = run_id or f"RUN-{uuid.uuid4().hex[:10].upper()}"
 
         # Prevent overlapping concurrent investigations on the same Case using NOWAIT row lock
+        assert_execution_fencing_in_txn(self._db, session_id=session_id)
         try:
             case = self._db.scalar(
                 select(Case)

@@ -44,6 +44,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.ai_core.telemetry import assert_execution_fencing_in_txn
 from app.cases.state_machine import can_transition, transition_case
 from app.core.errors import AppError, ErrorCode
 from app.db.session import get_sessionmaker
@@ -637,6 +638,9 @@ class ActionExecutor:
                     "context_snapshot": eval_res.context_snapshot,
                 },
             )
+
+        # 4.5. Verify worker fencing ownership inside the SAME DB transaction before ANY write
+        assert_execution_fencing_in_txn(self._db, session_id=self._session_id)
 
         # 5. Transition Case WAITING_APPROVAL -> EXECUTING
         if case_obj is not None:

@@ -122,7 +122,18 @@ class LLMModelAdapter:
         if exec_ctx is not None:
             exec_ctx.before_llm_call()
 
-        with llm_concurrency_guard():
+        try:
+            guard_cm = llm_concurrency_guard(
+                session_id=exec_ctx.session_id if exec_ctx is not None else None,
+                provider=self._provider,
+            )
+            guard_cm.__enter__()
+        except Exception:
+            if exec_ctx is not None and exec_ctx.release_llm_reservation is not None:
+                exec_ctx.release_llm_reservation()
+            raise
+
+        try:
             client = self._http_client or httpx.Client(timeout=self._timeout)
             close_client = self._http_client is None
             try:
@@ -155,6 +166,8 @@ class LLMModelAdapter:
             finally:
                 if close_client:
                     client.close()
+        finally:
+            guard_cm.__exit__(None, None, None)
 
         if exec_ctx is not None:
             tokens_unknown = t_tok <= 0 and p_tok <= 0 and c_tok <= 0

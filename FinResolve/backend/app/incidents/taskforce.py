@@ -39,6 +39,12 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.ai_core.model_adapter import ModelAdapter, get_model_adapter
+from app.ai_core.telemetry import (
+    BudgetExhaustedError,
+    JobCancelledError,
+    JobSupersededError,
+    assert_execution_fencing_in_txn,
+)
 from app.connectors.read_tools import ReadToolRegistry
 from app.core.config import ModelMode, get_settings
 from app.core.errors import AppError, ErrorCode
@@ -439,6 +445,8 @@ class TaskforceManager:
                 else:
                     llm_calls_failed += 1
                     llm_fallback_reasons.append("role_plan_fallback:empty_llm_response")
+            except (JobCancelledError, JobSupersededError, BudgetExhaustedError):
+                raise
             except Exception as exc:  # noqa: BLE001
                 llm_calls_failed += 1
                 llm_fallback_reasons.append(f"role_plan_fallback:{str(exc)[:180]}")
@@ -581,6 +589,8 @@ class TaskforceManager:
                     else:
                         llm_calls_failed += 1
                         llm_fallback_reasons.append(f"{role_name}_fallback:empty_llm_response")
+                except (JobCancelledError, JobSupersededError, BudgetExhaustedError):
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     llm_calls_failed += 1
                     llm_fallback_reasons.append(f"{role_name}_fallback:{str(exc)[:180]}")
@@ -598,6 +608,7 @@ class TaskforceManager:
             idx += 1
 
         # --- PHASE C: REVALIDATE & PERSIST IN A SHORT ATOMIC WRITE TRANSACTION ---
+        assert_execution_fencing_in_txn(self._db, session_id=self._session_id)
         try:
             fresh_inc = self._db.scalar(
                 select(Incident)

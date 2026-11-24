@@ -40,6 +40,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.ai_core.model_adapter import ModelAdapter, get_model_adapter
+from app.ai_core.telemetry import (
+    BudgetExhaustedError,
+    JobCancelledError,
+    JobSupersededError,
+    assert_execution_fencing_in_txn,
+)
 from app.core.config import ModelMode, get_settings
 from app.core.errors import AppError, ErrorCode
 from app.models.cases import Case, CaseEvent, Evidence
@@ -375,6 +381,8 @@ class IncidentCorrelator:
                 }
             )
             return review, review_meta
+        except (JobCancelledError, JobSupersededError, BudgetExhaustedError):
+            raise
         except Exception as exc:  # noqa: BLE001
             _ = exc
             return None
@@ -655,6 +663,7 @@ class IncidentCorrelator:
                         continue
                     hypothesis_vi = ai_review.shared_root_cause_hypothesis
 
+                assert_execution_fencing_in_txn(self._db, session_id=self._session_id)
                 existing_inc = self._db.scalar(
                     select(Incident)
                     .options(selectinload(Incident.incident_cases))

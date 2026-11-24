@@ -1,4 +1,4 @@
-"""Persistent models for Supervisor, Worker Heartbeats, and Challenge Lab (Prompt 09.1)."""
+"""Persistent models for Supervisor, Worker Heartbeats, Event Inbox, and Challenge Lab."""
 
 from __future__ import annotations
 
@@ -76,6 +76,9 @@ class SupervisorState(Base):
     last_llm_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
     llm_calls_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     llm_attempts_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_dispatched_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_reserved_calls: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_reserved_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     llm_succeeded_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     llm_failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     llm_timeout_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -228,6 +231,70 @@ class SupervisorActivity(Base):
     title_vi: Mapped[str] = mapped_column(String(255), nullable=False)
     detail_vi: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
+class NormalizedEvent(Base):
+    """Durable normalized event inbox supporting idempotency, conflict checks, and provenance."""
+
+    __tablename__ = "normalized_events"
+    __table_args__ = (
+        Index(
+            "uq_normalized_events_scope",
+            "session_id",
+            "world_epoch",
+            "merchant_id",
+            "event_id",
+            unique=True,
+        ),
+        Index("ix_normalized_events_session_type", "session_id", "event_type"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    session_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("demo_sessions.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    world_epoch: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    merchant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    verified_source: Mapped[str] = mapped_column(String(64), nullable=False)
+    claimed_source: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_mode: Mapped[str] = mapped_column(String(32), default="MOCK", nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(16), default="1.0", nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    payment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    correlation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    provenance_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    triggered_investigation: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    linked_case_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    linked_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class LlmConcurrencyLease(Base):
+    """PostgreSQL-backed cross-process provider concurrency lease (no Redis required)."""
+
+    __tablename__ = "llm_concurrency_leases"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    worker_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    reserved_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), index=True, nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )

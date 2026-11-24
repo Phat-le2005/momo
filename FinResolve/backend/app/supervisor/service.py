@@ -28,7 +28,10 @@ from __future__ import annotations
 
 import os
 import socket
+import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -74,8 +77,121 @@ from app.models.supervisor import (
 )
 from app.policy.executor import ActionExecutor
 
-DEFAULT_JOB_LEASE_SECONDS = 45
+DEFAULT_JOB_LEASE_SECONDS = 30
 MAX_QUEUE_DEPTH_PER_SESSION = 25
+CONSERVATIVE_LLM_TOKEN_RESERVATION = 1000
+UNKNOWN_USAGE_FALLBACK_TOKENS = 500
+
+
+class _JobHeartbeatThread(threading.Thread):
+    """Independent periodic heartbeat thread that renews job lease and worker heartbeat
+    during external I/O using short-lived DB sessions without holding open transactions."""
+
+    def __init__(
+        self,
+        *,
+        job_id: str,
+        session_id: str,
+        claim_token: str,
+        world_epoch: int,
+        worker_id: str,
+        worker_mode: str,
+    ) -> None:
+        super().__init__(name=f"finresolve-hb-{job_id[:12]}", daemon=True)
+        self._job_id = job_id
+        self._session_id = session_id
+        self._claim_token = claim_token
+        self._world_epoch = world_epoch
+        self._worker_id = worker_id
+        self._worker_mode = worker_mode
+        self._stop_event = threading.Event()
+        self.ownership_lost = threading.Event()
+        self.cancel_detected = threading.Event()
+        self.renewals_count = 0
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _renew_once(self) -> bool:
+        settings = get_settings()
+        maker = get_sessionmaker()
+        now = datetime.now(UTC)
+        try:
+            with maker() as hdb:
+                sess = hdb.get(DemoSession, self._session_id)
+                if sess is None or not sess.is_active:
+                    self.ownership_lost.set()
+                    return False
+
+                state = hdb.get(SupervisorState, self._session_id)
+                if state is None or state.world_epoch != self._world_epoch:
+                    self.ownership_lost.set()
+                    return False
+
+                job = hdb.scalar(
+                    select(SupervisorJob)
+                    .where(SupervisorJob.id == self._job_id)
+                    .with_for_update(skip_locked=True)
+                )
+                if job is None:
+                    exists = hdb.scalar(
+                        select(SupervisorJob.id).where(SupervisorJob.id == self._job_id)
+                    )
+                    hdb.rollback()
+                    if exists is None:
+                        self.ownership_lost.set()
+                        return False
+                    return True
+                if job.claim_token != self._claim_token or job.worker_id != self._worker_id:
+                    self.ownership_lost.set()
+                    hdb.rollback()
+                    return False
+
+                if (
+                    job.status
+                    in (
+                        SupervisorJobStatus.CANCELLING.value,
+                        SupervisorJobStatus.CANCELLED.value,
+                    )
+                    or job.cancel_requested_at is not None
+                ):
+                    self.cancel_detected.set()
+                    self.ownership_lost.set()
+                    hdb.rollback()
+                    return False
+
+                if job.status != SupervisorJobStatus.RUNNING.value:
+                    self.ownership_lost.set()
+                    hdb.rollback()
+                    return False
+
+                if job.locked_until is not None and job.locked_until <= now:
+                    # Never renew an already-expired lease that another worker may reclaim
+                    self.ownership_lost.set()
+                    hdb.rollback()
+                    return False
+
+                job.heartbeat_at = now
+                job.locked_until = now + timedelta(seconds=settings.supervisor_job_lease_seconds)
+                job.updated_at = now
+                upsert_worker_heartbeat(
+                    hdb,
+                    worker_id=self._worker_id,
+                    worker_mode=self._worker_mode,
+                    status="BUSY",
+                    active_job_id=self._job_id,
+                )
+                hdb.commit()
+                self.renewals_count += 1
+                return True
+        except Exception:  # noqa: BLE001
+            return True
+
+    def run(self) -> None:
+        interval = max(0.1, float(get_settings().supervisor_heartbeat_interval_seconds))
+        while not self._stop_event.wait(timeout=interval):
+            if not self._renew_once():
+                break
 
 
 def initial_llm_execution_state() -> str:
@@ -166,6 +282,9 @@ def ensure_supervisor_state(db: Session, session_id: str) -> SupervisorState:
         llm_execution_state=initial_llm_execution_state(),
         llm_calls_count=0,
         llm_attempts_count=0,
+        llm_dispatched_count=0,
+        llm_reserved_calls=0,
+        llm_reserved_tokens=0,
         llm_succeeded_count=0,
         llm_failed_count=0,
         llm_timeout_count=0,
@@ -716,6 +835,21 @@ def recover_stale_supervisor_jobs(
             job.claim_token = None
             job.completed_at = now
             job.updated_at = now
+            if job.challenge_id:
+                ch_cancel = db.scalar(
+                    select(ChallengeRun).where(
+                        ChallengeRun.id == job.challenge_id,
+                        ChallengeRun.session_id == job.session_id,
+                    )
+                )
+                if ch_cancel is not None and ch_cancel.status in (
+                    ChallengeStatus.QUEUED.value,
+                    ChallengeStatus.RUNNING.value,
+                    ChallengeStatus.CANCELLING.value,
+                ):
+                    ch_cancel.status = ChallengeStatus.CANCELLED.value
+                    ch_cancel.safety_verdict = "CANCELLED_BY_USER"
+                    ch_cancel.updated_at = now
             recovered_ids.append(job.id)
             recompute_supervisor_idle_status(db, state)
             continue
@@ -778,6 +912,21 @@ def recover_stale_supervisor_jobs(
             job.updated_at = now
             job.error_message = "Worker interrupted and exceeded bounded max_attempts"
             state.status = SupervisorStatus.DEGRADED.value
+            if job.challenge_id:
+                ch_fail = db.scalar(
+                    select(ChallengeRun).where(
+                        ChallengeRun.id == job.challenge_id,
+                        ChallengeRun.session_id == job.session_id,
+                    )
+                )
+                if ch_fail is not None and ch_fail.status in (
+                    ChallengeStatus.QUEUED.value,
+                    ChallengeStatus.RUNNING.value,
+                    ChallengeStatus.CANCELLING.value,
+                ):
+                    ch_fail.status = ChallengeStatus.FAILED.value
+                    ch_fail.safety_verdict = "WORKER_INTERRUPTED_FAILED"
+                    ch_fail.updated_at = now
             record_activity(
                 db,
                 session_id=job.session_id,
@@ -961,19 +1110,20 @@ def _build_execution_context(
     challenge_id: str | None,
     case_id: str | None,
 ) -> RuntimeExecutionContext:
-    """Create the context-local guard, budget enforcer, and live telemetry recorder for a worker."""
+    """Create the context-local guard, atomic budget enforcer, and live telemetry recorder."""
     maker = get_sessionmaker()
+    pending_reservations: list[int] = []
+    res_lock = threading.Lock()
 
     def _check_guard(stage: str) -> None:
         _ = stage
-        now = datetime.now(UTC)
         with maker() as gdb:
             job = gdb.get(SupervisorJob, job_id)
-            state = ensure_supervisor_state(gdb, session_id)
+            state = gdb.get(SupervisorState, session_id)
             sess = gdb.get(DemoSession, session_id)
             if sess is None or not sess.is_active:
                 raise JobSupersededError("DemoSession expired or revoked during job execution")
-            if state.world_epoch != world_epoch:
+            if state is None or state.world_epoch != world_epoch:
                 raise JobSupersededError("Session MOCK world was reset during job execution")
             if job is None or job.claim_token != claim_token:
                 raise JobSupersededError("Worker lost fencing claim_token ownership")
@@ -986,19 +1136,6 @@ def _build_execution_context(
             if job.status == SupervisorJobStatus.SUPERSEDED.value:
                 raise JobSupersededError("Job was superseded")
 
-            # Renew job lease & worker heartbeat
-            job.heartbeat_at = now
-            job.locked_until = now + timedelta(seconds=DEFAULT_JOB_LEASE_SECONDS)
-            job.updated_at = now
-            upsert_worker_heartbeat(
-                gdb,
-                worker_id=worker_id,
-                worker_mode=worker_mode,
-                status="BUSY",
-                active_job_id=job_id,
-            )
-            gdb.commit()
-
     def _before_llm_call() -> None:
         _check_guard("before_llm_call")
         now = datetime.now(UTC)
@@ -1010,16 +1147,18 @@ def _build_execution_context(
             )
             if state is None:
                 state = ensure_supervisor_state(bdb, session_id)
+            effective_calls = state.llm_attempts_count + state.llm_reserved_calls
+            effective_tokens = state.llm_tokens_used + state.llm_reserved_tokens
             if (
-                state.llm_attempts_count >= state.llm_budget_calls
-                or state.llm_tokens_used >= state.llm_budget_tokens
+                effective_calls >= state.llm_budget_calls
+                or effective_tokens >= state.llm_budget_tokens
             ):
                 state.llm_execution_state = LlmExecutionState.BUDGET_EXHAUSTED.value
                 state.status = SupervisorStatus.DEGRADED.value
                 state.last_llm_error = (
                     f"Session LLM budget exhausted "
-                    f"(calls={state.llm_attempts_count}/{state.llm_budget_calls}, "
-                    f"tokens={state.llm_tokens_used}/{state.llm_budget_tokens})"
+                    f"(calls={effective_calls}/{state.llm_budget_calls}, "
+                    f"tokens={effective_tokens}/{state.llm_budget_tokens})"
                 )
                 state.updated_at = now
                 record_activity(
@@ -1034,16 +1173,25 @@ def _build_execution_context(
                     detail_vi=state.last_llm_error,
                     metadata_json={
                         "llm_attempts_count": state.llm_attempts_count,
+                        "llm_reserved_calls": state.llm_reserved_calls,
                         "llm_budget_calls": state.llm_budget_calls,
                         "llm_tokens_used": state.llm_tokens_used,
+                        "llm_reserved_tokens": state.llm_reserved_tokens,
                         "llm_budget_tokens": state.llm_budget_tokens,
                     },
                 )
                 bdb.commit()
                 raise BudgetExhaustedError(state.last_llm_error)
 
+            remaining_tokens = max(0, state.llm_budget_tokens - effective_tokens)
+            reserve_tok = min(CONSERVATIVE_LLM_TOKEN_RESERVATION, max(1, remaining_tokens))
+            state.llm_reserved_calls += 1
+            state.llm_reserved_tokens += reserve_tok
+            state.llm_dispatched_count += 1
             state.llm_execution_state = LlmExecutionState.LLM_CALL_STARTED.value
             state.updated_at = now
+            with res_lock:
+                pending_reservations.append(reserve_tok)
             record_activity(
                 bdb,
                 session_id=session_id,
@@ -1053,13 +1201,41 @@ def _build_execution_context(
                 job_id=job_id,
                 kind="LLM_CALL_STARTED",
                 title_vi="Đang gọi mô hình LLM suy luận (bước có giới hạn ngân sách)",
-                detail_vi=f"Lượt gọi thứ {state.llm_attempts_count + 1}/{state.llm_budget_calls}.",
-                metadata_json={"attempt_number": state.llm_attempts_count + 1},
+                detail_vi=(
+                    f"Lượt gọi thứ {state.llm_attempts_count + state.llm_reserved_calls}/"
+                    f"{state.llm_budget_calls}."
+                ),
+                metadata_json={
+                    "attempt_number": state.llm_attempts_count + state.llm_reserved_calls,
+                    "reserved_tokens": reserve_tok,
+                },
             )
             bdb.commit()
 
+    def _release_llm_reservation() -> None:
+        with res_lock:
+            reserve_tok = pending_reservations.pop() if pending_reservations else 0
+        if reserve_tok <= 0:
+            return
+        with maker() as rdb:
+            state = rdb.scalar(
+                select(SupervisorState)
+                .where(SupervisorState.session_id == session_id)
+                .with_for_update()
+            )
+            if state is not None:
+                state.llm_reserved_calls = max(0, state.llm_reserved_calls - 1)
+                state.llm_reserved_tokens = max(0, state.llm_reserved_tokens - reserve_tok)
+                state.llm_dispatched_count = max(0, state.llm_dispatched_count - 1)
+                state.updated_at = datetime.now(UTC)
+                rdb.commit()
+
     def _record_llm_outcome(rec: LlmInvocationRecord) -> None:
         now = datetime.now(UTC)
+        reserve_tok = 0
+        if not rec.is_fallback:
+            with res_lock:
+                reserve_tok = pending_reservations.pop() if pending_reservations else 0
         with maker() as rdb:
             state = rdb.scalar(
                 select(SupervisorState)
@@ -1076,6 +1252,9 @@ def _build_execution_context(
                 ):
                     state.llm_execution_state = LlmExecutionState.DEMO_RULES_FALLBACK.value
             else:
+                if reserve_tok > 0:
+                    state.llm_reserved_calls = max(0, state.llm_reserved_calls - 1)
+                    state.llm_reserved_tokens = max(0, state.llm_reserved_tokens - reserve_tok)
                 state.llm_attempts_count += 1
                 if rec.succeeded:
                     state.llm_succeeded_count += 1
@@ -1085,6 +1264,8 @@ def _build_execution_context(
                     state.llm_execution_state = LlmExecutionState.LLM_CALL_SUCCEEDED.value
                     if rec.tokens_unknown or rec.total_tokens is None:
                         state.llm_tokens_unknown_count += 1
+                        # Apply conservative token charge so unknown usage cannot bypass budgets
+                        state.llm_tokens_used += UNKNOWN_USAGE_FALLBACK_TOKENS
                     else:
                         state.llm_tokens_used += max(0, rec.total_tokens)
                     record_activity(
@@ -1097,7 +1278,8 @@ def _build_execution_context(
                         kind="LLM_CALL_SUCCEEDED",
                         title_vi=f"LLM phản hồi thành công ({rec.provider}:{rec.model_name})",
                         detail_vi=(
-                            "Token usage: không báo cáo từ nhà cung cấp (unknown)."
+                            "Token usage: unknown (áp mức dự phòng "
+                            f"{UNKNOWN_USAGE_FALLBACK_TOKENS} tokens để bảo vệ ngân sách)."
                             if rec.tokens_unknown
                             else f"Đã dùng {rec.total_tokens} tokens."
                         ),
@@ -1170,7 +1352,147 @@ def _build_execution_context(
         before_llm_call=_before_llm_call,
         record_llm_outcome=_record_llm_outcome,
         emit_activity=_emit_activity,
+        release_llm_reservation=_release_llm_reservation,
     )
+
+
+@contextmanager
+def session_budget_context(session_id: str) -> Iterator[None]:
+    """Attach a lightweight session-level LLM budget context for legacy/manual API routes
+    when no Supervisor worker execution context is already active."""
+    from app.ai_core.telemetry import get_execution_context
+
+    if get_execution_context() is not None:
+        yield
+        return
+
+    maker = get_sessionmaker()
+    pending_reservations: list[int] = []
+    res_lock = threading.Lock()
+
+    def _before_llm_call() -> None:
+        now = datetime.now(UTC)
+        with maker() as bdb:
+            state = bdb.scalar(
+                select(SupervisorState)
+                .where(SupervisorState.session_id == session_id)
+                .with_for_update()
+            )
+            if state is None:
+                state = ensure_supervisor_state(bdb, session_id)
+            effective_calls = state.llm_attempts_count + state.llm_reserved_calls
+            effective_tokens = state.llm_tokens_used + state.llm_reserved_tokens
+            if (
+                effective_calls >= state.llm_budget_calls
+                or effective_tokens >= state.llm_budget_tokens
+            ):
+                state.llm_execution_state = LlmExecutionState.BUDGET_EXHAUSTED.value
+                state.last_llm_error = (
+                    f"Session LLM budget exhausted "
+                    f"(calls={effective_calls}/{state.llm_budget_calls}, "
+                    f"tokens={effective_tokens}/{state.llm_budget_tokens})"
+                )
+                state.updated_at = now
+                bdb.commit()
+                raise BudgetExhaustedError(state.last_llm_error)
+
+            remaining_tokens = max(0, state.llm_budget_tokens - effective_tokens)
+            reserve_tok = min(CONSERVATIVE_LLM_TOKEN_RESERVATION, max(1, remaining_tokens))
+            state.llm_reserved_calls += 1
+            state.llm_reserved_tokens += reserve_tok
+            state.llm_dispatched_count += 1
+            state.llm_execution_state = LlmExecutionState.LLM_CALL_STARTED.value
+            state.updated_at = now
+            with res_lock:
+                pending_reservations.append(reserve_tok)
+            bdb.commit()
+
+    def _release_llm_reservation() -> None:
+        with res_lock:
+            reserve_tok = pending_reservations.pop() if pending_reservations else 0
+        if reserve_tok <= 0:
+            return
+        with maker() as rdb:
+            state = rdb.scalar(
+                select(SupervisorState)
+                .where(SupervisorState.session_id == session_id)
+                .with_for_update()
+            )
+            if state is not None:
+                state.llm_reserved_calls = max(0, state.llm_reserved_calls - 1)
+                state.llm_reserved_tokens = max(0, state.llm_reserved_tokens - reserve_tok)
+                state.llm_dispatched_count = max(0, state.llm_dispatched_count - 1)
+                state.updated_at = datetime.now(UTC)
+                rdb.commit()
+
+    def _record_llm_outcome(rec: LlmInvocationRecord) -> None:
+        now = datetime.now(UTC)
+        reserve_tok = 0
+        if not rec.is_fallback:
+            with res_lock:
+                reserve_tok = pending_reservations.pop() if pending_reservations else 0
+        with maker() as rdb:
+            state = rdb.scalar(
+                select(SupervisorState)
+                .where(SupervisorState.session_id == session_id)
+                .with_for_update()
+            )
+            if state is None:
+                state = ensure_supervisor_state(rdb, session_id)
+            if rec.is_fallback:
+                state.llm_fallback_count += 1
+            else:
+                if reserve_tok > 0:
+                    state.llm_reserved_calls = max(0, state.llm_reserved_calls - 1)
+                    state.llm_reserved_tokens = max(0, state.llm_reserved_tokens - reserve_tok)
+                state.llm_attempts_count += 1
+                if rec.succeeded:
+                    state.llm_succeeded_count += 1
+                    state.llm_calls_count += 1
+                    state.last_llm_succeeded_at = now
+                    state.llm_execution_state = LlmExecutionState.LLM_CALL_SUCCEEDED.value
+                    if rec.tokens_unknown or rec.total_tokens is None:
+                        state.llm_tokens_unknown_count += 1
+                        state.llm_tokens_used += UNKNOWN_USAGE_FALLBACK_TOKENS
+                    else:
+                        state.llm_tokens_used += max(0, rec.total_tokens)
+                else:
+                    state.llm_failed_count += 1
+                    if rec.timed_out:
+                        state.llm_timeout_count += 1
+                    state.last_llm_failed_at = now
+                    state.last_llm_error = (rec.error_summary or "LLM provider error")[:500]
+                    state.llm_execution_state = LlmExecutionState.LLM_CALL_FAILED.value
+            state.updated_at = now
+            rdb.commit()
+
+    def _noop_guard(_stage: str) -> None:
+        return None
+
+    def _noop_emit(
+        _kind: str,
+        _title: str,
+        _detail: str | None = None,
+        _meta: dict[str, Any] | None = None,
+    ) -> None:
+        return None
+
+    ctx = RuntimeExecutionContext(
+        job_id="",
+        session_id=session_id,
+        claim_token="",
+        world_epoch=1,
+        check_guard=_noop_guard,
+        before_llm_call=_before_llm_call,
+        record_llm_outcome=_record_llm_outcome,
+        emit_activity=_noop_emit,
+        release_llm_reservation=_release_llm_reservation,
+    )
+    tok = set_execution_context(ctx)
+    try:
+        yield
+    finally:
+        reset_execution_context(tok)
 
 
 def _finalize_challenge_and_case_outcome(
@@ -1420,7 +1742,8 @@ def process_next_supervisor_job(
         target_job.claim_token = claim_token
         target_job.started_at = now
         target_job.heartbeat_at = now
-        target_job.locked_until = now + timedelta(seconds=DEFAULT_JOB_LEASE_SECONDS)
+        lease_s = get_settings().supervisor_job_lease_seconds
+        target_job.locked_until = now + timedelta(seconds=lease_s)
         target_job.updated_at = now
 
         target_state.status = SupervisorStatus.INVESTIGATING.value
@@ -1468,7 +1791,17 @@ def process_next_supervisor_job(
         claimed_payload = dict(target_job.payload_json or {})
         db.commit()
 
-    # Phase 2: Execute job under fenced RuntimeExecutionContext without holding job locks
+    # Phase 2: Execute job under fenced RuntimeExecutionContext + independent periodic heartbeat
+    hb_thread = _JobHeartbeatThread(
+        job_id=claimed_job_id,
+        session_id=claimed_session_id,
+        claim_token=claim_token,
+        world_epoch=claimed_world_epoch,
+        worker_id=eff_worker,
+        worker_mode=worker_mode,
+    )
+    hb_thread.start()
+
     exec_ctx = _build_execution_context(
         job_id=claimed_job_id,
         session_id=claimed_session_id,
@@ -1535,20 +1868,53 @@ def process_next_supervisor_job(
                         ).all()
                     )
                     for ch in linked_challenges:
-                        if outcome.proposal.case_id in (ch.linked_case_ids_json or []):
-                            ch.status = ChallengeStatus.COMPLETED.value
-                            ch.safety_verdict = "VERIFIED_RESOLVED"
+                        linked_ids = list(ch.linked_case_ids_json or [])
+                        if outcome.proposal.case_id in linked_ids:
+                            total_cases_count = len(linked_ids)
+                            if total_cases_count > 1:
+                                resolved_count = (
+                                    exec_db.scalar(
+                                        select(func.count(Case.id)).where(
+                                            Case.session_id == claimed_session_id,
+                                            Case.id.in_(linked_ids),
+                                            Case.state == CaseState.RESOLVED.value,
+                                        )
+                                    )
+                                    or 0
+                                )
+                            else:
+                                resolved_count = 1
+                            all_resolved = resolved_count >= max(1, total_cases_count)
+                            ch.status = (
+                                ChallengeStatus.COMPLETED.value
+                                if all_resolved
+                                else ChallengeStatus.PARTIALLY_RESOLVED.value
+                            )
+                            ch.safety_verdict = (
+                                "VERIFIED_RESOLVED" if all_resolved else "PARTIALLY_RESOLVED"
+                            )
                             ch.outcome_json = {
                                 **(ch.outcome_json or {}),
                                 "postconditions_verified": True,
                                 "requires_human_approval": False,
                                 "case_state": case_state_val,
+                                "verified_cases_count": int(resolved_count),
+                                "total_cases_count": total_cases_count,
+                                "all_linked_cases_resolved": all_resolved,
                                 "summary_vi": (
                                     f"Đã phê duyệt & thực thi {outcome.proposal.action_type}, "
                                     "Verifier kiểm chứng hậu điều kiện thành công (PASSED) — "
                                     "hồ sơ chuyển sang RESOLVED."
+                                    if all_resolved
+                                    else (
+                                        f"Đã xác minh {resolved_count}/{total_cases_count} hồ sơ "
+                                        f"({outcome.proposal.case_id} -> RESOLVED). "
+                                        "Các hồ sơ còn lại trong thử thách hàng loạt chưa được "
+                                        "tự động đóng và cần phê duyệt/kiểm chứng độc lập."
+                                    )
                                 ),
                             }
+                            ch.updated_at = datetime.now(UTC)
                     exec_db.commit()
             elif claimed_job_type == SupervisorJobType.CORRELATE_INCIDENT.value:
                 correlator = IncidentCorrelator(exec_db, claimed_session_id)
@@ -1614,6 +1980,8 @@ def process_next_supervisor_job(
         terminal_outcome = "FAILED"
         exec_error = str(exc)
     finally:
+        hb_thread.stop()
+        hb_thread.join(timeout=2.0)
         reset_execution_context(ctx_tok)
 
     # Phase 3: Fenced commit verifying claim_token, world_epoch, session, and cancellation
@@ -1667,6 +2035,29 @@ def process_next_supervisor_job(
             job.error_message = exec_error or "Cancelled cooperatively"
             job.completed_at = now
             job.updated_at = now
+            if claimed_challenge_id:
+                ch_cancel = fin_db.scalar(
+                    select(ChallengeRun).where(
+                        ChallengeRun.id == claimed_challenge_id,
+                        ChallengeRun.session_id == claimed_session_id,
+                    )
+                )
+                if ch_cancel is not None and ch_cancel.status in (
+                    ChallengeStatus.QUEUED.value,
+                    ChallengeStatus.RUNNING.value,
+                    ChallengeStatus.CANCELLING.value,
+                ):
+                    ch_cancel.status = ChallengeStatus.CANCELLED.value
+                    ch_cancel.safety_verdict = "CANCELLED_BY_USER"
+                    ch_cancel.outcome_json = {
+                        **(ch_cancel.outcome_json or {}),
+                        "summary_vi": (
+                            "Worker đã xác nhận dừng hợp tác (CANCELLED); "
+                            "kết quả đến muộn đã bị loại bỏ."
+                        ),
+                        "cancelled_completed_at": now.isoformat(),
+                    }
+                    ch_cancel.updated_at = now
             record_activity(
                 fin_db,
                 session_id=claimed_session_id,
@@ -1690,6 +2081,34 @@ def process_next_supervisor_job(
             job.completed_at = now
             job.updated_at = now
             state.status = SupervisorStatus.DEGRADED.value
+            if claimed_challenge_id:
+                ch_fail = fin_db.scalar(
+                    select(ChallengeRun).where(
+                        ChallengeRun.id == claimed_challenge_id,
+                        ChallengeRun.session_id == claimed_session_id,
+                    )
+                )
+                if ch_fail is not None and ch_fail.status in (
+                    ChallengeStatus.QUEUED.value,
+                    ChallengeStatus.RUNNING.value,
+                    ChallengeStatus.CANCELLING.value,
+                ):
+                    ch_fail.status = ChallengeStatus.FAILED.value
+                    ch_fail.safety_verdict = (
+                        "BUDGET_EXHAUSTED"
+                        if terminal_outcome == "BUDGET_EXHAUSTED"
+                        else "EXECUTION_FAILED"
+                    )
+                    ch_fail.outcome_json = {
+                        **(ch_fail.outcome_json or {}),
+                        "summary_vi": (
+                            "Đã đạt giới hạn ngân sách LLM — dừng điều tra an toàn."
+                            if terminal_outcome == "BUDGET_EXHAUSTED"
+                            else f"Tác vụ thất bại kỹ thuật: {(exec_error or '')[:240]}"
+                        ),
+                        "error_message": (exec_error or terminal_outcome)[:400],
+                    }
+                    ch_fail.updated_at = now
             record_activity(
                 fin_db,
                 session_id=claimed_session_id,

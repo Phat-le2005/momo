@@ -413,12 +413,24 @@ def investigate_case(
             risk_signal_ids=[],
         )
 
-    runtime = BoundedAgentRuntime(db, max_steps=req.max_steps)
-    res = runtime.investigate_case(
-        case_id=case_id,
-        session_id=current_session.id,
-        simulate_timeout=req.simulate_timeout,
-    )
+    from app.ai_core.telemetry import BudgetExhaustedError
+    from app.supervisor.service import session_budget_context
+
+    try:
+        with session_budget_context(current_session.id):
+            runtime = BoundedAgentRuntime(db, max_steps=req.max_steps)
+            res = runtime.investigate_case(
+                case_id=case_id,
+                session_id=current_session.id,
+                simulate_timeout=req.simulate_timeout,
+            )
+    except BudgetExhaustedError as exc:
+        raise AppError(
+            ErrorCode.RATE_LIMITED,
+            str(exc),
+            status_code=429,
+            details={"reason": "SESSION_LLM_BUDGET_EXHAUSTED"},
+        ) from exc
     from sqlalchemy import update as sa_update
 
     from app.models.enums import SupervisorJobStatus

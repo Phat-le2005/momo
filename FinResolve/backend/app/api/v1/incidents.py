@@ -273,15 +273,27 @@ def correlate_session_incidents(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> IncidentListResponse:
-    # Phase 1: Correlate and commit Incidents before Taskforce LLM reasoning
-    correlator = IncidentCorrelator(db, current_session.id)
-    outcome = correlator.correlate_session_cases()
-    db.commit()
+    from app.ai_core.telemetry import BudgetExhaustedError
+    from app.supervisor.service import session_budget_context
 
-    # Phase 2: Run 3-phase zero-lock Taskforce per Incident (each commits its own short txn)
-    tf_manager = TaskforceManager(db, current_session.id, manage_transactions=True)
-    for inc in outcome.incidents:
-        tf_manager.assign_and_run_taskforce(inc, force_rerun=True)
+    try:
+        with session_budget_context(current_session.id):
+            # Phase 1: Correlate and commit Incidents before Taskforce LLM reasoning
+            correlator = IncidentCorrelator(db, current_session.id)
+            outcome = correlator.correlate_session_cases()
+            db.commit()
+
+            # Phase 2: Run 3-phase zero-lock Taskforce per Incident (each commits its own short txn)
+            tf_manager = TaskforceManager(db, current_session.id, manage_transactions=True)
+            for inc in outcome.incidents:
+                tf_manager.assign_and_run_taskforce(inc, force_rerun=True)
+    except BudgetExhaustedError as exc:
+        raise AppError(
+            ErrorCode.RATE_LIMITED,
+            str(exc),
+            status_code=429,
+            details={"reason": "SESSION_LLM_BUDGET_EXHAUSTED"},
+        ) from exc
     return list_incidents(current_session=current_session, db=db)
 
 

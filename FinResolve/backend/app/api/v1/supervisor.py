@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.errors import AppError, ErrorCode
 from app.core.rate_limit import enforce_ai_investigation_rate_limit
-from app.core.session import get_current_session
+from app.core.session import (
+    ServiceIngestionPrincipal,
+    get_current_session,
+    resolve_service_ingestion_principal,
+)
 from app.db.session import get_db
 from app.models.actions import ActionProposal, Verification
 from app.models.cases import Case
@@ -85,7 +89,9 @@ LLM_EXECUTION_LABELS_VI: dict[str, str] = {
 CHALLENGE_STATUS_LABELS_VI: dict[str, str] = {
     "QUEUED": "Đang chờ worker xử lý",
     "RUNNING": "AI đang điều tra",
+    "CANCELLING": "Đang dừng hợp tác",
     "COMPLETED": "Đã hoàn tất",
+    "PARTIALLY_RESOLVED": "Đã xác minh một phần",
     "WAITING_APPROVAL": "Chờ con người phê duyệt",
     "BLOCKED_SAFELY": "Đã chặn an toàn",
     "CANCELLED": "Đã dừng",
@@ -498,16 +504,28 @@ def get_mission_control_overview(
     "/events/ingest",
     response_model=IngestEventResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Ingest a normalized Commerce/Payment event and enqueue Supervisor investigation (202)",
+    summary="Ingest a normalized Commerce/Payment event into durable inbox (202/200)",
 )
 def ingest_business_event(
     payload: NormalizedBusinessEvent,
+    response: Response,
     _rate_limit: None = Depends(enforce_ai_investigation_rate_limit),
     current_session: DemoSession = Depends(get_current_session),
+    service_principal: ServiceIngestionPrincipal | None = Depends(
+        resolve_service_ingestion_principal
+    ),
     db: Session = Depends(get_db),
 ) -> IngestEventResponse:
-    res = ingest_normalized_business_event(db, session_obj=current_session, event=payload)
-    notify_supervisor_worker()
+    res = ingest_normalized_business_event(
+        db,
+        session_obj=current_session,
+        event=payload,
+        service_principal=service_principal,
+    )
+    if res.idempotent_replay:
+        response.status_code = status.HTTP_200_OK
+    elif res.triggered_investigation:
+        notify_supervisor_worker()
     return res
 
 

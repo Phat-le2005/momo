@@ -417,8 +417,10 @@ def test_prompt09_test5_and_test6_duplicate_refund_and_auto_continuation_after_a
 
     ov_after = client.get("/api/v1/supervisor/overview", headers=headers).json()
     assert ov_after["approval_inbox"] == []
-    assert ov_after["latest_challenge"]["safety_verdict"] == "VERIFIED_RESOLVED"
+    assert ov_after["latest_challenge"]["status"] == "PARTIALLY_RESOLVED"
+    assert ov_after["latest_challenge"]["safety_verdict"] == "PARTIALLY_RESOLVED"
     assert ov_after["latest_challenge"]["outcome_json"]["postconditions_verified"] is True
+    assert ov_after["latest_challenge"]["outcome_json"]["verified_cases_count"] == 1
     assert len(ov_after["recent_verifications"]) >= 1
     assert ov_after["recent_verifications"][0]["verdict"] == "PASSED"
 

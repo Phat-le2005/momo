@@ -51,7 +51,8 @@ def clean_database() -> Iterator[None]:
                         "products, warehouses, inventory_levels, order_items, "
                         "inventory_reservations, inventory_movements, sim_payment_events, "
                         "supervisor_states, supervisor_jobs, challenges, "
-                        "supervisor_activities, supervisor_workers CASCADE"
+                        "supervisor_activities, supervisor_workers, "
+                        "normalized_events, llm_concurrency_leases CASCADE"
                     )
                 )
         except Exception:

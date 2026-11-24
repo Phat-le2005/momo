@@ -1642,7 +1642,7 @@
           "challenges",
           "events"
         ],
-        "summary": "Ingest a normalized Commerce/Payment event and enqueue Supervisor investigation (202)",
+        "summary": "Ingest a normalized Commerce/Payment event into durable inbox (202/200)",
         "operationId": "ingest_business_event_api_v1_events_ingest_post",
         "requestBody": {
           "content": {
@@ -3916,12 +3916,47 @@
             "type": "integer",
             "title": "World Epoch"
           },
-          "case_id": {
+          "merchant_id": {
             "type": "string",
+            "title": "Merchant Id"
+          },
+          "verified_source": {
+            "type": "string",
+            "title": "Verified Source"
+          },
+          "event_type": {
+            "type": "string",
+            "title": "Event Type"
+          },
+          "triggered_investigation": {
+            "type": "boolean",
+            "title": "Triggered Investigation"
+          },
+          "idempotent_replay": {
+            "type": "boolean",
+            "title": "Idempotent Replay",
+            "default": false
+          },
+          "case_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Case Id"
           },
           "job_id": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Job Id"
           },
           "job_status": {
@@ -3938,8 +3973,10 @@
           "event_id",
           "session_id",
           "world_epoch",
-          "case_id",
-          "job_id",
+          "merchant_id",
+          "verified_source",
+          "event_type",
+          "triggered_investigation",
           "job_status",
           "source_mode"
         ],
@@ -4445,6 +4482,7 @@
           "merchant_id": {
             "type": "string",
             "maxLength": 64,
+            "minLength": 2,
             "title": "Merchant Id",
             "default": "MERCHANT_MOCK_01"
           },
@@ -4514,8 +4552,15 @@
             "title": "Occurred At"
           },
           "received_at": {
-            "type": "string",
-            "format": "date-time",
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Received At"
           },
           "payload": {

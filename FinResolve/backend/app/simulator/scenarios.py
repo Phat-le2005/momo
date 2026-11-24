@@ -501,7 +501,7 @@ class ScenarioRegistry:
 
             if scenario_id == "mega_live":
                 t_corr = time.perf_counter_ns()
-                dropped_set = set(result["oracle_truth"].get("expected_sync_case_ids") or [])
+                # Strictly observable causal correlation — NEVER read oracle_truth for routing!
                 correlator = IncidentCorrelator(db, session_id, adapter=adapter)
                 outcome = correlator.correlate_session_cases()
                 db.commit()
@@ -509,33 +509,42 @@ class ScenarioRegistry:
                 tf_manager = TaskforceManager(db, session_id, adapter=adapter)
                 taskforce_mode = "DETERMINISTIC_TASKFORCE"
                 incident_ids = []
+                observable_incident_case_ids: list[str] = []
                 for inc in outcome.incidents:
-                    linked_ids = set(
+                    linked_ids = list(
                         db.scalars(
-                            select(IncidentCase.case_id).where(
+                            select(IncidentCase.case_id)
+                            .where(
                                 IncidentCase.session_id == session_id,
                                 IncidentCase.incident_id == inc.id,
                             )
+                            .order_by(IncidentCase.created_at.asc(), IncidentCase.case_id.asc())
                         ).all()
                     )
-                    if linked_ids & dropped_set:
-                        tf_tasks = tf_manager.assign_and_run_taskforce(inc)
-                        db.commit()
-                        refreshed_inc = db.get(Incident, inc.id)
-                        if refreshed_inc is not None:
-                            sf = refreshed_inc.shared_factors_json or {}
-                            if sf.get("llm_output_validated") is True:
-                                taskforce_mode = str(
-                                    sf.get("taskforce_execution_mode")
-                                    or "LLM_API_ADAPTIVE_TASKFORCE"
-                                )
-                            else:
-                                taskforce_mode = "DETERMINISTIC_TASKFORCE"
-                        elif tf_tasks:
-                            first_mode = (tf_tasks[0].handoff_json or {}).get("reasoning_mode")
-                            if isinstance(first_mode, str) and first_mode:
-                                taskforce_mode = first_mode
-                        incident_ids.append(inc.id)
+                    if not linked_ids:
+                        continue
+                    for cid in linked_ids:
+                        if cid not in observable_incident_case_ids:
+                            observable_incident_case_ids.append(cid)
+                    tf_tasks = tf_manager.assign_and_run_taskforce(inc)
+                    db.commit()
+                    refreshed_inc = db.get(Incident, inc.id)
+                    if refreshed_inc is not None:
+                        sf = refreshed_inc.shared_factors_json or {}
+                        if sf.get("llm_output_validated") is True:
+                            taskforce_mode = str(
+                                sf.get("taskforce_execution_mode") or "LLM_API_ADAPTIVE_TASKFORCE"
+                            )
+                        else:
+                            taskforce_mode = "DETERMINISTIC_TASKFORCE"
+                    elif tf_tasks:
+                        first_mode = (tf_tasks[0].handoff_json or {}).get("reasoning_mode")
+                        if isinstance(first_mode, str) and first_mode:
+                            taskforce_mode = first_mode
+                    incident_ids.append(inc.id)
+                if observable_incident_case_ids:
+                    recommended_ids = observable_incident_case_ids[:1]
+                    metrics["recommended_investigation_case_ids"] = recommended_ids
                 corr_ms = max(1, int((time.perf_counter_ns() - t_corr) / 1_000_000))
                 metrics["correlation_ms"] = corr_ms
                 metrics["taskforce_mode"] = taskforce_mode

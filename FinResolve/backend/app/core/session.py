@@ -18,8 +18,22 @@ from app.models.session import DemoSession
 
 SESSION_HEADER = "X-Demo-Session"
 MANAGER_TOKEN_HEADER = "X-Demo-Manager-Token"  # noqa: S105
+SERVICE_TOKEN_HEADER = "X-Service-Token"  # noqa: S105
 
 ALLOWED_APPROVER_ROLES: frozenset[str] = frozenset({"DEMO_MANAGER", "OPS_MANAGER", "FINANCE_LEAD"})
+ALLOWED_SERVICE_SOURCES: frozenset[str] = frozenset(
+    {"MINI_STORE_COMMERCE", "VNPAY_SANDBOX_IPN", "ORDER_EVENT_LOG_DB"}
+)
+
+
+@dataclass(frozen=True)
+class ServiceIngestionPrincipal:
+    """Server-verified service-to-service ingestion identity (never caller-asserted)."""
+
+    session_id: str
+    verified_source: str
+    merchant_id: str
+    source_mode: str = "MOCK"
 
 
 @dataclass(frozen=True)
@@ -221,5 +235,97 @@ def get_current_approver_principal(
         session_id=current_session.id,
         role=norm_role,
         principal_id=clean_id,
+        source_mode=SourceMode.MOCK.value,
+    )
+
+
+def _compute_service_token_hmac(
+    *,
+    session_id: str,
+    session_token: str,
+    source: str,
+    merchant_id: str,
+) -> str:
+    secret = get_settings().demo_approval_secret.get_secret_value().encode()
+    msg = f"svc_v1|MOCK|{session_id}|{session_token}|{source}|{merchant_id}".encode()
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
+
+def issue_service_ingestion_token(
+    session: DemoSession,
+    *,
+    source: str,
+    merchant_id: str = "MERCHANT_MOCK_01",
+) -> str:
+    """Issue a server-signed HMAC token binding an authenticated service source to a session."""
+    norm_source = source.strip().upper()
+    if norm_source not in ALLOWED_SERVICE_SOURCES:
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            f"Unauthorized service ingestion source '{source}'",
+            status_code=403,
+        )
+    clean_merchant = merchant_id.strip()
+    if not clean_merchant or "." in clean_merchant or len(clean_merchant) > 64:
+        raise AppError(ErrorCode.BAD_REQUEST, "Invalid merchant_id", status_code=400)
+    sig = _compute_service_token_hmac(
+        session_id=session.id,
+        session_token=session.token,
+        source=norm_source,
+        merchant_id=clean_merchant,
+    )
+    return f"svc_{norm_source}.{clean_merchant}.{sig}"
+
+
+def resolve_service_ingestion_principal(
+    request: Request,
+    current_session: DemoSession = Depends(get_current_session),
+) -> ServiceIngestionPrincipal | None:
+    """Resolve optional `X-Service-Token` into a verified service principal.
+
+    If absent, returns `None` (the caller is treated as `UNTRUSTED_GUEST_CLIENT` and can only
+    produce `CLAIM` evidence). If present and invalid/forged/cross-session, raises 403 FORBIDDEN.
+    """
+    raw = request.headers.get(SERVICE_TOKEN_HEADER, "").strip()
+    if not raw:
+        return None
+    if not raw.startswith("svc_"):
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            "INVALID_SERVICE_INGESTION_TOKEN: Malformed service token",
+            status_code=403,
+        )
+    parts = raw[4:].split(".")
+    if len(parts) != 3:
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            "INVALID_SERVICE_INGESTION_TOKEN: Malformed service token segments",
+            status_code=403,
+        )
+    src_part, merch_part, sig_part = parts
+    norm_source = src_part.strip().upper()
+    clean_merchant = merch_part.strip()
+    if norm_source not in ALLOWED_SERVICE_SOURCES or not clean_merchant:
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            f"INVALID_SERVICE_INGESTION_TOKEN: Unauthorized service source '{norm_source}'",
+            status_code=403,
+        )
+    expected_sig = _compute_service_token_hmac(
+        session_id=current_session.id,
+        session_token=current_session.token,
+        source=norm_source,
+        merchant_id=clean_merchant,
+    )
+    if not hmac.compare_digest(sig_part, expected_sig):
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            "INVALID_SERVICE_INGESTION_TOKEN: Signature mismatch or cross-session service token",
+            status_code=403,
+        )
+    return ServiceIngestionPrincipal(
+        session_id=current_session.id,
+        verified_source=norm_source,
+        merchant_id=clean_merchant,
         source_mode=SourceMode.MOCK.value,
     )

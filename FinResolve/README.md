@@ -52,3 +52,34 @@ Trong thực tế bán hàng online (đặc biệt các đợt Flash Sale / Mega
 ## Lưu ý về dữ liệu mô phỏng
 
 Toàn bộ đơn hàng, giao dịch thanh toán, hoàn tiền và tồn kho trong FinResolve AI hiện chạy trên **dữ liệu mô phỏng (`MOCK`)**. Hệ thống không kết nối tài khoản ngân hàng, không thực hiện thanh toán hay hoàn tiền thật.
+
+---
+
+## Khởi chạy nhanh (API + Standalone Supervisor Worker + Frontend)
+
+### 1. Docker Compose (khuyến nghị)
+`infra/docker-compose.yml` chạy đầy đủ 4 dịch vụ: `db` (PostgreSQL), `api` (FastAPI + Alembic migrations), `worker` (Standalone Autonomous Supervisor: `python -m app.supervisor.worker`), và `web` (Next.js):
+
+```bash
+cp infra/.env.example infra/.env
+# Đặt DEMO_APPROVAL_SECRET ngẫu nhiên >= 32 ký tự trong infra/.env
+docker compose -f infra/docker-compose.yml up --build
+```
+
+### 2. Chạy cục bộ (Linux / macOS / Windows PowerShell)
+Mở 3 terminal riêng biệt (giữ `ENABLE_EMBEDDED_SUPERVISOR_WORKER=false` để tránh nhân đôi worker):
+
+```powershell
+# Terminal 1 — Backend API (tự chạy Alembic migration trước)
+cd FinResolve/backend
+alembic upgrade head
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+# Terminal 2 — Standalone Autonomous Supervisor Worker
+cd FinResolve/backend
+python -m app.supervisor.worker
+
+# Terminal 3 — Frontend (Next.js)
+cd FinResolve/frontend
+npm run dev
+```

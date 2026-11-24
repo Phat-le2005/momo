@@ -94,6 +94,8 @@ class Settings(BaseSettings):
     max_concurrent_llm_calls: int = Field(default=4, ge=1, le=100)
     enable_embedded_supervisor_worker: bool = False
     worker_heartbeat_ttl_seconds: int = Field(default=15, ge=3, le=300)
+    supervisor_job_lease_seconds: int = Field(default=30, ge=3, le=600)
+    supervisor_heartbeat_interval_seconds: float = Field(default=5.0, gt=0.1, le=120.0)
 
     @field_validator("web_origin")
     @classmethod
@@ -145,6 +147,20 @@ class Settings(BaseSettings):
                     f"Deployed environment (APP_ENV='{self.app_env}') requires an explicit, "
                     "strong DEMO_APPROVAL_SECRET (>= 32 chars, not a repository example or default)"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_supervisor_heartbeat_timing(self) -> Settings:
+        if self.supervisor_heartbeat_interval_seconds >= (self.supervisor_job_lease_seconds / 2.0):
+            raise ValueError(
+                "SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS must be strictly less than half of "
+                "SUPERVISOR_JOB_LEASE_SECONDS"
+            )
+        if self.supervisor_heartbeat_interval_seconds >= float(self.worker_heartbeat_ttl_seconds):
+            raise ValueError(
+                "SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS must be strictly less than "
+                "WORKER_HEARTBEAT_TTL_SECONDS"
+            )
         return self
 
     @property

@@ -50,6 +50,8 @@ from app.models.simulator import (
 )
 from app.models.supervisor import (
     ChallengeRun,
+    LlmConcurrencyLease,
+    NormalizedEvent,
     SupervisorActivity,
     SupervisorJob,
     SupervisorState,
@@ -82,8 +84,10 @@ __all__ = [
     "InventoryLevel",
     "InventoryMovement",
     "InventoryReservation",
+    "LlmConcurrencyLease",
     "LlmExecutionState",
     "MovementReason",
+    "NormalizedEvent",
     "OrderItem",
     "OrderPaymentStatus",
     "OrderStatus",
