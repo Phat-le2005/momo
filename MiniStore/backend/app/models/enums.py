@@ -14,6 +14,12 @@ class OrderStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class ReconciliationStatus(StrEnum):
+    NONE = "NONE"
+    RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
+    RESOLVED = "RESOLVED"
+
+
 class PaymentStatus(StrEnum):
     INITIATED = "INITIATED"
     PENDING = "PENDING"
@@ -68,7 +74,16 @@ class OutboxStatus(StrEnum):
     PENDING = "PENDING"
     DELIVERED = "DELIVERED"
     SKIPPED_UNSUPPORTED = "SKIPPED_UNSUPPORTED"
+    DEAD_LETTER = "DEAD_LETTER"
+    REVIEW_REQUIRED = "REVIEW_REQUIRED"
     FAILED = "FAILED"
+
+
+class OutboxFailureCategory(StrEnum):
+    TRANSIENT = "TRANSIENT"
+    PERMANENT_AUTH = "PERMANENT_AUTH"
+    PERMANENT_CONTRACT = "PERMANENT_CONTRACT"
+    STALE_WORLD = "STALE_WORLD"
 
 
 # Validated Order state machine transitions

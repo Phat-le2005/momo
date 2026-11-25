@@ -40,11 +40,12 @@ def clean_commerce_db() -> Iterator[None]:
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE merchants, commerce_sessions, customers, products, product_variants, "
+                "TRUNCATE merchants, commerce_sessions, merchant_accounts, merchant_sessions, "
+                "service_credentials, customers, products, product_variants, "
                 "inventories, inventory_reservations, carts, cart_items, vouchers, "
-                "voucher_redemptions, orders, order_items, payments, refund_requests, "
-                "refund_transactions, live_sessions, live_products, live_comments, "
-                "complaints, commerce_events, event_outbox CASCADE"
+                "voucher_redemptions, orders, order_items, payments, provider_notifications, "
+                "refund_requests, refund_transactions, live_sessions, live_products, "
+                "live_comments, complaints, commerce_events, event_outbox CASCADE"
             )
         )
     with get_sessionmaker()() as db:

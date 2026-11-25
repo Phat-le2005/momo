@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, Query, Response, status
+from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.auth import (
+    CUSTOMER_COOKIE_NAME,
     CustomerPrincipal,
+    generate_customer_token,
     get_current_customer,
+    verify_mock_provider_secret,
 )
+from app.core.config import get_settings
 from app.core.errors import CommerceError, ErrorCode
-from app.core.rate_limit import enforce_checkout_rate_limit
+from app.core.rate_limit import (
+    enforce_auth_rate_limit,
+    enforce_checkout_rate_limit,
+    enforce_payment_rate_limit,
+)
 from app.db.session import get_db
 from app.models.entities import (
     Cart,
@@ -55,6 +63,7 @@ from app.schemas.commerce import (
     CreateCustomerSessionRequest,
     CreateRefundRequest,
     CustomerIdentityResponse,
+    CustomerMockPayRequest,
     LiveCommentCreateRequest,
     LiveCommentResponse,
     LiveProductItemResponse,
@@ -100,6 +109,8 @@ def _to_payment_response(p: Payment) -> PaymentResponse:
         refundable_remaining_vnd=max(0, p.amount_vnd - p.refunded_amount_vnd),
         status=p.status,
         is_synced_to_order=p.is_synced_to_order,
+        reconciliation_required=p.reconciliation_required,
+        reconciliation_note=p.reconciliation_note,
         confirmed_at=p.confirmed_at,
         created_at=p.created_at,
     )
@@ -115,6 +126,8 @@ def _to_order_response(order: Order) -> OrderResponse:
         customer_id=order.customer_id,
         status=order.status,
         payment_status=order.payment_status,
+        reconciliation_status=order.reconciliation_status,
+        reconciliation_reason=order.reconciliation_reason,
         subtotal_vnd=order.subtotal_vnd,
         discount_vnd=order.discount_vnd,
         shipping_fee_vnd=order.shipping_fee_vnd,
@@ -267,25 +280,15 @@ def _build_cart_response(db: Session, cart: Cart, customer_id: str) -> CartRespo
     )
 
 
-@router.get("/store/bootstrap", summary="Bootstrap FinShop LIVE storefront & test identities")
+@router.get(
+    "/store/bootstrap", summary="Public storefront bootstrap metadata (zero session tokens)"
+)
 def store_bootstrap(db: Session = Depends(get_db)) -> dict[str, Any]:
     merchant = db.get(Merchant, DEFAULT_MERCHANT_ID)
     if merchant is None:
         seed_commerce_data(db)
         merchant = db.get(Merchant, DEFAULT_MERCHANT_ID)
     csess = db.get(CommerceSession, DEFAULT_SESSION_ID)
-    customers = list(
-        db.scalars(
-            select(Customer)
-            .where(
-                Customer.merchant_id == DEFAULT_MERCHANT_ID,
-                Customer.commerce_session_id == DEFAULT_SESSION_ID,
-                Customer.is_test_identity.is_(True),
-            )
-            .order_by(Customer.id.asc())
-            .limit(5)
-        ).all()
-    )
     categories = sorted(
         {
             c
@@ -310,20 +313,6 @@ def store_bootstrap(db: Session = Depends(get_db)) -> dict[str, Any]:
             "world_epoch": csess.world_epoch if csess else 1,
         },
         "categories": categories,
-        "test_customers": [
-            CustomerIdentityResponse(
-                id=c.id,
-                merchant_id=c.merchant_id,
-                commerce_session_id=c.commerce_session_id,
-                display_name=c.display_name,
-                phone=c.phone,
-                email=c.email,
-                default_address=c.default_address,
-                session_token=c.session_token,
-                is_test_identity=c.is_test_identity,
-            ).model_dump()
-            for c in customers
-        ],
         "payment_methods": [
             {
                 "id": "LOCAL_MOCK",
@@ -339,20 +328,17 @@ def store_bootstrap(db: Session = Depends(get_db)) -> dict[str, Any]:
     }
 
 
-@router.post(
-    "/store/customers/session",
-    response_model=CustomerIdentityResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create a new session-scoped test customer identity",
-)
-def create_customer_session(
+def _issue_guest_customer(
     payload: CreateCustomerSessionRequest,
-    db: Session = Depends(get_db),
+    response: Response,
+    db: Session,
 ) -> CustomerIdentityResponse:
     if db.get(CommerceSession, DEFAULT_SESSION_ID) is None:
         seed_commerce_data(db)
+    settings = get_settings()
+    now = datetime.now(UTC)
     cid = f"CUST-{uuid.uuid4().hex[:8].upper()}"
-    tok = f"ctk_{uuid.uuid4().hex}"
+    tok = generate_customer_token()
     cust = Customer(
         id=cid,
         merchant_id=DEFAULT_MERCHANT_ID,
@@ -363,10 +349,20 @@ def create_customer_session(
         default_address=payload.default_address.strip(),
         session_token=tok,
         is_test_identity=True,
+        token_expires_at=now + timedelta(seconds=settings.customer_session_ttl_seconds),
+        revoked_at=None,
     )
     db.add(cust)
     db.commit()
     db.refresh(cust)
+    response.set_cookie(
+        key=CUSTOMER_COOKIE_NAME,
+        value=tok,
+        httponly=True,
+        samesite="lax",
+        secure=not settings.is_local_env,
+        max_age=settings.customer_session_ttl_seconds,
+    )
     return CustomerIdentityResponse(
         id=cust.id,
         merchant_id=cust.merchant_id,
@@ -378,6 +374,70 @@ def create_customer_session(
         session_token=cust.session_token,
         is_test_identity=cust.is_test_identity,
     )
+
+
+@router.post(
+    "/store/customers/session",
+    response_model=CustomerIdentityResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create an isolated guest customer session (returns token only to caller)",
+)
+def create_customer_session(
+    payload: CreateCustomerSessionRequest,
+    response: Response,
+    _rl: None = Depends(enforce_auth_rate_limit),
+    db: Session = Depends(get_db),
+) -> CustomerIdentityResponse:
+    return _issue_guest_customer(payload, response, db)
+
+
+@router.post(
+    "/store/customers/guest",
+    response_model=CustomerIdentityResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create an isolated guest customer session (alias)",
+)
+def create_guest_customer_session(
+    payload: CreateCustomerSessionRequest,
+    response: Response,
+    _rl: None = Depends(enforce_auth_rate_limit),
+    db: Session = Depends(get_db),
+) -> CustomerIdentityResponse:
+    return _issue_guest_customer(payload, response, db)
+
+
+@router.get(
+    "/store/customers/me",
+    response_model=CustomerIdentityResponse,
+    summary="Return the currently authenticated customer identity",
+)
+def get_my_customer_profile(
+    principal: CustomerPrincipal = Depends(get_current_customer),
+) -> CustomerIdentityResponse:
+    c = principal.customer
+    return CustomerIdentityResponse(
+        id=c.id,
+        merchant_id=c.merchant_id,
+        commerce_session_id=c.commerce_session_id,
+        display_name=c.display_name,
+        phone=c.phone,
+        email=c.email,
+        default_address=c.default_address,
+        session_token=c.session_token,
+        is_test_identity=c.is_test_identity,
+    )
+
+
+@router.post("/store/customers/logout", summary="Revoke the active customer session token")
+def logout_customer_session(
+    response: Response,
+    principal: CustomerPrincipal = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    principal.customer.revoked_at = datetime.now(UTC)
+    db.commit()
+    response.delete_cookie(CUSTOMER_COOKIE_NAME)
+    return {"revoked": True, "customer_id": principal.customer.id}
 
 
 @router.get("/store/products", response_model=list[ProductResponse])
@@ -534,7 +594,10 @@ def get_active_live_session(db: Session = Depends(get_db)) -> LiveSessionRespons
             lock_live_product=False,
         )
         fs_rem = (
-            max(0, lp.flash_sale_stock_limit - lp.flash_sale_sold_qty)
+            max(
+                0,
+                lp.flash_sale_stock_limit - lp.flash_sale_reserved_qty - lp.flash_sale_sold_qty,
+            )
             if lp.flash_sale_stock_limit is not None
             else None
         )
@@ -550,6 +613,7 @@ def get_active_live_session(db: Session = Depends(get_db)) -> LiveSessionRespons
             effective_price_vnd=eff_price,
             flash_sale_price_vnd=lp.flash_sale_price_vnd,
             flash_sale_stock_limit=lp.flash_sale_stock_limit,
+            flash_sale_reserved_qty=lp.flash_sale_reserved_qty,
             flash_sale_sold_qty=lp.flash_sale_sold_qty,
             flash_sale_remaining=fs_rem,
             flash_sale_starts_at=lp.flash_sale_starts_at,
@@ -1129,20 +1193,87 @@ def submit_refund_request(
     )
 
 
-# --- Restricted Test-Payment Boundary (LOCAL_MOCK only) ---
+# --- Customer-Initiated LOCAL_MOCK Payment Action (no provider secret in browser) ---
+@router.post(
+    "/store/orders/{order_id}/mock-pay",
+    summary="Customer-authenticated LOCAL_MOCK payment trigger (server-side provider callback)",
+)
+def customer_mock_pay_order(
+    order_id: str,
+    payload: CustomerMockPayRequest,
+    _rl: None = Depends(enforce_payment_rate_limit),
+    principal: CustomerPrincipal = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Allow an authenticated customer to complete a LOCAL_MOCK test payment for THEIR OWN order.
+
+    The backend validates ownership and invokes `MockPaymentAdapter.process_provider_notification`
+    server-side. The browser NEVER receives provider secrets and NEVER modifies other users' orders.
+    """
+    settings = get_settings()
+    if settings.source_mode != "MOCK" or not settings.enable_mock_payment_test_api:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "LOCAL_MOCK test payment action is disabled",
+            status_code=403,
+        )
+    order = db.scalar(
+        select(Order)
+        .options(selectinload(Order.payments))
+        .where(
+            Order.id == order_id,
+            Order.customer_id == principal.customer.id,
+            Order.merchant_id == principal.merchant_id,
+        )
+    )
+    if order is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Không tìm thấy đơn hàng", status_code=404)
+    if not order.payments:
+        raise CommerceError(
+            ErrorCode.CONFLICT, "Đơn hàng chưa có giao dịch thanh toán", status_code=409
+        )
+    pay = order.payments[0]
+    adapter = MockPaymentAdapter()
+    notif_id = f"MOCK-CUST-{uuid.uuid4().hex[:12].upper()}"
+    updated_pay, is_dup = adapter.process_provider_notification(
+        db,
+        provider_ref=pay.provider_ref,
+        notification_id=notif_id,
+        merchant_id=order.merchant_id,
+        order_id=order.id,
+        amount_vnd=pay.amount_vnd,
+        outcome=payload.outcome,
+        raw_payload={"initiated_by": "customer_mock_pay", "customer_id": principal.customer.id},
+    )
+    synced_count = 0
+    if payload.auto_sync_order and updated_pay.status == PaymentStatus.SUCCEEDED.value:
+        synced_count = sync_confirmed_payments_to_orders(db, limit=10)
+        db.refresh(updated_pay)
+
+    return {
+        "payment": _to_payment_response(updated_pay).model_dump(),
+        "is_duplicate_notification": is_dup,
+        "orders_synced": synced_count,
+    }
+
+
+# --- Restricted Server-Side Provider Callback Boundary (LOCAL_MOCK only) ---
 @router.post(
     "/test-payments/mock/notify",
-    summary="Restricted LOCAL_MOCK payment provider notification boundary (test mode only)",
+    summary="Server-authenticated LOCAL_MOCK payment provider notification boundary",
 )
 def mock_payment_provider_notify(
     payload: MockPaymentNotifyRequest,
+    request: Request,
+    _rl: None = Depends(enforce_payment_rate_limit),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Process a simulated LOCAL_MOCK payment gateway callback.
 
-    Customers cannot directly mutate payment rows; this explicit test boundary validates
-    merchant, order, integer VND amount, idempotency, and state machine transitions.
+    Strictly protected by `X-Mock-Provider-Secret` matching `COMMERCE_MOCK_PROVIDER_SECRET`.
+    Anonymous browser calls are rejected with 403.
     """
+    verify_mock_provider_secret(request)
     adapter = MockPaymentAdapter()
     payment, is_duplicate = adapter.process_provider_notification(
         db,

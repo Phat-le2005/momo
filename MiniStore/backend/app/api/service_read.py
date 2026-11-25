@@ -1,7 +1,8 @@
-"""Authenticated Scoped Service Read APIs for future FinResolve Read Connectors (Section 12).
+"""Authenticated Scoped Service Read APIs for FinResolve Read Connectors (Prompt 10.1).
 
-Protected strictly by `X-Commerce-Service-Key` + `X-Merchant-Id` + `X-Commerce-Session-Id`
-(+ optional `X-World-Epoch`). Browser clients NEVER receive service credentials.
+Protected strictly by `X-Commerce-Service-Key` (validated against `service_credentials` bound
+to merchant_id & commerce_session_id) + `X-Merchant-Id` + `X-Commerce-Session-Id` + required
+`X-World-Epoch`. Browser clients NEVER receive service credentials.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.auth import ServicePrincipal, get_service_principal
@@ -17,6 +18,7 @@ from app.core.errors import CommerceError, ErrorCode
 from app.db.session import get_db
 from app.models.entities import (
     CommerceEvent,
+    EventOutbox,
     Inventory,
     LiveSession,
     Order,
@@ -25,7 +27,7 @@ from app.models.entities import (
     RefundTransaction,
     VoucherRedemption,
 )
-from app.models.enums import OrderStatus, PaymentStatus
+from app.models.enums import OrderStatus, OutboxStatus, PaymentStatus, ReconciliationStatus
 from app.payments.adapter import MockPaymentAdapter
 
 router = APIRouter(prefix="/service", tags=["service-read-connectors"])
@@ -82,10 +84,15 @@ def service_get_payment_observation(
         "status": obs.status,
         "amount_vnd": obs.amount_vnd,
         "refunded_amount_vnd": obs.refunded_amount_vnd,
+        "pending_refund_amount_vnd": obs.pending_refund_amount_vnd,
+        "unknown_refund_amount_vnd": obs.unknown_refund_amount_vnd,
         "refundable_remaining_vnd": obs.refundable_remaining_vnd,
         "is_synced_to_order": obs.is_synced_to_order,
+        "reconciliation_required": obs.reconciliation_required,
+        "reconciliation_note": obs.reconciliation_note,
         "confirmed_at": obs.confirmed_at.isoformat() if obs.confirmed_at else None,
         "observed_at": obs.observed_at.isoformat(),
+        "authoritative_provenance": obs.authoritative_provenance,
     }
 
 
@@ -130,6 +137,7 @@ def service_get_inventory(
         select(Inventory)
         .options(selectinload(Inventory.variant))
         .where(Inventory.merchant_id == principal.merchant_id)
+        .order_by(Inventory.variant_id.asc())
     )
     if variant_id:
         stmt = stmt.where(Inventory.variant_id == variant_id)
@@ -150,35 +158,68 @@ def service_get_inventory(
 
 @router.get("/events")
 def service_get_recent_events(
+    after_id: str | None = Query(default=None, max_length=64),
     limit: int = Query(default=50, ge=1, le=200),
     principal: ServicePrincipal = Depends(get_service_principal),
     db: Session = Depends(get_db),
-) -> list[dict[str, Any]]:
-    rows = list(
-        db.scalars(
-            select(CommerceEvent)
-            .where(
+) -> dict[str, Any]:
+    """Cursor-based paginated commerce event stream ordered stably by `(occurred_at, id)`."""
+    stmt = select(CommerceEvent).where(
+        CommerceEvent.merchant_id == principal.merchant_id,
+        CommerceEvent.commerce_session_id == principal.commerce_session_id,
+        CommerceEvent.world_epoch == principal.world_epoch,
+    )
+    if after_id:
+        anchor = db.scalar(
+            select(CommerceEvent).where(
+                CommerceEvent.id == after_id,
                 CommerceEvent.merchant_id == principal.merchant_id,
                 CommerceEvent.commerce_session_id == principal.commerce_session_id,
-                CommerceEvent.world_epoch == principal.world_epoch,
             )
-            .order_by(CommerceEvent.occurred_at.desc())
-            .limit(limit)
+        )
+        if anchor is None:
+            raise CommerceError(
+                ErrorCode.BAD_REQUEST,
+                f"Invalid cursor after_id '{after_id}'",
+                status_code=400,
+            )
+        stmt = stmt.where(
+            or_(
+                CommerceEvent.occurred_at > anchor.occurred_at,
+                and_(
+                    CommerceEvent.occurred_at == anchor.occurred_at,
+                    CommerceEvent.id > anchor.id,
+                ),
+            )
+        )
+
+    rows = list(
+        db.scalars(
+            stmt.order_by(CommerceEvent.occurred_at.asc(), CommerceEvent.id.asc()).limit(limit + 1)
         ).all()
     )
-    return [
-        {
-            "event_id": e.event_id,
-            "event_type": e.event_type,
-            "source": e.source,
-            "order_id": e.order_id,
-            "payment_id": e.payment_id,
-            "correlation_id": e.correlation_id,
-            "occurred_at": e.occurred_at.isoformat(),
-            "payload": e.payload_json,
-        }
-        for e in rows
-    ]
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor = page[-1].id if has_more and page else None
+
+    return {
+        "items": [
+            {
+                "id": e.id,
+                "event_id": e.event_id,
+                "event_type": e.event_type,
+                "source": e.source,
+                "order_id": e.order_id,
+                "payment_id": e.payment_id,
+                "correlation_id": e.correlation_id,
+                "occurred_at": e.occurred_at.isoformat(),
+                "payload": e.payload_json,
+            }
+            for e in page
+        ],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
 
 
 @router.get("/orders/{order_id}/timeline")
@@ -195,11 +236,12 @@ def service_get_order_timeline(
                 CommerceEvent.merchant_id == principal.merchant_id,
                 CommerceEvent.commerce_session_id == principal.commerce_session_id,
             )
-            .order_by(CommerceEvent.occurred_at.asc())
+            .order_by(CommerceEvent.occurred_at.asc(), CommerceEvent.id.asc())
         ).all()
     )
     return [
         {
+            "id": e.id,
             "event_id": e.event_id,
             "event_type": e.event_type,
             "occurred_at": e.occurred_at.isoformat(),
@@ -290,6 +332,16 @@ def service_get_operational_metrics(
         )
         or 0
     )
+    reconciliation_required_orders = int(
+        db.scalar(
+            select(func.count(Order.id)).where(
+                Order.merchant_id == mid,
+                Order.commerce_session_id == sid,
+                Order.reconciliation_status == ReconciliationStatus.RECONCILIATION_REQUIRED.value,
+            )
+        )
+        or 0
+    )
     succeeded_payments = int(
         db.scalar(
             select(func.count(Payment.id)).where(
@@ -311,12 +363,22 @@ def service_get_operational_metrics(
         )
         or 0
     )
+    outbox_lag_count = int(
+        db.scalar(
+            select(func.count(EventOutbox.id)).where(
+                EventOutbox.status == OutboxStatus.PENDING.value
+            )
+        )
+        or 0
+    )
     return {
         "merchant_id": mid,
         "commerce_session_id": sid,
         "world_epoch": principal.world_epoch,
         "orders_total": orders_total,
         "pending_payment_orders": pending_orders,
+        "reconciliation_required_orders": reconciliation_required_orders,
         "succeeded_payments": succeeded_payments,
         "unsynced_payments": unsynced_payments,
+        "outbox_lag_count": outbox_lag_count,
     }

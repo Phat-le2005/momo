@@ -42,14 +42,41 @@ def reset_rate_limiter() -> None:
     _limiter.reset()
 
 
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client and request.client.host else "unknown"
+
+
 def enforce_checkout_rate_limit(request: Request) -> None:
-    ip = request.client.host if request.client and request.client.host else "unknown"
     limit = get_settings().rate_limit_checkout_per_minute
-    ok, retry = _limiter.check(f"checkout:{ip}", limit=limit)
+    ok, retry = _limiter.check(f"checkout:{_client_ip(request)}", limit=limit)
     if not ok:
         raise CommerceError(
             ErrorCode.RATE_LIMITED,
             f"Too many checkout requests; retry in {retry}s",
+            status_code=429,
+            details={"retry_after_seconds": retry},
+        )
+
+
+def enforce_auth_rate_limit(request: Request) -> None:
+    limit = get_settings().rate_limit_auth_per_minute
+    ok, retry = _limiter.check(f"auth:{_client_ip(request)}", limit=limit)
+    if not ok:
+        raise CommerceError(
+            ErrorCode.RATE_LIMITED,
+            f"Too many authentication attempts; retry in {retry}s",
+            status_code=429,
+            details={"retry_after_seconds": retry},
+        )
+
+
+def enforce_payment_rate_limit(request: Request) -> None:
+    limit = get_settings().rate_limit_payment_per_minute
+    ok, retry = _limiter.check(f"payment:{_client_ip(request)}", limit=limit)
+    if not ok:
+        raise CommerceError(
+            ErrorCode.RATE_LIMITED,
+            f"Too many payment requests; retry in {retry}s",
             status_code=429,
             details={"retry_after_seconds": retry},
         )

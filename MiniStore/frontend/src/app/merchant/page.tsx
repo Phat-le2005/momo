@@ -12,10 +12,18 @@ import {
   type ProductDTO,
   type RefundRequestDTO,
   type VoucherDTO,
+  clearStoredMerchantToken,
   commerceFetch,
-  ensureMerchantToken,
+  getStoredMerchantToken,
+  loginMerchant,
+  logoutMerchant,
 } from "@/lib/commerce-api";
-import { formatVnd, orderStatusLabelVi, paymentStatusLabelVi } from "@/lib/commerce-utils";
+import {
+  formatVnd,
+  orderStatusLabelVi,
+  paymentStatusLabelVi,
+  reconciliationLabelVi,
+} from "@/lib/commerce-utils";
 
 type TabKey =
   | "overview"
@@ -31,21 +39,29 @@ type TabKey =
 const SIDEBAR_TABS: Array<{ key: TabKey; label: string }> = [
   { key: "overview", label: "Tổng quan" },
   { key: "products", label: "Sản phẩm" },
-  { key: "orders", label: "Đơn hàng" },
+  { key: "orders", label: "Đơn hàng & Đối soát" },
   { key: "inventory", label: "Kho hàng" },
   { key: "payments", label: "Thanh toán" },
   { key: "refunds", label: "Hoàn tiền & Khiếu nại" },
   { key: "vouchers", label: "Voucher" },
   { key: "live", label: "Phiên LIVE" },
-  { key: "events", label: "Nhật ký hoạt động" },
+  { key: "events", label: "Nhật ký & Outbox" },
 ];
 
 export default function MerchantCenterPage() {
   const [tab, setTab] = useState<TabKey>("overview");
   const [merchantToken, setMerchantToken] = useState<string | null>(null);
+  const [operatorId, setOperatorId] = useState<string>("");
+  const [authChecking, setAuthChecking] = useState(true);
+  const [loginUsername, setLoginUsername] = useState("merchant_owner");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [loggingIn, setLoggingIn] = useState(false);
+
   const [overview, setOverview] = useState<MerchantOverviewDTO | null>(null);
   const [products, setProducts] = useState<ProductDTO[]>([]);
   const [orders, setOrders] = useState<OrderDTO[]>([]);
+  const [orderSearch, setOrderSearch] = useState("");
   const [payments, setPayments] = useState<PaymentDTO[]>([]);
   const [refunds, setRefunds] = useState<RefundRequestDTO[]>([]);
   const [complaints, setComplaints] = useState<ComplaintDTO[]>([]);
@@ -66,11 +82,14 @@ export default function MerchantCenterPage() {
   const [vTitle, setVTitle] = useState("");
   const [vValue, setVValue] = useState("20000");
 
-  async function refreshAll(tok: string) {
+  async function refreshAll(tok: string, q?: string) {
+    const orderUrl = q && q.trim()
+      ? `/api/v1/merchant/orders?q=${encodeURIComponent(q.trim())}`
+      : "/api/v1/merchant/orders";
     const [ov, prods, ords, pays, refs, cmps, vchs, lv, evs] = await Promise.all([
       commerceFetch<MerchantOverviewDTO>("/api/v1/merchant/overview", { merchantToken: tok }),
       commerceFetch<ProductDTO[]>("/api/v1/merchant/products", { merchantToken: tok }),
-      commerceFetch<OrderDTO[]>("/api/v1/merchant/orders", { merchantToken: tok }),
+      commerceFetch<OrderDTO[]>(orderUrl, { merchantToken: tok }),
       commerceFetch<PaymentDTO[]>("/api/v1/merchant/payments", { merchantToken: tok }),
       commerceFetch<RefundRequestDTO[]>("/api/v1/merchant/refunds", { merchantToken: tok }),
       commerceFetch<ComplaintDTO[]>("/api/v1/merchant/complaints", { merchantToken: tok }),
@@ -91,37 +110,153 @@ export default function MerchantCenterPage() {
 
   useEffect(() => {
     let mounted = true;
-    async function init() {
+    async function checkExistingSession() {
+      const existing = getStoredMerchantToken();
+      if (!existing) {
+        if (mounted) setAuthChecking(false);
+        return;
+      }
       try {
-        const tok = await ensureMerchantToken();
+        const me = await commerceFetch<{ operator_id: string }>("/api/v1/merchant/auth/me", {
+          merchantToken: existing,
+        });
         if (!mounted) return;
-        setMerchantToken(tok);
-        await refreshAll(tok);
-      } catch (err) {
-        if (mounted) setNotice(err instanceof Error ? err.message : "Không thể mở Kênh Người Bán");
+        setMerchantToken(existing);
+        setOperatorId(me.operator_id);
+        await refreshAll(existing);
+      } catch {
+        clearStoredMerchantToken();
+      } finally {
+        if (mounted) setAuthChecking(false);
       }
     }
-    void init();
+    void checkExistingSession();
     return () => {
       mounted = false;
     };
   }, []);
+
+  async function handleLogin(e: React.FormEvent) {
+    e.preventDefault();
+    setLoginError(null);
+    setLoggingIn(true);
+    try {
+      const res = await loginMerchant(loginUsername.trim(), loginPassword);
+      setMerchantToken(res.merchant_token);
+      setOperatorId(res.operator_id);
+      setLoginPassword("");
+      await refreshAll(res.merchant_token);
+    } catch (err) {
+      setLoginError(err instanceof Error ? err.message : "Đăng nhập thất bại");
+    } finally {
+      setLoggingIn(false);
+    }
+  }
+
+  async function handleLogout() {
+    await logoutMerchant();
+    setMerchantToken(null);
+    setOperatorId("");
+    setOverview(null);
+    setNotice(null);
+  }
 
   async function runAction(fn: () => Promise<void>, successMsg: string) {
     if (!merchantToken) return;
     try {
       await fn();
       setNotice(successMsg);
-      await refreshAll(merchantToken);
+      await refreshAll(merchantToken, orderSearch);
     } catch (err) {
       setNotice(err instanceof Error ? err.message : "Thao tác thất bại");
     }
   }
 
+  if (authChecking) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-[#f4f5f7] text-sm text-slate-600">
+        Đang kiểm tra phiên đăng nhập Kênh Người Bán...
+      </div>
+    );
+  }
+
+  if (!merchantToken) {
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center bg-[#f4f5f7] px-4 py-10 text-[#161823]">
+        <div className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-7 shadow-sm">
+          <div className="flex items-center gap-3">
+            <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-[#161823] text-sm font-black text-white">
+              MC
+            </span>
+            <div>
+              <h1 className="text-lg font-extrabold">Đăng nhập Kênh Người Bán</h1>
+              <p className="text-xs text-slate-500">
+                FinShop LIVE Merchant Center · Xác thực phiên bảo mật
+              </p>
+            </div>
+          </div>
+
+          {loginError && (
+            <div className="mt-4 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-xs font-semibold text-rose-700">
+              {loginError}
+            </div>
+          )}
+
+          <form onSubmit={handleLogin} className="mt-5 space-y-3.5">
+            <label className="block text-xs font-bold text-slate-700">
+              Tên đăng nhập
+              <input
+                required
+                value={loginUsername}
+                onChange={(e) => setLoginUsername(e.target.value)}
+                autoComplete="username"
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm outline-none focus:border-[#fe2c55]"
+              />
+            </label>
+            <label className="block text-xs font-bold text-slate-700">
+              Mật khẩu
+              <input
+                required
+                type="password"
+                value={loginPassword}
+                onChange={(e) => setLoginPassword(e.target.value)}
+                autoComplete="current-password"
+                placeholder="Nhập mật khẩu quản trị cửa hàng"
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm outline-none focus:border-[#fe2c55]"
+              />
+            </label>
+            <button
+              type="submit"
+              disabled={loggingIn}
+              className="w-full rounded-xl bg-[#fe2c55] py-3 text-sm font-extrabold text-white transition hover:bg-[#e02047] disabled:bg-slate-300"
+            >
+              {loggingIn ? "Đang xác thực..." : "Đăng nhập Kênh Người Bán"}
+            </button>
+          </form>
+
+          <div className="mt-5 rounded-xl bg-slate-50 p-3 text-[11px] text-slate-600">
+            <p className="font-bold text-slate-800">Lưu ý môi trường thử nghiệm (MOCK):</p>
+            <p className="mt-0.5">
+              Tài khoản thử nghiệm mặc định được cấu hình qua biến môi trường{" "}
+              <code className="font-mono">COMMERCE_TEST_MERCHANT_USERNAME</code> /{" "}
+              <code className="font-mono">COMMERCE_TEST_MERCHANT_PASSWORD</code>.
+            </p>
+          </div>
+
+          <div className="mt-4 text-center">
+            <Link href="/" className="text-xs font-semibold text-slate-600 hover:text-[#fe2c55]">
+              ← Quay lại cửa hàng FinShop LIVE
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[#f4f5f7] text-[#161823]">
       <header className="border-b border-slate-200 bg-white px-6 py-3.5">
-        <div className="mx-auto flex max-w-7xl items-center justify-between">
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <span className="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-[#161823] text-xs font-black text-white">
               MC
@@ -131,20 +266,30 @@ export default function MerchantCenterPage() {
                 FinShop LIVE — Kênh Người Bán (Merchant Center)
               </h1>
               <p className="text-[11px] text-slate-500">
-                Hệ thống quản trị vận hành độc lập · Dữ liệu thử nghiệm MOCK
+                Quản trị viên: <strong>{operatorId || "merchant_owner"}</strong> · Dữ liệu thử
+                nghiệm MOCK
               </p>
             </div>
           </div>
-          <Link
-            href="/"
-            className="rounded-xl border border-slate-300 bg-white px-3.5 py-1.5 text-xs font-bold text-slate-800 hover:border-[#fe2c55] hover:text-[#fe2c55]"
-          >
-            ← Về cửa hàng khách
-          </Link>
+          <div className="flex items-center gap-2">
+            <Link
+              href="/"
+              className="rounded-xl border border-slate-300 bg-white px-3.5 py-1.5 text-xs font-bold text-slate-800 hover:border-[#fe2c55] hover:text-[#fe2c55]"
+            >
+              ← Về cửa hàng khách
+            </Link>
+            <button
+              type="button"
+              onClick={() => void handleLogout()}
+              className="rounded-xl bg-slate-900 px-3.5 py-1.5 text-xs font-bold text-white hover:bg-slate-700"
+            >
+              Đăng xuất
+            </button>
+          </div>
         </div>
       </header>
 
-      <div className="mx-auto grid max-w-7xl gap-5 px-4 py-5 lg:grid-cols-[220px_1fr]">
+      <div className="mx-auto grid max-w-7xl gap-5 px-4 py-5 lg:grid-cols-[230px_1fr]">
         <aside className="rounded-2xl border border-slate-200 bg-white p-2.5">
           <nav className="space-y-1">
             {SIDEBAR_TABS.map((item) => (
@@ -152,13 +297,20 @@ export default function MerchantCenterPage() {
                 key={item.key}
                 type="button"
                 onClick={() => setTab(item.key)}
-                className={`w-full rounded-xl px-3 py-2 text-left text-xs font-bold transition ${
+                className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-xs font-bold transition ${
                   tab === item.key
                     ? "bg-[#fe2c55] text-white"
                     : "text-slate-700 hover:bg-slate-100"
                 }`}
               >
-                {item.label}
+                <span>{item.label}</span>
+                {item.key === "orders" &&
+                  overview &&
+                  overview.reconciliation_required_count > 0 && (
+                    <span className="rounded-full bg-amber-400 px-1.5 py-0.5 text-[10px] font-black text-slate-900">
+                      {overview.reconciliation_required_count}
+                    </span>
+                  )}
               </button>
             ))}
           </nav>
@@ -176,14 +328,20 @@ export default function MerchantCenterPage() {
               <p className="text-xs text-slate-500">{overview.metrics_note_vi}</p>
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 {[
-                  { label: "Doanh thu test đã xác nhận", value: formatVnd(overview.confirmed_revenue_vnd) },
+                  {
+                    label: "Doanh thu test đã xác nhận",
+                    value: formatVnd(overview.confirmed_revenue_vnd),
+                  },
                   { label: "Tổng số đơn hàng", value: String(overview.order_count) },
-                  { label: "Thanh toán đang chờ", value: String(overview.pending_payments) },
+                  { label: "Đơn cần đối soát", value: String(overview.reconciliation_required_count) },
                   { label: "Đơn chờ đóng gói / giao", value: String(overview.pending_fulfillment) },
+                  { label: "Thanh toán đang chờ", value: String(overview.pending_payments) },
                   { label: "Yêu cầu hoàn tiền chờ duyệt", value: String(overview.refund_requests) },
                   { label: "Khiếu nại đang mở", value: String(overview.open_complaints) },
-                  { label: "Tổng tồn kho khả dụng", value: String(overview.total_available_inventory) },
-                  { label: "Sản phẩm sắp hết hàng", value: String(overview.low_stock_products_count) },
+                  {
+                    label: "Outbox chờ / Dead-letter",
+                    value: `${overview.outbox_pending_count} / ${overview.outbox_dead_letter_count}`,
+                  },
                 ].map((m) => (
                   <div
                     key={m.label}
@@ -279,6 +437,27 @@ export default function MerchantCenterPage() {
 
           {tab === "orders" && (
             <div className="space-y-3">
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (merchantToken) void refreshAll(merchantToken, orderSearch);
+                }}
+                className="flex gap-2 rounded-2xl border border-slate-200 bg-white p-3"
+              >
+                <input
+                  value={orderSearch}
+                  onChange={(e) => setOrderSearch(e.target.value)}
+                  placeholder="Tìm theo mã đơn, tên khách hoặc số điện thoại..."
+                  className="w-full rounded-xl border border-slate-300 px-3 py-1.5 text-xs outline-none focus:border-[#fe2c55]"
+                />
+                <button
+                  type="submit"
+                  className="shrink-0 rounded-xl bg-[#161823] px-4 py-1.5 text-xs font-bold text-white"
+                >
+                  Tìm kiếm
+                </button>
+              </form>
+
               {orders.length === 0 ? (
                 <div className="rounded-2xl bg-white p-6 text-center text-xs text-slate-500">
                   Chưa có đơn hàng nào.
@@ -287,12 +466,23 @@ export default function MerchantCenterPage() {
                 orders.map((o) => (
                   <div
                     key={o.id}
-                    className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white p-4 text-xs"
+                    className={`flex flex-wrap items-center justify-between gap-3 rounded-2xl border bg-white p-4 text-xs ${
+                      o.reconciliation_status === "RECONCILIATION_REQUIRED"
+                        ? "border-amber-400 bg-amber-50/40"
+                        : "border-slate-200"
+                    }`}
                   >
                     <div>
-                      <p className="font-black text-slate-900">
-                        {o.order_code} · {formatVnd(o.total_vnd)}
-                      </p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="font-black text-slate-900">
+                          {o.order_code} · {formatVnd(o.total_vnd)}
+                        </p>
+                        {reconciliationLabelVi(o.reconciliation_status) && (
+                          <span className="rounded-full bg-amber-200 px-2 py-0.5 text-[10px] font-bold text-amber-950">
+                            {reconciliationLabelVi(o.reconciliation_status)}
+                          </span>
+                        )}
+                      </div>
                       <p className="text-slate-600">
                         {o.recipient_name} ({o.recipient_phone}) — {o.shipping_address}
                       </p>
@@ -300,8 +490,38 @@ export default function MerchantCenterPage() {
                         Đơn: <strong>{orderStatusLabelVi(o.status)}</strong> · Thanh toán:{" "}
                         <strong>{paymentStatusLabelVi(o.payment_status)}</strong>
                       </p>
+                      {o.reconciliation_reason && (
+                        <p className="mt-1 text-[11px] font-medium text-amber-900">
+                          Ghi chú đối soát: {o.reconciliation_reason}
+                        </p>
+                      )}
                     </div>
-                    <div className="flex gap-1.5">
+                    <div className="flex flex-wrap gap-1.5">
+                      {o.reconciliation_status === "RECONCILIATION_REQUIRED" && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void runAction(
+                              () =>
+                                commerceFetch(
+                                  `/api/v1/merchant/orders/${o.id}/reconciliation/resolve`,
+                                  {
+                                    method: "POST",
+                                    merchantToken,
+                                    body: JSON.stringify({
+                                      resolution_note:
+                                        "Người bán đã đối soát giao dịch và xác nhận xử lý thủ công.",
+                                    }),
+                                  },
+                                ),
+                              `Đã đánh dấu hoàn tất đối soát cho đơn ${o.order_code}`,
+                            )
+                          }
+                          className="rounded-lg bg-amber-600 px-3 py-1.5 font-bold text-white"
+                        >
+                          Xác nhận đã đối soát
+                        </button>
+                      )}
                       {o.status === "CONFIRMED" && (
                         <button
                           type="button"
@@ -443,7 +663,7 @@ export default function MerchantCenterPage() {
                       <th className="p-3">Số tiền</th>
                       <th className="p-3">Đã hoàn</th>
                       <th className="p-3">Trạng thái</th>
-                      <th className="p-3">Đồng bộ đơn</th>
+                      <th className="p-3">Đồng bộ / Đối soát</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -453,7 +673,17 @@ export default function MerchantCenterPage() {
                         <td className="p-3 font-bold">{formatVnd(p.amount_vnd)}</td>
                         <td className="p-3">{formatVnd(p.refunded_amount_vnd)}</td>
                         <td className="p-3">{paymentStatusLabelVi(p.status)}</td>
-                        <td className="p-3">{p.is_synced_to_order ? "Đã đồng bộ" : "Chưa đồng bộ"}</td>
+                        <td className="p-3">
+                          {p.reconciliation_required ? (
+                            <span className="rounded-full bg-amber-100 px-2 py-0.5 font-bold text-amber-900">
+                              Cần đối soát
+                            </span>
+                          ) : p.is_synced_to_order ? (
+                            "Đã đồng bộ"
+                          ) : (
+                            "Chưa đồng bộ"
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -652,12 +882,13 @@ export default function MerchantCenterPage() {
                   >
                     <div>
                       <p className="font-bold">
-                        {lp.is_pinned ? "📌 " : ""}
+                        {lp.is_pinned ? "[ĐANG GHIM] " : ""}
                         {lp.product_title} ({lp.variant_title})
                       </p>
                       <p className="text-slate-500">
-                        Giá LIVE: <strong>{formatVnd(lp.effective_price_vnd)}</strong> · Đã bán
-                        Flash Sale: {lp.flash_sale_sold_qty}/{lp.flash_sale_stock_limit ?? "∞"}
+                        Giá LIVE: <strong>{formatVnd(lp.effective_price_vnd)}</strong> · Giữ chỗ:{" "}
+                        {lp.flash_sale_reserved_qty} · Đã bán: {lp.flash_sale_sold_qty}/
+                        {lp.flash_sale_stock_limit ?? "∞"}
                       </p>
                     </div>
                     <button
@@ -697,9 +928,16 @@ export default function MerchantCenterPage() {
                   <div key={ev.id} className="rounded-xl border border-slate-100 bg-slate-50 p-3 text-xs">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="font-black text-slate-900">{ev.event_type}</span>
-                      <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-slate-600">
-                        Outbox: {ev.outbox_status || "—"}
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        {ev.failure_category && (
+                          <span className="rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-bold text-rose-800">
+                            {ev.failure_category}
+                          </span>
+                        )}
+                        <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-slate-600">
+                          Outbox: {ev.outbox_status || "—"}
+                        </span>
+                      </div>
                     </div>
                     <p className="mt-1 font-mono text-[11px] text-slate-500">
                       event_id={ev.event_id} · order_id={ev.order_id || "—"} ·{" "}

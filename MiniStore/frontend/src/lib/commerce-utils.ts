@@ -35,7 +35,7 @@ export function orderStatusLabelVi(status: string): string {
 
 export function paymentStatusLabelVi(status: string): string {
   const map: Record<string, string> = {
-    INITIATED: "Khởi tạo",
+    INITIATED: "Chờ thanh toán",
     PENDING: "Đang chờ xác nhận",
     SUCCEEDED: "Đã thanh toán (MOCK)",
     FAILED: "Thanh toán thất bại",
@@ -44,4 +44,11 @@ export function paymentStatusLabelVi(status: string): string {
     REFUNDED: "Đã hoàn tiền toàn phần",
   };
   return map[status] ?? status;
+}
+
+export function reconciliationLabelVi(status: string | null | undefined): string | null {
+  if (!status || status === "NONE") return null;
+  if (status === "RECONCILIATION_REQUIRED") return "Cần đối soát thanh toán";
+  if (status === "RESOLVED") return "Đã đối soát";
+  return status;
 }

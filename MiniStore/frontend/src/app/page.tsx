@@ -279,7 +279,7 @@ export default function HomePage() {
                     <div className="relative aspect-square overflow-hidden rounded-xl bg-slate-50">
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img
-                        src={prod.image_urls[0] || "/products/fash-tshirt.svg"}
+                        src={prod.image_urls[0] || "/products/fash-tshirt.jpg"}
                         alt={prod.title}
                         className="h-full w-full object-cover"
                       />
@@ -358,7 +358,7 @@ export default function HomePage() {
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src={p.image_urls[0] || "/products/fash-tshirt.svg"}
+                  src={p.image_urls[0] || "/products/fash-tshirt.jpg"}
                   alt={p.title}
                   className="h-14 w-14 shrink-0 rounded-lg object-cover"
                 />

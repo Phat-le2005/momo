@@ -34,6 +34,7 @@ from app.models.enums import (
     OrderStatus,
     OutboxStatus,
     PaymentStatus,
+    ReconciliationStatus,
     RefundRequestStatus,
     RefundTransactionStatus,
     ReservationStatus,
@@ -96,6 +97,77 @@ class Customer(Base):
     default_address: Mapped[str] = mapped_column(String(300), default="", nullable=False)
     session_token: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
     is_test_identity: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    token_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class MerchantAccount(Base):
+    __tablename__ = "merchant_accounts"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    merchant_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("merchants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    role: Mapped[str] = mapped_column(String(32), default="MERCHANT_OWNER", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class MerchantSession(Base):
+    __tablename__ = "merchant_sessions"
+    __table_args__ = (Index("ix_merchant_sessions_merchant_active", "merchant_id", "revoked_at"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    merchant_account_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("merchant_accounts.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    merchant_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("merchants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    commerce_session_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("commerce_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(32), default="MERCHANT_OWNER", nullable=False)
+    operator_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class ServiceCredential(Base):
+    __tablename__ = "service_credentials"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    service_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    merchant_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("merchants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    commerce_session_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("commerce_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    allowed_scopes_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -217,6 +289,11 @@ class InventoryReservation(Base):
         ForeignKey("product_variants.id", ondelete="CASCADE"),
         index=True,
         nullable=False,
+    )
+    live_product_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("live_products.id", ondelete="SET NULL"),
+        nullable=True,
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(
@@ -357,6 +434,7 @@ class Order(Base):
         String(64), ForeignKey("live_sessions.id", ondelete="SET NULL"), nullable=True
     )
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     correlation_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
 
     status: Mapped[str] = mapped_column(
@@ -365,6 +443,10 @@ class Order(Base):
     payment_status: Mapped[str] = mapped_column(
         String(32), default=PaymentStatus.INITIATED.value, index=True, nullable=False
     )
+    reconciliation_status: Mapped[str] = mapped_column(
+        String(32), default=ReconciliationStatus.NONE.value, index=True, nullable=False
+    )
+    reconciliation_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     subtotal_vnd: Mapped[int] = mapped_column(Integer, nullable=False)
     discount_vnd: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -476,6 +558,10 @@ class Payment(Base):
     is_synced_to_order: Mapped[bool] = mapped_column(
         Boolean, default=False, index=True, nullable=False
     )
+    reconciliation_required: Mapped[bool] = mapped_column(
+        Boolean, default=False, index=True, nullable=False
+    )
+    reconciliation_note: Mapped[str | None] = mapped_column(String(500), nullable=True)
     last_notification_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     provider_payload_json: Mapped[dict[str, Any]] = mapped_column(
         JSON, default=dict, nullable=False
@@ -489,6 +575,35 @@ class Payment(Base):
     )
 
     order: Mapped[Order] = relationship(back_populates="payments")
+
+
+class ProviderNotification(Base):
+    __tablename__ = "provider_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "notification_id",
+            name="uq_provider_notifications_provider_nid",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    notification_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    payment_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("payments.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    order_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    merchant_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    response_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
 
 
 class RefundRequest(Base):
@@ -614,6 +729,10 @@ class LiveProduct(Base):
             "flash_sale_stock_limit IS NULL OR flash_sale_stock_limit >= 0",
             name="ck_live_products_flash_limit_nonneg",
         ),
+        CheckConstraint(
+            "flash_sale_reserved_qty >= 0",
+            name="ck_live_products_flash_reserved_nonneg",
+        ),
         CheckConstraint("flash_sale_sold_qty >= 0", name="ck_live_products_flash_sold_nonneg"),
     )
 
@@ -631,6 +750,7 @@ class LiveProduct(Base):
     is_pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     flash_sale_price_vnd: Mapped[int | None] = mapped_column(Integer, nullable=True)
     flash_sale_stock_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    flash_sale_reserved_qty: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     flash_sale_sold_qty: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     flash_sale_starts_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -744,6 +864,11 @@ class EventOutbox(Base):
     )
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    failure_category: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    target_finresolve_world_epoch: Mapped[int | None] = mapped_column(Integer, nullable=True)
     next_attempt_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

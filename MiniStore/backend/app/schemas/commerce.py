@@ -162,6 +162,8 @@ class PaymentResponse(BaseModel):
     refundable_remaining_vnd: int
     status: str
     is_synced_to_order: bool
+    reconciliation_required: bool = False
+    reconciliation_note: str | None = None
     confirmed_at: datetime | None = None
     created_at: datetime
 
@@ -174,6 +176,8 @@ class OrderResponse(BaseModel):
     customer_id: str
     status: str
     payment_status: str
+    reconciliation_status: str = "NONE"
+    reconciliation_reason: str | None = None
     subtotal_vnd: int
     discount_vnd: int
     shipping_fee_vnd: int
@@ -196,6 +200,11 @@ class CheckoutResponse(BaseModel):
     order: OrderResponse
     payment: PaymentResponse
     idempotent_replay: bool
+
+
+class CustomerMockPayRequest(BaseModel):
+    outcome: str = Field(default="SUCCEEDED", max_length=32)
+    auto_sync_order: bool = Field(default=True)
 
 
 class MockPaymentNotifyRequest(BaseModel):
@@ -258,6 +267,7 @@ class LiveProductItemResponse(BaseModel):
     effective_price_vnd: int
     flash_sale_price_vnd: int | None = None
     flash_sale_stock_limit: int | None = None
+    flash_sale_reserved_qty: int = 0
     flash_sale_sold_qty: int
     flash_sale_remaining: int | None = None
     flash_sale_starts_at: datetime | None = None
@@ -297,11 +307,31 @@ class LiveSessionResponse(BaseModel):
 
 
 # Merchant Center request schemas
+class MerchantLoginRequest(BaseModel):
+    username: str = Field(..., min_length=2, max_length=64)
+    password: str = Field(..., min_length=4, max_length=128)
+
+
+class MerchantLoginResponse(BaseModel):
+    session_id: str
+    merchant_id: str
+    commerce_session_id: str
+    role: str
+    operator_id: str
+    merchant_token: str
+    expires_at: datetime
+    source_mode: str
+
+
+class ReconciliationResolveRequest(BaseModel):
+    resolution_note: str = Field(..., min_length=3, max_length=500)
+
+
 class MerchantCreateProductRequest(BaseModel):
     title: str = Field(..., min_length=3, max_length=200)
     category: str = Field(..., min_length=2, max_length=64)
     description: str = Field(default="", max_length=2000)
-    image_url: str = Field(default="/products/fash-tshirt.svg", max_length=255)
+    image_url: str = Field(default="/products/fash-tshirt.jpg", max_length=255)
     is_featured: bool = False
     sku: str = Field(..., min_length=3, max_length=64)
     variant_title: str = Field(default="Tiêu chuẩn", max_length=120)
@@ -378,4 +408,5 @@ class CommerceEventItemResponse(BaseModel):
     occurred_at: datetime
     payload_json: dict[str, Any]
     outbox_status: str | None = None
+    failure_category: str | None = None
     finresolve_mapped_type: str | None = None

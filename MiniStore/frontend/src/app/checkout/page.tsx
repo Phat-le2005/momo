@@ -122,16 +122,13 @@ function CheckoutContent() {
     setPaying(true);
     setError(null);
     try {
+      // Customer-authenticated endpoint: backend verifies ownership & constructs provider callback server-side.
+      // Browser NEVER holds X-Mock-Provider-Secret.
       const res = await commerceFetch<{ payment: PaymentDTO; orders_synced: number }>(
-        "/api/v1/test-payments/mock/notify",
+        `/api/v1/store/orders/${encodeURIComponent(createdOrder.id)}/mock-pay`,
         {
           method: "POST",
           body: JSON.stringify({
-            provider_ref: createdPayment.provider_ref,
-            notification_id: `NOTIF-WEB-${Date.now()}`,
-            merchant_id: createdOrder.merchant_id,
-            order_id: createdOrder.id,
-            amount_vnd: createdPayment.amount_vnd,
             outcome,
             auto_sync_order: true,
           }),

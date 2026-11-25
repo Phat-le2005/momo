@@ -1,6 +1,10 @@
-"""Idempotent seed data for FinShop LIVE (14 Vietnamese test products, vouchers, LIVE).
+"""Idempotent seed data for FinShop LIVE (14 Vietnamese test products, vouchers, LIVE, auth).
 
-Invariant: Never resets or deletes existing customer orders on application restart.
+Security & Persistence Invariants (Prompt 10.1):
+- Never resets or deletes existing customer orders on application restart.
+- Seeds initial `MerchantAccount` with salted `scrypt` password hash from config.
+- Seeds scoped `ServiceCredential` bound strictly to `(DEFAULT_MERCHANT_ID, DEFAULT_SESSION_ID)`.
+- Generates cryptographically random customer tokens with expiration (no predictable tokens).
 """
 
 from __future__ import annotations
@@ -8,8 +12,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.auth import generate_customer_token, hash_password, hash_token
+from app.core.config import get_settings
 from app.models.entities import (
     CommerceSession,
     Customer,
@@ -17,8 +24,10 @@ from app.models.entities import (
     LiveProduct,
     LiveSession,
     Merchant,
+    MerchantAccount,
     Product,
     ProductVariant,
+    ServiceCredential,
     Voucher,
 )
 from app.models.enums import LiveSessionStatus, VoucherDiscountType
@@ -26,10 +35,10 @@ from app.models.enums import LiveSessionStatus, VoucherDiscountType
 DEFAULT_MERCHANT_ID = "MERCHANT_FINSHOP_01"
 DEFAULT_SESSION_ID = "CSESS_FINSHOP_DEFAULT_01"
 DEFAULT_LIVE_SESSION_ID = "LIVE_FINSHOP_01"
+DEFAULT_MERCHANT_ACCOUNT_ID = "MACC_FINSHOP_OWNER_01"
+DEFAULT_SERVICE_CREDENTIAL_ID = "SCRED_FINRESOLVE_READ_01"
 DEFAULT_CUSTOMER_1_ID = "CUST_MINH_01"
-DEFAULT_CUSTOMER_1_TOKEN = "ctk_finshop_minh_test_01"  # noqa: S105
 DEFAULT_CUSTOMER_2_ID = "CUST_LINH_02"
-DEFAULT_CUSTOMER_2_TOKEN = "ctk_finshop_linh_test_02"  # noqa: S105
 
 SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
     # 1. Thời trang (Fashion)
@@ -42,7 +51,7 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
             "[Dữ liệu thử nghiệm] Chất vải dù trượt nước thoáng khí, chống tia UV, "
             "phù hợp mặc đi làm và di chuyển hàng ngày."
         ),
-        "images": ["/products/fash-jacket.svg"],
+        "images": ["/products/fash-jacket.jpg"],
         "is_featured": True,
         "variants": [
             ("VAR-FASH-01-M", "FS-UVJ-KEM-M", "Kem Sữa - Size M", 249000, 350000, 18),
@@ -57,7 +66,7 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
         "description": (
             "[Dữ liệu thử nghiệm] Cotton 100% dày dặn đứng form, không xù lông sau nhiều lần giặt."
         ),
-        "images": ["/products/fash-tshirt.svg"],
+        "images": ["/products/fash-tshirt.jpg"],
         "is_featured": True,
         "variants": [
             ("VAR-FASH-02-TRANG", "FS-TEE-WHT-L", "Trắng Tinh - Size L", 169000, 229000, 35),
@@ -72,7 +81,7 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
         "description": (
             "[Dữ liệu thử nghiệm] Thiết kế tối giản, có khóa kéo và ngăn chống sốc tiện dụng."
         ),
-        "images": ["/products/fash-tote.svg"],
+        "images": ["/products/fash-tote.jpg"],
         "is_featured": False,
         "variants": [
             ("VAR-FASH-03-BE", "FS-TOTE-BE", "Màu Be Tự Nhiên", 139000, 199000, 22),
@@ -88,7 +97,7 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
             "[Dữ liệu thử nghiệm] Pin 28 giờ kèm hộp sạc USB-C, chống ồn ANC 38dB, "
             "độ trễ thấp khi xem LIVE và họp trực tuyến."
         ),
-        "images": ["/products/tech-earbuds.svg"],
+        "images": ["/products/tech-earbuds.jpg"],
         "is_featured": True,
         "variants": [
             ("VAR-TECH-01-WHT", "FS-PODS-WHT", "Trắng Ngọc", 490000, 690000, 6),
@@ -103,7 +112,7 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
         "description": (
             "[Dữ liệu thử nghiệm] Thiết kế mỏng nhẹ, tích hợp giá đỡ gập tiện lợi khi xem video."
         ),
-        "images": ["/products/tech-powerbank.svg"],
+        "images": ["/products/tech-powerbank.jpg"],
         "is_featured": True,
         "variants": [
             ("VAR-TECH-02-TITAN", "FS-PB-10K-TI", "Xám Titan 10.000mAh", 359000, 490000, 15),
@@ -117,7 +126,7 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
         "description": (
             "[Dữ liệu thử nghiệm] Hỗ trợ sạc nhanh cho điện thoại, máy tính bảng và laptop USB-C."
         ),
-        "images": ["/products/tech-cable.svg"],
+        "images": ["/products/tech-cable.jpg"],
         "is_featured": False,
         "variants": [
             ("VAR-TECH-03-15M", "FS-CBL-65W-15", "Đen 1.5m (65W)", 79000, 119000, 60),
@@ -129,8 +138,8 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
         "slug": "serum-b5-phuc-hoi-cap-am-30ml",
         "title": "Serum Vitamin B5 + HA cấp ẩm phục hồi da 30ml",
         "category": "Mỹ phẩm",
-        "description": ("[Dữ liệu thử nghiệm] Kết cấu thấm nhanh không bết dính, dịu da nhạy cảm."),
-        "images": ["/products/cosm-serum.svg"],
+        "description": "[Dữ liệu thử nghiệm] Kết cấu thấm nhanh không bết dính, dịu da nhạy cảm.",
+        "images": ["/products/cosm-serum.jpg"],
         "is_featured": True,
         "variants": [
             ("VAR-COSM-01-30ML", "FS-SERUM-B5-30", "Chai 30ml Tiêu chuẩn", 265000, 340000, 14),
@@ -145,7 +154,7 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
         "description": (
             "[Dữ liệu thử nghiệm] Không cay mắt, không vệt trắng, kiềm dầu nhẹ đến 8 giờ."
         ),
-        "images": ["/products/cosm-sunscreen.svg"],
+        "images": ["/products/cosm-sunscreen.jpg"],
         "is_featured": True,
         "variants": [
             ("VAR-COSM-02-50ML", "FS-SUN-50ML", "Tuýp 50ml", 219000, 295000, 20),
@@ -159,7 +168,7 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
         "description": (
             "[Dữ liệu thử nghiệm] Chất son mềm mượt không khô môi, sắc đỏ đất thời thượng."
         ),
-        "images": ["/products/cosm-lipstick.svg"],
+        "images": ["/products/cosm-lipstick.jpg"],
         "is_featured": False,
         "variants": [
             ("VAR-COSM-03-01", "FS-LIP-01-DD", "01 Đỏ Đất", 145000, 195000, 28),
@@ -175,7 +184,7 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
         "description": (
             "[Dữ liệu thử nghiệm] Giữ lạnh 18 giờ, giữ nóng 10 giờ, sơn tĩnh điện chống trầy."
         ),
-        "images": ["/products/home-tumbler.svg"],
+        "images": ["/products/home-tumbler.jpg"],
         "is_featured": True,
         "variants": [
             ("VAR-HOME-01-MINT", "FS-TUMB-900-MN", "Xanh Mint 900ml", 189000, 260000, 10),
@@ -190,7 +199,7 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
         "description": (
             "[Dữ liệu thử nghiệm] Xay nhuyễn đá nhỏ và trái cây trong 30 giây, dễ vệ sinh."
         ),
-        "images": ["/products/home-blender.svg"],
+        "images": ["/products/home-blender.jpg"],
         "is_featured": False,
         "variants": [
             ("VAR-HOME-02-WHT", "FS-BLND-450-W", "Trắng Kem 450ml", 279000, 390000, 9),
@@ -205,7 +214,7 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
             "[Dữ liệu thử nghiệm] Ánh sáng chuẩn Ra>90 không nhấp nháy, "
             "gập gọn tiết kiệm diện tích."
         ),
-        "images": ["/products/home-lamp.svg"],
+        "images": ["/products/home-lamp.jpg"],
         "is_featured": False,
         "variants": [
             ("VAR-HOME-03-WHT", "FS-LAMP-LED-W", "Trắng Tối Giản", 199000, 275000, 16),
@@ -244,10 +253,11 @@ SEED_PRODUCTS: tuple[dict[str, Any], ...] = (
 
 
 def seed_commerce_data(db: Session) -> dict[str, Any]:
-    """Idempotently seed FinShop LIVE catalog, vouchers, live session, and test identities.
+    """Idempotently seed FinShop LIVE catalog, vouchers, live session, and auth principals.
 
     Never deletes or overwrites existing customer orders or payments.
     """
+    settings = get_settings()
     now = datetime.now(UTC)
 
     merchant = db.get(Merchant, DEFAULT_MERCHANT_ID)
@@ -274,20 +284,73 @@ def seed_commerce_data(db: Session) -> dict[str, Any]:
             is_active=True,
         )
         db.add(csess)
-    db.flush()
+        db.flush()
 
-    for cid, tok, name, phone, addr in (
+    # Seed initial MerchantAccount with salted scrypt password hash from config
+    macc = db.get(MerchantAccount, DEFAULT_MERCHANT_ACCOUNT_ID)
+    if macc is None:
+        username = settings.test_merchant_username.strip()
+        raw_pw = settings.test_merchant_password.get_secret_value()
+        macc = MerchantAccount(
+            id=DEFAULT_MERCHANT_ACCOUNT_ID,
+            merchant_id=DEFAULT_MERCHANT_ID,
+            username=username,
+            password_hash=hash_password(raw_pw),
+            role="MERCHANT_OWNER",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(macc)
+        db.flush()
+
+    # Seed scoped ServiceCredential bound strictly to (DEFAULT_MERCHANT_ID, DEFAULT_SESSION_ID)
+    expected_key_hash = hash_token(settings.service_api_key.get_secret_value().strip())
+    scred = db.get(ServiceCredential, DEFAULT_SERVICE_CREDENTIAL_ID)
+    if scred is None:
+        existing_by_hash = db.scalar(
+            select(ServiceCredential).where(ServiceCredential.key_hash == expected_key_hash)
+        )
+        if existing_by_hash is None:
+            scred = ServiceCredential(
+                id=DEFAULT_SERVICE_CREDENTIAL_ID,
+                service_name="FINRESOLVE_READ_CONNECTOR",
+                key_hash=expected_key_hash,
+                merchant_id=DEFAULT_MERCHANT_ID,
+                commerce_session_id=DEFAULT_SESSION_ID,
+                allowed_scopes_json=[
+                    "orders:read",
+                    "payments:read",
+                    "refunds:read",
+                    "inventory:read",
+                    "events:read",
+                    "vouchers:read",
+                    "live:read",
+                    "metrics:read",
+                ],
+                is_active=True,
+                expires_at=None,
+                revoked_at=None,
+                created_at=now,
+            )
+            db.add(scred)
+            db.flush()
+    elif scred.key_hash != expected_key_hash:
+        scred.key_hash = expected_key_hash
+        db.flush()
+
+    # Seed sample test customers with cryptographically random expiring tokens (never public)
+    cust_ttl = timedelta(seconds=settings.customer_session_ttl_seconds)
+    for cid, name, phone, addr in (
         (
             DEFAULT_CUSTOMER_1_ID,
-            DEFAULT_CUSTOMER_1_TOKEN,
-            "Nguyễn Minh Anh (Khách Test 1)",
+            "Nguyễn Minh Anh",
             "0901234567",
             "123 Nguyễn Huệ, Quận 1, TP. Hồ Chí Minh",
         ),
         (
             DEFAULT_CUSTOMER_2_ID,
-            DEFAULT_CUSTOMER_2_TOKEN,
-            "Trần Khánh Linh (Khách Test 2)",
+            "Trần Khánh Linh",
             "0909876543",
             "45 Lê Lợi, Quận Hải Châu, Đà Nẵng",
         ),
@@ -302,15 +365,18 @@ def seed_commerce_data(db: Session) -> dict[str, Any]:
                     phone=phone,
                     email=f"{cid.lower()}@finshop.test",
                     default_address=addr,
-                    session_token=tok,
+                    session_token=generate_customer_token(),
                     is_test_identity=True,
+                    token_expires_at=now + cust_ttl,
+                    revoked_at=None,
                 )
             )
     db.flush()
 
     seeded_products = 0
     for item in SEED_PRODUCTS:
-        if db.get(Product, item["id"]) is None:
+        existing_prod = db.get(Product, item["id"])
+        if existing_prod is None:
             db.add(
                 Product(
                     id=item["id"],
@@ -327,9 +393,14 @@ def seed_commerce_data(db: Session) -> dict[str, Any]:
             )
             db.flush()
             seeded_products += 1
+        elif existing_prod.image_urls_json != list(item["images"]):
+            # Upgrade seeded product imagery path cleanly (e.g. .svg -> .png)
+            existing_prod.image_urls_json = list(item["images"])
+            db.flush()
 
         for vid, sku, vtitle, price, cmp_price, stock in item["variants"]:
-            if db.get(ProductVariant, vid) is None:
+            existing_var = db.get(ProductVariant, vid)
+            if existing_var is None:
                 db.add(
                     ProductVariant(
                         id=vid,
@@ -355,6 +426,9 @@ def seed_commerce_data(db: Session) -> dict[str, Any]:
                         version=1,
                     )
                 )
+                db.flush()
+            elif existing_var.image_url != item["images"][0]:
+                existing_var.image_url = item["images"][0]
                 db.flush()
 
     # Seed valid test vouchers
@@ -464,6 +538,7 @@ def seed_commerce_data(db: Session) -> dict[str, Any]:
                     is_pinned=pinned,
                     flash_sale_price_vnd=fs_price,
                     flash_sale_stock_limit=fs_limit,
+                    flash_sale_reserved_qty=0,
                     flash_sale_sold_qty=0,
                     flash_sale_starts_at=now - timedelta(minutes=10),
                     flash_sale_ends_at=now + timedelta(hours=3),

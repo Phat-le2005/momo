@@ -9,7 +9,12 @@ import {
   commerceFetch,
   ensureCustomerBootstrap,
 } from "@/lib/commerce-api";
-import { formatVnd, orderStatusLabelVi, paymentStatusLabelVi } from "@/lib/commerce-utils";
+import {
+  formatVnd,
+  orderStatusLabelVi,
+  paymentStatusLabelVi,
+  reconciliationLabelVi,
+} from "@/lib/commerce-utils";
 
 export default function OrdersPage() {
   const [customer, setCustomer] = useState<CustomerIdentityDTO | null>(null);
@@ -139,8 +144,19 @@ export default function OrdersPage() {
                   <span className="rounded-full bg-rose-50 px-2.5 py-0.5 text-[#fe2c55]">
                     Thanh toán: {paymentStatusLabelVi(ord.payment_status)}
                   </span>
+                  {reconciliationLabelVi(ord.reconciliation_status) && (
+                    <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-amber-900">
+                      {reconciliationLabelVi(ord.reconciliation_status)}
+                    </span>
+                  )}
                 </div>
               </div>
+
+              {ord.reconciliation_status === "RECONCILIATION_REQUIRED" && ord.reconciliation_reason && (
+                <div className="mt-2.5 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-semibold text-amber-900">
+                  Cần đối soát: {ord.reconciliation_reason}
+                </div>
+              )}
 
               <div className="mt-3 space-y-2">
                 {ord.items.map((it) => (
@@ -148,7 +164,7 @@ export default function OrdersPage() {
                     <div className="flex items-center gap-2.5">
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img
-                        src={it.image_url_snapshot || "/products/fash-tshirt.svg"}
+                        src={it.image_url_snapshot || "/products/fash-tshirt.jpg"}
                         alt={it.product_title_snapshot}
                         className="h-12 w-12 rounded-lg bg-slate-50 object-cover"
                       />

@@ -143,6 +143,9 @@ services:
       COMMERCE_SOURCE_MODE: MOCK
       COMMERCE_AUTH_SECRET: ${COMMERCE_AUTH_SECRET:?COMMERCE_AUTH_SECRET must be set to a strong random >=32-char secret}
       COMMERCE_SERVICE_API_KEY: ${COMMERCE_SERVICE_API_KEY:?COMMERCE_SERVICE_API_KEY must be set to a strong random >=32-char secret}
+      COMMERCE_MOCK_PROVIDER_SECRET: ${COMMERCE_MOCK_PROVIDER_SECRET:?COMMERCE_MOCK_PROVIDER_SECRET must be set to a strong random >=32-char secret}
+      COMMERCE_TEST_MERCHANT_USERNAME: ${COMMERCE_TEST_MERCHANT_USERNAME:-merchant_owner}
+      COMMERCE_TEST_MERCHANT_PASSWORD: ${COMMERCE_TEST_MERCHANT_PASSWORD:?COMMERCE_TEST_MERCHANT_PASSWORD must be set to a strong >=12-char password}
     ports:
       - "${COMMERCE_API_PORT:-8100}:8100"
     depends_on:
@@ -172,6 +175,9 @@ services:
       COMMERCE_SOURCE_MODE: MOCK
       COMMERCE_AUTH_SECRET: ${COMMERCE_AUTH_SECRET:?COMMERCE_AUTH_SECRET must be set to a strong random >=32-char secret}
       COMMERCE_SERVICE_API_KEY: ${COMMERCE_SERVICE_API_KEY:?COMMERCE_SERVICE_API_KEY must be set to a strong random >=32-char secret}
+      COMMERCE_MOCK_PROVIDER_SECRET: ${COMMERCE_MOCK_PROVIDER_SECRET:?COMMERCE_MOCK_PROVIDER_SECRET must be set to a strong random >=32-char secret}
+      COMMERCE_TEST_MERCHANT_USERNAME: ${COMMERCE_TEST_MERCHANT_USERNAME:-merchant_owner}
+      COMMERCE_TEST_MERCHANT_PASSWORD: ${COMMERCE_TEST_MERCHANT_PASSWORD:?COMMERCE_TEST_MERCHANT_PASSWORD must be set to a strong >=12-char password}
     depends_on:
       commerce-api:
         condition: service_healthy

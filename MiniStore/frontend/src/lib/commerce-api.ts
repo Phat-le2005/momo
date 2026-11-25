@@ -1,10 +1,19 @@
-/** Typed REST client for FinShop LIVE independent Commerce API (port 8100). */
+/** Typed REST client for FinShop LIVE independent Commerce API (port 8100).
+ *
+ * Security Invariants (Prompt 10.1):
+ * - Bootstrap NEVER returns customer session tokens.
+ * - Guest customer sessions are provisioned per-browser via `POST /api/v1/store/customers/guest`
+ *   and validated via `GET /api/v1/store/customers/me`.
+ * - Merchant Center requires explicit username/password sign-in via `POST /api/v1/merchant/auth/login`
+ *   and supports revocable sign-out via `POST /api/v1/merchant/auth/logout`.
+ * - Browser NEVER holds payment provider secrets (`X-Mock-Provider-Secret` or `X-Commerce-Service-Key`).
+ */
 
 export const COMMERCE_API_BASE =
   process.env.NEXT_PUBLIC_COMMERCE_API_BASE_URL || "http://localhost:8100";
 
-const CUSTOMER_TOKEN_STORAGE_KEY = "finshop_customer_token_v1";
-const MERCHANT_TOKEN_STORAGE_KEY = "finshop_merchant_token_v1";
+const CUSTOMER_TOKEN_STORAGE_KEY = "finshop_customer_token_v2";
+const MERCHANT_TOKEN_STORAGE_KEY = "finshop_merchant_token_v2";
 
 export interface VariantDTO {
   id: string;
@@ -74,7 +83,6 @@ export interface StoreBootstrapDTO {
   merchant: { id: string; name: string; description: string };
   commerce_session: { id: string; world_epoch: number };
   categories: string[];
-  test_customers: CustomerIdentityDTO[];
   payment_methods: Array<{ id: string; label_vi: string; available: boolean }>;
 }
 
@@ -117,6 +125,8 @@ export interface PaymentDTO {
   refundable_remaining_vnd: number;
   status: string;
   is_synced_to_order: boolean;
+  reconciliation_required: boolean;
+  reconciliation_note: string | null;
   confirmed_at: string | null;
   created_at: string;
 }
@@ -144,6 +154,8 @@ export interface OrderDTO {
   customer_id: string;
   status: string;
   payment_status: string;
+  reconciliation_status: string;
+  reconciliation_reason: string | null;
   subtotal_vnd: number;
   discount_vnd: number;
   shipping_fee_vnd: number;
@@ -174,6 +186,7 @@ export interface LiveProductItemDTO {
   effective_price_vnd: number;
   flash_sale_price_vnd: number | null;
   flash_sale_stock_limit: number | null;
+  flash_sale_reserved_qty: number;
   flash_sale_sold_qty: number;
   flash_sale_remaining: number | null;
   flash_sale_starts_at: string | null;
@@ -245,11 +258,25 @@ export interface MerchantOverviewDTO {
   pending_payments: number;
   pending_fulfillment: number;
   unsynced_payments: number;
+  reconciliation_required_count: number;
+  outbox_pending_count: number;
+  outbox_dead_letter_count: number;
   refund_requests: number;
   open_complaints: number;
   total_available_inventory: number;
   low_stock_products_count: number;
   live_session_orders_count: number;
+}
+
+export interface MerchantLoginDTO {
+  session_id: string;
+  merchant_id: string;
+  commerce_session_id: string;
+  role: string;
+  operator_id: string;
+  merchant_token: string;
+  expires_at: string;
+  source_mode: string;
 }
 
 export interface CommerceEventDTO {
@@ -266,6 +293,7 @@ export interface CommerceEventDTO {
   occurred_at: string;
   payload_json: Record<string, unknown>;
   outbox_status: string | null;
+  failure_category: string | null;
   finresolve_mapped_type: string | null;
 }
 
@@ -280,6 +308,12 @@ export function setStoredCustomerToken(token: string): void {
   }
 }
 
+export function clearStoredCustomerToken(): void {
+  if (typeof window !== "undefined") {
+    window.localStorage.removeItem(CUSTOMER_TOKEN_STORAGE_KEY);
+  }
+}
+
 export function getStoredMerchantToken(): string | null {
   if (typeof window === "undefined") return null;
   return window.localStorage.getItem(MERCHANT_TOKEN_STORAGE_KEY);
@@ -291,6 +325,12 @@ export function setStoredMerchantToken(token: string): void {
   }
 }
 
+export function clearStoredMerchantToken(): void {
+  if (typeof window !== "undefined") {
+    window.localStorage.removeItem(MERCHANT_TOKEN_STORAGE_KEY);
+  }
+}
+
 export async function commerceFetch<T>(
   path: string,
   options: RequestInit & { customerToken?: string | null; merchantToken?: string | null } = {},
@@ -299,11 +339,13 @@ export async function commerceFetch<T>(
   if (options.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const cTok = options.customerToken ?? getStoredCustomerToken();
+  const cTok =
+    options.customerToken !== undefined ? options.customerToken : getStoredCustomerToken();
   if (cTok && !headers.has("X-Customer-Token")) {
     headers.set("X-Customer-Token", cTok);
   }
-  const mTok = options.merchantToken ?? getStoredMerchantToken();
+  const mTok =
+    options.merchantToken !== undefined ? options.merchantToken : getStoredMerchantToken();
   if (mTok && !headers.has("X-Merchant-Token")) {
     headers.set("X-Merchant-Token", mTok);
   }
@@ -311,6 +353,7 @@ export async function commerceFetch<T>(
   const res = await fetch(`${COMMERCE_API_BASE}${path}`, {
     ...options,
     headers,
+    credentials: "include",
     cache: "no-store",
   });
 
@@ -327,6 +370,7 @@ export async function commerceFetch<T>(
   return (await res.json()) as T;
 }
 
+/** Load public storefront bootstrap and ensure an isolated guest customer session exists. */
 export async function ensureCustomerBootstrap(): Promise<{
   bootstrap: StoreBootstrapDTO;
   activeCustomer: CustomerIdentityDTO;
@@ -334,32 +378,57 @@ export async function ensureCustomerBootstrap(): Promise<{
   const bootstrap = await commerceFetch<StoreBootstrapDTO>("/api/v1/store/bootstrap", {
     customerToken: null,
   });
-  const stored = getStoredCustomerToken();
-  const matched =
-    bootstrap.test_customers.find((c) => c.session_token === stored) ||
-    bootstrap.test_customers[0];
-  if (matched) {
-    setStoredCustomerToken(matched.session_token);
-  }
-  return { bootstrap, activeCustomer: matched };
-}
 
-export async function ensureMerchantToken(): Promise<string> {
-  const existing = getStoredMerchantToken();
-  if (existing) {
+  const existingTok = getStoredCustomerToken();
+  if (existingTok) {
     try {
-      await commerceFetch<MerchantOverviewDTO>("/api/v1/merchant/overview", {
-        merchantToken: existing,
+      const me = await commerceFetch<CustomerIdentityDTO>("/api/v1/store/customers/me", {
+        customerToken: existingTok,
       });
-      return existing;
+      return { bootstrap, activeCustomer: me };
     } catch {
-      // fall through and re-issue
+      clearStoredCustomerToken();
     }
   }
-  const res = await commerceFetch<{ merchant_token: string }>("/api/v1/merchant/session", {
+
+  // Provision a fresh isolated guest customer session for this browser only
+  const guest = await commerceFetch<CustomerIdentityDTO>("/api/v1/store/customers/guest", {
+    method: "POST",
+    customerToken: null,
+    body: JSON.stringify({
+      display_name: "Khách FinShop",
+      phone: "0901234567",
+      default_address: "123 Nguyễn Huệ, Quận 1, TP. Hồ Chí Minh",
+    }),
+  });
+  setStoredCustomerToken(guest.session_token);
+  return { bootstrap, activeCustomer: guest };
+}
+
+export async function loginMerchant(
+  username: string,
+  password: string,
+): Promise<MerchantLoginDTO> {
+  const res = await commerceFetch<MerchantLoginDTO>("/api/v1/merchant/auth/login", {
     method: "POST",
     merchantToken: null,
+    body: JSON.stringify({ username, password }),
   });
   setStoredMerchantToken(res.merchant_token);
-  return res.merchant_token;
+  return res;
+}
+
+export async function logoutMerchant(): Promise<void> {
+  const tok = getStoredMerchantToken();
+  if (tok) {
+    try {
+      await commerceFetch("/api/v1/merchant/auth/logout", {
+        method: "POST",
+        merchantToken: tok,
+      });
+    } catch {
+      // ignore if already expired
+    }
+  }
+  clearStoredMerchantToken();
 }

@@ -6,21 +6,32 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, Query, Request, Response, status
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.core.auth import MerchantPrincipal, get_current_merchant, issue_merchant_token
+from app.core.auth import (
+    MERCHANT_COOKIE_NAME,
+    MERCHANT_TOKEN_HEADER,
+    MerchantPrincipal,
+    create_merchant_session,
+    get_current_merchant,
+    revoke_merchant_session,
+    verify_password,
+)
 from app.core.config import get_settings
 from app.core.errors import CommerceError, ErrorCode
+from app.core.rate_limit import enforce_auth_rate_limit
 from app.db.session import get_db
 from app.models.entities import (
     CommerceEvent,
+    CommerceSession,
     Complaint,
     EventOutbox,
     Inventory,
     LiveProduct,
     LiveSession,
+    MerchantAccount,
     Order,
     Payment,
     Product,
@@ -30,7 +41,9 @@ from app.models.entities import (
 )
 from app.models.enums import (
     OrderStatus,
+    OutboxStatus,
     PaymentStatus,
+    ReconciliationStatus,
     RefundRequestStatus,
     can_transition_order,
 )
@@ -42,6 +55,8 @@ from app.schemas.commerce import (
     MerchantCreateProductRequest,
     MerchantCreateVariantRequest,
     MerchantCreateVoucherRequest,
+    MerchantLoginRequest,
+    MerchantLoginResponse,
     MerchantRefundDecisionRequest,
     MerchantUpdateComplaintRequest,
     MerchantUpdateLiveProductRequest,
@@ -50,12 +65,12 @@ from app.schemas.commerce import (
     OrderResponse,
     PaymentResponse,
     ProductResponse,
+    ReconciliationResolveRequest,
     RefundRequestResponse,
     VoucherResponse,
 )
 from app.services.events import record_commerce_event
 from app.services.seed import (
-    DEFAULT_MERCHANT_ID,
     DEFAULT_SESSION_ID,
     seed_commerce_data,
 )
@@ -65,29 +80,94 @@ router = APIRouter(prefix="/merchant", tags=["merchant"])
 
 
 @router.post(
-    "/session",
-    summary="Issue server-signed Merchant token for local MOCK Merchant Center",
+    "/auth/login",
+    response_model=MerchantLoginResponse,
+    summary="Authenticate merchant operator with username/password and issue revocable session",
 )
-def create_merchant_demo_session(db: Session = Depends(get_db)) -> dict[str, Any]:
-    if get_settings().source_mode != "MOCK":
+def merchant_login(
+    payload: MerchantLoginRequest,
+    response: Response,
+    _rl: None = Depends(enforce_auth_rate_limit),
+    db: Session = Depends(get_db),
+) -> MerchantLoginResponse:
+    username = payload.username.strip()
+    account = db.scalar(select(MerchantAccount).where(MerchantAccount.username == username))
+    if (
+        account is None
+        or not account.is_active
+        or not verify_password(payload.password, account.password_hash)
+    ):
         raise CommerceError(
-            ErrorCode.FORBIDDEN,
-            "Demo merchant session issuance is restricted to SOURCE_MODE=MOCK",
-            status_code=403,
+            ErrorCode.UNAUTHORIZED,
+            "Sai tên đăng nhập hoặc mật khẩu Kênh Người Bán",
+            status_code=401,
         )
-    seed_commerce_data(db)
-    token = issue_merchant_token(
-        merchant_id=DEFAULT_MERCHANT_ID,
-        commerce_session_id=DEFAULT_SESSION_ID,
-        role="MERCHANT_OWNER",
-        operator_id="merchant_finshop_owner",
+
+    csess = db.scalar(
+        select(CommerceSession).where(
+            CommerceSession.merchant_id == account.merchant_id,
+            CommerceSession.is_active.is_(True),
+        )
     )
+    if csess is None:
+        seed_commerce_data(db)
+        csess = db.get(CommerceSession, DEFAULT_SESSION_ID)
+    if csess is None:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN, "No active commerce session for merchant", status_code=403
+        )
+
+    ms, raw_token = create_merchant_session(db, account=account, commerce_session=csess)
+    db.commit()
+
+    settings = get_settings()
+    response.set_cookie(
+        key=MERCHANT_COOKIE_NAME,
+        value=raw_token,
+        httponly=True,
+        samesite="lax",
+        secure=not settings.is_local_env,
+        max_age=settings.merchant_session_ttl_seconds,
+    )
+    return MerchantLoginResponse(
+        session_id=ms.id,
+        merchant_id=ms.merchant_id,
+        commerce_session_id=ms.commerce_session_id,
+        role=ms.role,
+        operator_id=ms.operator_id,
+        merchant_token=raw_token,
+        expires_at=ms.expires_at,
+        source_mode=settings.source_mode,
+    )
+
+
+@router.post("/auth/logout", summary="Revoke active merchant session")
+def merchant_logout(
+    request: Request,
+    response: Response,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    raw = (
+        request.headers.get(MERCHANT_TOKEN_HEADER, "").strip()
+        or request.cookies.get(MERCHANT_COOKIE_NAME, "").strip()
+    )
+    revoked = revoke_merchant_session(db, raw_token=raw) if raw else False
+    response.delete_cookie(MERCHANT_COOKIE_NAME)
+    return {"revoked": revoked, "session_id": principal.session_id}
+
+
+@router.get("/auth/me", summary="Return current authenticated merchant session metadata")
+def merchant_me(
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+) -> dict[str, Any]:
     return {
-        "merchant_id": DEFAULT_MERCHANT_ID,
-        "commerce_session_id": DEFAULT_SESSION_ID,
-        "role": "MERCHANT_OWNER",
-        "merchant_token": token,
-        "source_mode": "MOCK",
+        "session_id": principal.session_id,
+        "merchant_id": principal.merchant_id,
+        "commerce_session_id": principal.commerce_session_id,
+        "world_epoch": principal.world_epoch,
+        "role": principal.role,
+        "operator_id": principal.operator_id,
     }
 
 
@@ -173,6 +253,33 @@ def get_merchant_overview(
         )
         or 0
     )
+    reconciliation_required_count = int(
+        db.scalar(
+            select(func.count(Order.id)).where(
+                Order.merchant_id == mid,
+                Order.reconciliation_status == ReconciliationStatus.RECONCILIATION_REQUIRED.value,
+            )
+        )
+        or 0
+    )
+    outbox_pending_count = int(
+        db.scalar(
+            select(func.count(EventOutbox.id)).where(
+                EventOutbox.status == OutboxStatus.PENDING.value
+            )
+        )
+        or 0
+    )
+    outbox_dead_letter_count = int(
+        db.scalar(
+            select(func.count(EventOutbox.id)).where(
+                EventOutbox.status.in_(
+                    [OutboxStatus.DEAD_LETTER.value, OutboxStatus.REVIEW_REQUIRED.value]
+                )
+            )
+        )
+        or 0
+    )
 
     return {
         "merchant_id": mid,
@@ -186,6 +293,9 @@ def get_merchant_overview(
         "pending_payments": pending_payments,
         "pending_fulfillment": pending_fulfillment,
         "unsynced_payments": unsynced_payments,
+        "reconciliation_required_count": reconciliation_required_count,
+        "outbox_pending_count": outbox_pending_count,
+        "outbox_dead_letter_count": outbox_dead_letter_count,
         "refund_requests": refund_requests,
         "open_complaints": open_complaints,
         "total_available_inventory": total_available_inventory,
@@ -411,6 +521,8 @@ def merchant_adjust_inventory(
 @router.get("/orders", response_model=list[OrderResponse])
 def merchant_list_orders(
     status_filter: str | None = Query(default=None, alias="status"),
+    reconciliation_status: str | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=120),
     principal: MerchantPrincipal = Depends(get_current_merchant),
     db: Session = Depends(get_db),
 ) -> list[OrderResponse]:
@@ -425,7 +537,64 @@ def merchant_list_orders(
     )
     if status_filter and status_filter.strip():
         stmt = stmt.where(Order.status == status_filter.strip().upper())
+    if reconciliation_status and reconciliation_status.strip():
+        stmt = stmt.where(Order.reconciliation_status == reconciliation_status.strip().upper())
+    if q and q.strip():
+        pattern = f"%{q.strip()}%"
+        stmt = stmt.where(
+            or_(
+                Order.order_code.ilike(pattern),
+                Order.recipient_name.ilike(pattern),
+                Order.recipient_phone.ilike(pattern),
+            )
+        )
     return [_to_order_response(o) for o in db.scalars(stmt).all()]
+
+
+@router.post("/orders/{order_id}/reconciliation/resolve", response_model=OrderResponse)
+def merchant_resolve_reconciliation(
+    order_id: str,
+    payload: ReconciliationResolveRequest,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> OrderResponse:
+    from app.api.storefront import _to_order_response
+
+    order = db.scalar(
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.payments))
+        .where(Order.id == order_id, Order.merchant_id == principal.merchant_id)
+        .with_for_update()
+    )
+    if order is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Order not found", status_code=404)
+
+    now = datetime.now(UTC)
+    order.reconciliation_status = ReconciliationStatus.RESOLVED.value
+    order.reconciliation_reason = payload.resolution_note.strip()
+    order.updated_at = now
+    for p in order.payments:
+        p.reconciliation_required = False
+        p.reconciliation_note = payload.resolution_note.strip()
+        p.updated_at = now
+
+    record_commerce_event(
+        db,
+        merchant_id=order.merchant_id,
+        commerce_session_id=order.commerce_session_id,
+        world_epoch=order.world_epoch,
+        event_type="ORDER_UPDATED",
+        order_id=order.id,
+        correlation_id=order.correlation_id,
+        payload={
+            "reconciliation_status": ReconciliationStatus.RESOLVED.value,
+            "resolution_note": payload.resolution_note.strip(),
+            "actor": f"merchant:{principal.operator_id}",
+        },
+    )
+    db.commit()
+    db.refresh(order)
+    return _to_order_response(order)
 
 
 @router.patch("/orders/{order_id}/status", response_model=OrderResponse)
@@ -839,6 +1008,7 @@ def merchant_list_events(
             occurred_at=e.occurred_at,
             payload_json=dict(e.payload_json or {}),
             outbox_status=outbox_map[e.id].status if e.id in outbox_map else None,
+            failure_category=outbox_map[e.id].failure_category if e.id in outbox_map else None,
             finresolve_mapped_type=(
                 outbox_map[e.id].finresolve_mapped_type if e.id in outbox_map else None
             ),
