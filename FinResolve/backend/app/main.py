@@ -59,6 +59,7 @@ def create_app() -> FastAPI:
             "Content-Type",
             "X-Demo-Session",
             "X-Demo-Manager-Token",
+            "X-Judge-Token",
             "X-Idempotency-Key",
             REQUEST_ID_HEADER,
         ],

@@ -145,6 +145,15 @@ def _binding_to_response(b: CommerceSourceBinding) -> MonitoringBindingResponse:
 
 
 def _anomaly_to_response(a: AnomalyObservation) -> AnomalyObservationResponse:
+    has_case = a.linked_case_id is not None
+    is_inv = a.lifecycle_state in ("INVESTIGATING", "RECOVERY_PENDING", "RECOVERED")
+    has_ev = bool(a.evidence_refs_json)
+    is_verified = (
+        a.lifecycle_state == "RECOVERED"
+        and a.verified_recovered_at is not None
+        and a.verification_verdict == "VERIFIED_RECOVERY"
+    )
+    has_verif_check = a.verification_verdict is not None
     timeline = [
         AnomalyTimelineStage(
             stage="Observed",
@@ -159,22 +168,48 @@ def _anomaly_to_response(a: AnomalyObservation) -> AnomalyObservationResponse:
             detail=f"{a.detector_code} ({a.anomaly_type})",
         ),
         AnomalyTimelineStage(
-            stage="Case Created",
-            completed=a.linked_case_id is not None,
-            timestamp=a.created_at if a.linked_case_id else None,
+            stage="Investigating",
+            completed=has_case and is_inv,
+            timestamp=a.created_at if has_case else None,
             detail=a.linked_case_id,
         ),
         AnomalyTimelineStage(
-            stage="Investigating",
-            completed=a.lifecycle_state in ("INVESTIGATING", "RECOVERY_PENDING", "RECOVERED"),
-            timestamp=a.updated_at if a.linked_job_id else None,
-            detail=a.linked_job_id,
+            stage="Evidence Collected",
+            completed=has_ev,
+            timestamp=a.last_observed_at if has_ev else None,
+            detail=f"{len(a.evidence_refs_json or [])} ref(s)",
         ),
         AnomalyTimelineStage(
-            stage="Verified Recovery",
-            completed=a.lifecycle_state == "RECOVERED" and a.verified_recovered_at is not None,
+            stage="Diagnosis",
+            completed=has_case and has_ev and is_inv,
+            timestamp=a.updated_at if (has_case and has_ev) else None,
+            detail=a.anomaly_type,
+        ),
+        AnomalyTimelineStage(
+            stage="Policy Decision",
+            completed=has_case and is_inv,
+            timestamp=None,
+            detail="Pending" if not has_case else "Policy evaluated",
+        ),
+        AnomalyTimelineStage(
+            stage="Action",
+            completed=a.recovery_source == "AI_APPROVED_ACTION",
+            timestamp=a.verified_recovered_at
+            if a.recovery_source == "AI_APPROVED_ACTION"
+            else None,
+            detail=a.recovery_source or "Read-only / Pending",
+        ),
+        AnomalyTimelineStage(
+            stage="Verification",
+            completed=has_verif_check,
             timestamp=a.verified_recovered_at,
-            detail=a.verification_verdict or a.recovery_source,
+            detail=a.verification_verdict or "Pending",
+        ),
+        AnomalyTimelineStage(
+            stage="Recovery",
+            completed=is_verified,
+            timestamp=a.verified_recovered_at,
+            detail=a.recovery_source if is_verified else "Unrecovered",
         ),
     ]
     return AnomalyObservationResponse(

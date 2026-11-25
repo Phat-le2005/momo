@@ -33,6 +33,7 @@ from app.models.enums import (
     VerificationVerdict,
 )
 from app.models.incidents import AgentTask, Incident, IncidentCase
+from app.models.judge import BlindChallengeRun
 from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
 from app.models.risk import RiskSignal
 from app.models.scenario_runs import SimScenarioRun
@@ -70,6 +71,7 @@ __all__ = [
     "AnomalyObservation",
     "Approval",
     "ApprovalDecision",
+    "BlindChallengeRun",
     "Case",
     "CaseEvent",
     "CaseState",

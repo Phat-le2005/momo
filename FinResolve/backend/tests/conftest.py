@@ -53,7 +53,8 @@ def clean_database() -> Iterator[None]:
                         "supervisor_states, supervisor_jobs, challenges, "
                         "supervisor_activities, supervisor_workers, "
                         "normalized_events, llm_concurrency_leases, "
-                        "commerce_source_bindings, anomaly_observations CASCADE"
+                        "commerce_source_bindings, anomaly_observations, "
+                        "blind_challenge_runs CASCADE"
                     )
                 )
         except Exception:
