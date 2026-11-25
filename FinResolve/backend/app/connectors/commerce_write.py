@@ -320,6 +320,26 @@ def execute_and_verify_commerce_recovery(
             idempotent_replay=True,
         )
 
+    # 1b (Prompt 14.3 Fix 5): Block conflicting replanning while an earlier command for the
+    # same target order or anomaly is still in EXECUTING, UNKNOWN_OUTCOME, or VERIFYING!
+    conflict_filters: list[Any] = [
+        RecoveryCommand.session_id == binding.session_id,
+        RecoveryCommand.source_binding_id == binding.id,
+        RecoveryCommand.state.in_(["EXECUTING", "UNKNOWN_OUTCOME", "VERIFYING"]),
+    ]
+    if obs.affected_order_id:
+        conflict_filters.append(RecoveryCommand.target_order_id == obs.affected_order_id)
+    else:
+        conflict_filters.append(RecoveryCommand.anomaly_id == obs.id)
+    in_flight = db.scalar(select(RecoveryCommand).where(*conflict_filters).limit(1))
+    if in_flight is not None:
+        raise AppError(
+            ErrorCode.CONFLICT,
+            f"ACTIVE_OR_UNCERTAIN_COMMAND_IN_FLIGHT: command '{in_flight.id}' "
+            f"is in state '{in_flight.state}'; reconcile before planning another mutation",
+            status_code=409,
+        )
+
     # 2. Mandatory deterministic PolicyEngine evaluation (NO bypass, NO hardcoded allow!)
     policy_engine = PolicyEngine(db, binding.session_id)
     decision: CommercePolicyDecision = policy_engine.evaluate_commerce_recovery(
@@ -546,11 +566,19 @@ def reconcile_unknown_recovery_command(
     read_key: str | None = None,
     transport: httpx.BaseTransport | None = None,
     read_connector: CommerceReadConnector | None = None,
+    uncertainty_grace_seconds: int = 30,
+    max_not_found_probes: int = 3,
 ) -> RecoveryExecutionResult:
-    """Reconcile a RecoveryCommand stuck in EXECUTING or UNKNOWN_OUTCOME via authoritative lookup.
+    """Safely reconcile a RecoveryCommand stuck in EXECUTING, UNKNOWN_OUTCOME, or VERIFYING.
 
-    NEVER blindly retries the mutation! Queries MiniStore `GET /commands/{idempotency_key}` first,
-    then runs independent business postcondition verification if MiniStore confirms execution.
+    Hard Safety Invariants (Prompt 14.3 Fix 5):
+    - NEVER blindly retries the mutation!
+    - NEVER treats an isolated HTTP 404 from receiver status lookup as definitive proof the
+      command never executed (an in-flight or uncommitted command can return 404 transiently).
+    - Preserves UNKNOWN_OUTCOME until grace window + probe budget expire, then checks
+      authoritative business state and escalates to MANUAL_REVIEW if still uncertain.
+    - Requires ALL mandatory identity fields (`idempotency_key`, `request_hash`, `command`)
+      in the receiver status response to match `cmd_row` before accepting EXECUTED.
     """
     settings = get_settings()
     w_key = write_key if write_key is not None else settings.commerce_write_key.get_secret_value()
@@ -567,6 +595,31 @@ def reconcile_unknown_recovery_command(
         binding, service_key=read_key, transport=transport
     )
 
+    # If already VERIFYING, complete independent postcondition verification directly
+    if cmd_row.state == "VERIFYING":
+        recovered, detail = verify_anomaly_recovery(db, obs=obs, connector=reader)
+        cmd_row.state = "VERIFIED" if recovered else "MANUAL_REVIEW"
+        cmd_row.verification_json = {
+            "recovered": recovered,
+            "verdict": obs.verification_verdict,
+            "recovery_source": obs.recovery_source,
+            "detail": detail,
+            "reconciled_from_verifying": True,
+        }
+        cmd_row.updated_at = datetime.now(UTC)
+        db.commit()
+        return RecoveryExecutionResult(
+            command_id=cmd_row.id,
+            command=cmd_row.command,
+            executed=True,
+            http_status=cmd_row.http_status or 200,
+            verified_recovery=recovered,
+            verdict=obs.verification_verdict or RecoveryVerdict.STILL_INCONSISTENT.value,
+            recovery_source=obs.recovery_source,
+            detail=f"Completed verification for stranded VERIFYING command: {detail}",
+            response_payload=dict(cmd_row.response_json or {}),
+        )
+
     try:
         status_code, status_data = writer.get_command_status(cmd_row.idempotency_key)
     except CommerceConnectorError as exc:
@@ -582,11 +635,74 @@ def reconcile_unknown_recovery_command(
             response_payload={},
         )
 
+    now = datetime.now(UTC)
     if status_code == 404:
-        cmd_row.state = "FAILED"
+        # NEVER treat an isolated HTTP 404 as definitive proof the command never executed!
+        prev_resp = dict(cmd_row.response_json or {})
+        probes = int(prev_resp.get("not_found_probes") or 0) + 1
+        created = cmd_row.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        age_sec = max(0.0, (now - created).total_seconds())
+        prev_resp["not_found_probes"] = probes
+        prev_resp["last_404_at"] = now.isoformat()
         cmd_row.http_status = 404
-        cmd_row.response_json = {"reconciliation": "NOT_RECEIVED_BY_COMMERCE"}
-        cmd_row.updated_at = datetime.now(UTC)
+        cmd_row.response_json = prev_resp
+        cmd_row.updated_at = now
+
+        if probes < max(1, max_not_found_probes) or age_sec < float(
+            max(0, uncertainty_grace_seconds)
+        ):
+            cmd_row.state = "UNKNOWN_OUTCOME"
+            db.commit()
+            return RecoveryExecutionResult(
+                command_id=cmd_row.id,
+                command=cmd_row.command,
+                executed=False,
+                http_status=404,
+                verified_recovery=False,
+                verdict=RecoveryVerdict.UNKNOWN_OUTCOME.value,
+                recovery_source=None,
+                detail=(
+                    f"Transient 404 on receiver lookup (probe {probes}/{max_not_found_probes}, "
+                    f"age={age_sec:.1f}s); preserving UNKNOWN_OUTCOME"
+                ),
+                response_payload=status_data,
+            )
+
+        # Uncertainty window exhausted: verify authoritative business state before escalating
+        recovered, detail = verify_anomaly_recovery(db, obs=obs, connector=reader)
+        if recovered:
+            cmd_row.state = "VERIFIED"
+            cmd_row.verification_json = {
+                "recovered": True,
+                "verdict": obs.verification_verdict,
+                "recovery_source": obs.recovery_source,
+                "detail": detail,
+                "reconciled_after_404_probes": probes,
+            }
+            db.commit()
+            return RecoveryExecutionResult(
+                command_id=cmd_row.id,
+                command=cmd_row.command,
+                executed=True,
+                http_status=404,
+                verified_recovery=True,
+                verdict=obs.verification_verdict or RecoveryVerdict.VERIFIED_RECOVERY.value,
+                recovery_source=obs.recovery_source,
+                detail=f"Authoritative state verified recovered after 404 probes: {detail}",
+                response_payload=status_data,
+            )
+
+        cmd_row.state = "MANUAL_REVIEW"
+        cmd_row.verification_json = {
+            "recovered": False,
+            "verdict": RecoveryVerdict.UNKNOWN_OUTCOME.value,
+            "detail": (
+                f"Receiver returned 404 across {probes} probes over {age_sec:.1f}s; "
+                "escalated to MANUAL_REVIEW rather than unsafe blind retry"
+            ),
+        }
         db.commit()
         return RecoveryExecutionResult(
             command_id=cmd_row.id,
@@ -594,15 +710,28 @@ def reconcile_unknown_recovery_command(
             executed=False,
             http_status=404,
             verified_recovery=False,
-            verdict=RecoveryVerdict.STILL_INCONSISTENT.value,
+            verdict=RecoveryVerdict.UNKNOWN_OUTCOME.value,
             recovery_source=None,
-            detail="Receiver confirmed command was never executed (404); safe to re-plan",
+            detail="Uncertainty window exhausted after 404 probes; escalated to MANUAL_REVIEW",
             response_payload=status_data,
         )
 
     remote_status = str(status_data.get("status") or "").upper()
-    remote_hash = status_data.get("request_hash")
-    if remote_hash and str(remote_hash) != cmd_row.request_hash:
+    remote_hash = str(status_data.get("request_hash") or "").strip()
+    remote_cmd = str(status_data.get("command") or "").strip().upper()
+    remote_idemp = str(status_data.get("idempotency_key") or "").strip()
+    remote_epoch = status_data.get("world_epoch")
+
+    # Prompt 14.3 Fix 5: ALL mandatory identity fields must be present and match cmd_row!
+    if (
+        not remote_hash
+        or remote_hash != cmd_row.request_hash
+        or not remote_cmd
+        or remote_cmd != cmd_row.command.upper()
+        or not remote_idemp
+        or remote_idemp != cmd_row.idempotency_key
+        or (remote_epoch is not None and int(remote_epoch) != int(cmd_row.world_epoch))
+    ):
         return RecoveryExecutionResult(
             command_id=cmd_row.id,
             command=cmd_row.command,
@@ -611,9 +740,13 @@ def reconcile_unknown_recovery_command(
             verified_recovery=False,
             verdict=RecoveryVerdict.UNKNOWN_OUTCOME.value,
             recovery_source=None,
-            detail="Receiver status lookup request_hash mismatch; refusing reconciliation",
+            detail=(
+                "Receiver status lookup missing or mismatched mandatory identity fields "
+                "(idempotency_key/request_hash/command/world_epoch); refusing reconciliation"
+            ),
             response_payload=status_data,
         )
+
     if status_code == 200 and remote_status == "EXECUTED":
         cmd_row.http_status = 200
         cmd_row.response_json = dict(status_data.get("result") or status_data)
@@ -667,7 +800,7 @@ def reconcile_stranded_recovery_commands(
     read_connector: CommerceReadConnector | None = None,
     stale_executing_seconds: int = 30,
 ) -> int:
-    """Background worker reconciliation for commands stranded in EXECUTING or UNKNOWN_OUTCOME."""
+    """Reconcile commands stranded in EXECUTING, UNKNOWN_OUTCOME, or VERIFYING."""
     from datetime import timedelta
 
     now = datetime.now(UTC)
@@ -677,7 +810,7 @@ def reconcile_stranded_recovery_commands(
             select(RecoveryCommand).where(
                 RecoveryCommand.source_binding_id == binding.id,
                 RecoveryCommand.session_id == binding.session_id,
-                RecoveryCommand.state.in_(["UNKNOWN_OUTCOME", "EXECUTING"]),
+                RecoveryCommand.state.in_(["UNKNOWN_OUTCOME", "EXECUTING", "VERIFYING"]),
             )
         ).all()
     )
