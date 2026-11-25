@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
@@ -1107,6 +1108,202 @@ def submit_order_complaint(
         created_at=comp.created_at,
         updated_at=comp.updated_at,
     )
+
+
+class ReceiptClaimUploadRequest(BaseModel):
+    content_base64: str = Field(..., min_length=4, max_length=7_000_000)
+    content_type: str = Field(..., min_length=5, max_length=64)
+    claimed_txn_ref: str | None = Field(default=None, max_length=128)
+    claimed_amount_vnd: int | None = Field(default=None, ge=0)
+    note: str = Field(default="", max_length=1000)
+
+
+_ALLOWED_RECEIPT_MIMES: frozenset[str] = frozenset({"image/png", "image/jpeg", "image/webp"})
+_MAX_RECEIPT_UPLOAD_BYTES = 5 * 1024 * 1024
+_MAX_RECEIPT_DIM = 8000
+_MAX_RECEIPT_PIXELS = 25_000_000
+
+
+def _validate_receipt_image_bytes(raw: bytes, content_type: str) -> tuple[int, int]:
+    import struct
+
+    norm = content_type.strip().lower().split(";")[0]
+    if norm not in _ALLOWED_RECEIPT_MIMES:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST,
+            f"UNSUPPORTED_MEDIA_TYPE: '{norm}' not permitted for receipt upload",
+            status_code=400,
+        )
+    if not raw or len(raw) > _MAX_RECEIPT_UPLOAD_BYTES:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST,
+            "INVALID_RECEIPT_SIZE: receipt image must be 1 byte to 5 MB",
+            status_code=400,
+        )
+    if norm == "image/png":
+        if not raw.startswith(b"\x89PNG\r\n\x1a\n") or len(raw) < 24 or raw[12:16] != b"IHDR":
+            raise CommerceError(ErrorCode.BAD_REQUEST, "INVALID_PNG_HEADER", status_code=400)
+        w, h = struct.unpack(">II", raw[16:24])
+    elif norm == "image/jpeg":
+        if not raw.startswith(b"\xff\xd8\xff"):
+            raise CommerceError(ErrorCode.BAD_REQUEST, "INVALID_JPEG_HEADER", status_code=400)
+        w, h = 1, 1
+        idx = 2
+        while idx + 4 <= len(raw):
+            if raw[idx] != 0xFF:
+                idx += 1
+                continue
+            marker = raw[idx + 1]
+            if marker in (0xC0, 0xC1, 0xC2) and idx + 9 <= len(raw):
+                h, w = struct.unpack(">HH", raw[idx + 5 : idx + 9])
+                break
+            if marker in (0xD8, 0xD9, 0x01) or (0xD0 <= marker <= 0xD7):
+                idx += 2
+                continue
+            seg_len = struct.unpack(">H", raw[idx + 2 : idx + 4])[0]
+            if seg_len < 2:
+                break
+            idx += 2 + seg_len
+    else:
+        if not (raw.startswith(b"RIFF") and b"WEBP" in raw[:16]):
+            raise CommerceError(ErrorCode.BAD_REQUEST, "INVALID_WEBP_HEADER", status_code=400)
+        w, h = 1, 1
+    if (
+        w <= 0
+        or h <= 0
+        or w > _MAX_RECEIPT_DIM
+        or h > _MAX_RECEIPT_DIM
+        or (w * h) > _MAX_RECEIPT_PIXELS
+    ):
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST,
+            f"DECOMPRESSION_BOMB_BLOCKED: dimensions {w}x{h} exceed limits",
+            status_code=400,
+        )
+    return int(w), int(h)
+
+
+@router.post(
+    "/store/orders/{order_id}/receipt-claim",
+    status_code=status.HTTP_201_CREATED,
+)
+def upload_order_receipt_claim(
+    order_id: str,
+    payload: ReceiptClaimUploadRequest,
+    principal: CustomerPrincipal = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Authenticated customer receipt upload stored privately as untrusted CLAIM evidence."""
+    import base64
+    import hashlib
+    from pathlib import Path
+
+    order = db.scalar(
+        select(Order).where(
+            Order.id == order_id,
+            Order.customer_id == principal.customer.id,
+            Order.merchant_id == principal.merchant_id,
+        )
+    )
+    if order is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Không tìm thấy đơn hàng", status_code=404)
+
+    try:
+        raw_bytes = base64.b64decode(payload.content_base64, validate=True)
+    except Exception as exc:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST, "INVALID_BASE64_RECEIPT", status_code=400
+        ) from exc
+
+    width, height = _validate_receipt_image_bytes(raw_bytes, payload.content_type)
+    sha256_hex = hashlib.sha256(raw_bytes).hexdigest()
+
+    # Private non-public storage directory (never served via static public routes)
+    private_dir = Path(".private_receipts") / order.merchant_id
+    private_dir.mkdir(parents=True, exist_ok=True)
+    comp_id = f"CMP-{uuid.uuid4().hex[:10].upper()}"
+    ext = payload.content_type.split("/")[-1].split(";")[0].lower()
+    stored_path = private_dir / f"{comp_id}.{ext}"
+    stored_path.write_bytes(raw_bytes)
+
+    claim_desc = (
+        f"[PAYMENT_RECEIPT_CLAIM] sha256={sha256_hex[:16]} dims={width}x{height} "
+        f"claimed_amount_vnd={payload.claimed_amount_vnd} note={payload.note.strip()}"
+    )
+    comp = Complaint(
+        id=comp_id,
+        order_id=order.id,
+        merchant_id=order.merchant_id,
+        commerce_session_id=order.commerce_session_id,
+        customer_id=principal.customer.id,
+        category="PAYMENT_RECEIPT_CLAIM",
+        description=claim_desc,
+        claimed_receipt_ref=(payload.claimed_txn_ref.strip() if payload.claimed_txn_ref else None),
+        evidence_kind="CLAIM",
+        status=ComplaintStatus.OPEN.value,
+    )
+    db.add(comp)
+    record_commerce_event(
+        db,
+        merchant_id=order.merchant_id,
+        commerce_session_id=order.commerce_session_id,
+        world_epoch=order.world_epoch,
+        event_type="PAYMENT_RECEIPT_CLAIM_SUBMITTED",
+        order_id=order.id,
+        correlation_id=order.correlation_id,
+        payload={
+            "complaint_id": comp.id,
+            "evidence_kind": "CLAIM",
+            "claimed_receipt_ref": comp.claimed_receipt_ref,
+            "claimed_amount_vnd": payload.claimed_amount_vnd,
+            "receipt_sha256": sha256_hex,
+            "image_dimensions": [width, height],
+            "ocr_extraction_status": "UNAVAILABLE_MANUAL_REVIEW_REQUIRED",
+        },
+    )
+    db.commit()
+    return {
+        "complaint_id": comp.id,
+        "order_id": order.id,
+        "evidence_kind": "CLAIM",
+        "status": comp.status,
+        "receipt_sha256": sha256_hex,
+        "image_dimensions": [width, height],
+        "ocr_extraction_status": "UNAVAILABLE_MANUAL_REVIEW_REQUIRED",
+    }
+
+
+@router.delete("/store/orders/{order_id}/complaints/{complaint_id}")
+def delete_order_receipt_claim(
+    order_id: str,
+    complaint_id: str,
+    principal: CustomerPrincipal = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Retention & deletion control: customer may delete their own uploaded receipt file."""
+    from pathlib import Path
+
+    comp = db.scalar(
+        select(Complaint).where(
+            Complaint.id == complaint_id,
+            Complaint.order_id == order_id,
+            Complaint.customer_id == principal.customer.id,
+            Complaint.merchant_id == principal.merchant_id,
+        )
+    )
+    if comp is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Không tìm thấy khiếu nại", status_code=404)
+
+    private_dir = Path(".private_receipts") / comp.merchant_id
+    deleted_files = 0
+    if private_dir.exists():
+        for p in private_dir.glob(f"{comp.id}.*"):
+            p.unlink(missing_ok=True)
+            deleted_files += 1
+    comp.status = ComplaintStatus.CLOSED.value
+    comp.description = "[RECEIPT_DELETED_BY_CUSTOMER]"
+    db.commit()
+    return {"complaint_id": comp.id, "deleted_files": deleted_files, "status": comp.status}
 
 
 @router.post(
