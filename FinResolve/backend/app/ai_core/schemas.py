@@ -30,6 +30,8 @@ ALLOWED_READ_TOOLS: frozenset[str] = frozenset(
         "get_inventory",
         "get_policy",
         "get_order_events",
+        "get_operational_telemetry",
+        "get_incident_experience",
     }
 )
 

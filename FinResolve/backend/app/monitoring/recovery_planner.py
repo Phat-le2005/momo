@@ -48,6 +48,10 @@ class StructuredRecoveryPlan:
     preconditions_met: bool = False
     expected_postconditions: list[str] = field(default_factory=list)
     rationale: str = ""
+    policy_ids: list[str] = field(default_factory=list)
+    missing_evidence: list[str] = field(default_factory=list)
+    uncertainty_note: str = ""
+    planning_mode: str = "DETERMINISTIC_SAFETY_BASELINE"
 
 
 def build_evidence_driven_recovery_plan(
@@ -93,13 +97,18 @@ def build_evidence_driven_recovery_plan(
     expected_version: int | None = None
     preconditions_met = False
     postconditions: list[str] = []
+    missing_evidence: list[str] = []
+    uncertainty_note = "Insufficient authoritative evidence for automated mutation."
     rationale = "Insufficient authoritative evidence for automated mutation; escalating safely."
+    policy_ids = [
+        f"{p['policy_id']}@{p.get('version', '1.0')}" for p in policies if "policy_id" in p
+    ]
 
-    # Evidence-driven evaluation (NEVER keyed blindly on detector_code!)
+    # Deterministic safety baseline evaluation (PolicyEngine gates final authorization)
     if order_data is not None and pay_data is not None:
         o_status = str(order_data.get("status") or "").upper()
         p_status = str(pay_data.get("status") or "").upper()
-        p_provider = str(pay_data.get("provider") or "LOCAL_MOCK").upper()
+        p_provider = str(pay_data.get("provider") or "").upper()
         p_synced = bool(pay_data.get("is_synced_to_order", False))
         p_recon = bool(pay_data.get("reconciliation_required", False))
         o_recon = str(order_data.get("reconciliation_status") or "CLEAR").upper()
@@ -118,14 +127,16 @@ def build_evidence_driven_recovery_plan(
             hypotheses.append(
                 {
                     "cause": "Confirmed LOCAL_MOCK payment failed to synchronize order state",
-                    "confidence": 0.92,
+                    "evidence_support": "AUTHORITATIVE_STATE_MATCH",
                     "supported_by": evidence_refs,
+                    "contradicting_evidence": [],
                 }
             )
             proposed_cmd = "REQUEST_ORDER_SYNC"
             risk_level = "LOW"
             requires_approval = False
             preconditions_met = True
+            uncertainty_note = "Postconditions must still be verified independently after sync."
             postconditions = [
                 "Order status transitions to CONFIRMED",
                 "Payment is_synced_to_order becomes True",
@@ -133,56 +144,66 @@ def build_evidence_driven_recovery_plan(
             ]
             rationale = (
                 "Authoritative LOCAL_MOCK payment is SUCCEEDED and unsynced while order is "
-                "PENDING_PAYMENT with no conflicts; targeted REQUEST_ORDER_SYNC permitted."
+                "PENDING_PAYMENT with no conflicts; proposing targeted REQUEST_ORDER_SYNC "
+                "subject to PolicyEngine authorization."
             )
         elif o_status == "CANCELLED" and p_status == "SUCCEEDED":
             hypotheses.append(
                 {
                     "cause": "Late payment succeeded after order cancellation",
-                    "confidence": 0.95,
+                    "evidence_support": "AUTHORITATIVE_STATE_MATCH",
                     "supported_by": evidence_refs,
+                    "contradicting_evidence": [],
                 }
             )
             proposed_cmd = "REQUEST_MANUAL_REVIEW"
             risk_level = "HIGH"
             requires_approval = True
             preconditions_met = True
+            uncertainty_note = "Requires Finance decision on refund vs re-order."
             postconditions = ["Order remains CANCELLED", "Finance reviews refund/reconciliation"]
             rationale = "Cancelled orders MUST NOT be resurrected; escalating for Finance review."
         elif o_status == "PENDING_PAYMENT" and p_status in ("PENDING", "INITIATED", "UNKNOWN"):
             hypotheses.append(
                 {
                     "cause": "Payment not yet confirmed by authoritative provider",
-                    "confidence": 0.85,
+                    "evidence_support": "AUTHORITATIVE_STATE_MATCH",
                     "supported_by": evidence_refs,
+                    "contradicting_evidence": [],
                 }
             )
             proposed_cmd = "REQUEST_PAYMENT_RECONCILIATION"
             risk_level = "LOW"
             requires_approval = False
             preconditions_met = False
+            missing_evidence.append("authoritative_provider_confirmation")
+            uncertainty_note = "Provider settlement status not yet finalized."
             postconditions = ["Order remains PENDING_PAYMENT until authoritative confirmation"]
             rationale = "Payment is NOT confirmed; refusing order sync and flagging observation."
     elif (obs.affected_entities_json or {}).get("event_id"):
         hypotheses.append(
             {
                 "cause": "Scoped business event delivery lag or failure",
-                "confidence": 0.85,
+                "evidence_support": "EVENT_OUTBOX_OBSERVATION",
                 "supported_by": evidence_refs,
+                "contradicting_evidence": [],
             }
         )
         proposed_cmd = "REQUEST_EVENT_REDELIVERY"
         risk_level = "LOW"
         requires_approval = False
         preconditions_met = True
+        uncertainty_note = "Verify inbox arrival without duplicates after redelivery."
         postconditions = ["Scoped event present in durable inbox without duplicates"]
-        rationale = "Idempotent scoped event redelivery is safe and low-risk."
+        rationale = "Idempotent scoped event redelivery proposed subject to PolicyEngine."
     else:
+        missing_evidence.append("authoritative_root_cause_evidence")
         hypotheses.append(
             {
-                "cause": "Unknown operational or multivariate business anomaly",
-                "confidence": 0.4,
+                "cause": "Unknown operational or business anomaly (root cause unconfirmed)",
+                "evidence_support": "STATISTICAL_DEVIATION_ONLY",
                 "supported_by": evidence_refs,
+                "contradicting_evidence": [],
             }
         )
         postconditions = ["Sustained return to learned behavioral baseline"]
@@ -201,6 +222,10 @@ def build_evidence_driven_recovery_plan(
         preconditions_met=preconditions_met,
         expected_postconditions=postconditions,
         rationale=rationale,
+        policy_ids=policy_ids,
+        missing_evidence=missing_evidence,
+        uncertainty_note=uncertainty_note,
+        planning_mode="DETERMINISTIC_SAFETY_BASELINE",
     )
 
 

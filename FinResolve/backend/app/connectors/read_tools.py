@@ -145,6 +145,22 @@ class ReadToolRegistry:
                 "read_only": True,
                 "required_permission": "READ_POLICY",
             },
+            {
+                "tool_name": "get_operational_telemetry",
+                "purpose": "Inspect live rolling-window HTTP throughput, latency, and error rates",
+                "source_system": src,
+                "supported_entities": ["service", "telemetry"],
+                "read_only": True,
+                "required_permission": "READ_TELEMETRY",
+            },
+            {
+                "tool_name": "get_incident_experience",
+                "purpose": "Retrieve merchant-scoped verified past incident resolutions",
+                "source_system": "EXPERIENCE_MEMORY",
+                "supported_entities": ["incident", "merchant"],
+                "read_only": True,
+                "required_permission": "READ_EXPERIENCE",
+            },
         ]
 
     def _resolve_commerce_connector(self) -> CommerceReadConnector | None:
@@ -174,6 +190,8 @@ class ReadToolRegistry:
         now = datetime.now(UTC)
         if tool_name == "get_policy":
             return self._get_policy(args, simulate_timeout=simulate_timeout)
+        if tool_name == "get_incident_experience":
+            return self._get_incident_experience(args, simulate_timeout=simulate_timeout)
         if simulate_timeout:
             return ToolResult(
                 tool_name=tool_name,
@@ -323,6 +341,17 @@ class ReadToolRegistry:
                     observed_at=datetime.fromisoformat(env["observed_at"]),
                     data={"events": env["data"]},
                 )
+            if tool_name == "get_operational_telemetry":
+                telem, obs_at = conn.get_telemetry()
+                return ToolResult(
+                    tool_name=tool_name,
+                    status="OK",
+                    source="MINI_STORE_COMMERCE_HTTP",
+                    source_ref="/api/v1/service/telemetry",
+                    source_mode="COMMERCE_HTTP",
+                    observed_at=obs_at,
+                    data=telem,
+                )
             return ToolResult(
                 tool_name=tool_name,
                 status="ERROR",
@@ -373,6 +402,8 @@ class ReadToolRegistry:
             "get_inventory": self._get_inventory,
             "get_policy": self._get_policy,
             "get_order_events": self._get_order_events,
+            "get_operational_telemetry": self._get_operational_telemetry_sim,
+            "get_incident_experience": self._get_incident_experience,
         }
         handler = dispatch_map[tool_name]
         result = handler(args, simulate_timeout=simulate_timeout)
@@ -1351,5 +1382,56 @@ class ReadToolRegistry:
                     }
                     for pr in order_proposals
                 ],
+            },
+        )
+
+    def _get_operational_telemetry_sim(
+        self, args: dict[str, Any], *, simulate_timeout: bool = False
+    ) -> ToolResult:
+        now = datetime.now(UTC)
+        if simulate_timeout:
+            return ToolResult(
+                tool_name="get_operational_telemetry",
+                status="TIMEOUT",
+                source="SIMULATOR",
+                source_ref="telemetry",
+                observed_at=now,
+                data={"error": "Simulated telemetry timeout"},
+            )
+        return ToolResult(
+            tool_name="get_operational_telemetry",
+            status="OK",
+            source="SIMULATOR",
+            source_ref="telemetry",
+            observed_at=now,
+            data={"measured_from_real_requests": False, "windows": {}},
+        )
+
+    def _get_incident_experience(
+        self, args: dict[str, Any], *, simulate_timeout: bool = False
+    ) -> ToolResult:
+        from app.knowledge.experience_memory import retrieve_similar_experiences
+
+        now = datetime.now(UTC)
+        merchant_id = _safe_str(args, "merchant_id") or "MERCHANT_FINSHOP_01"
+        query = _safe_str(args, "query") or _safe_str(args, "symptom") or "payment order anomaly"
+        experiences = retrieve_similar_experiences(
+            self._db,
+            session_id=self._session_id,
+            merchant_id=merchant_id,
+            symptom_query=query,
+            limit=3,
+        )
+        return ToolResult(
+            tool_name="get_incident_experience",
+            status="OK",
+            source="EXPERIENCE_MEMORY",
+            source_ref=f"experience:{merchant_id}",
+            source_mode="COMMERCE_HTTP" if self._source_system == "COMMERCE_HTTP" else "MOCK",
+            observed_at=now,
+            data={
+                "advisory_only": True,
+                "merchant_id": merchant_id,
+                "experiences": experiences,
             },
         )

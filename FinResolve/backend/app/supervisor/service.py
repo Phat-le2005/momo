@@ -1669,6 +1669,7 @@ def process_next_supervisor_job(
     worker_id: str | None = None,
     worker_mode: str = "STANDALONE",
     force_when_paused: bool = False,
+    commerce_transport: Any = None,
 ) -> dict[str, Any] | None:
     """Claim and execute at most ONE queued Supervisor job with fencing tokens & live heartbeats."""
     eff_worker = worker_id or f"sup-{uuid.uuid4().hex[:8]}"
@@ -1967,6 +1968,21 @@ def process_next_supervisor_job(
                 is_fallback = inv_res.is_fallback
                 step_traces = list(inv_res.step_traces)
                 decision_summary = inv_res.decision_summary
+
+                # Prompt 14.1 Phase 4: Integrated Policy-Gated Autonomous Recovery for COMMERCE_HTTP
+                recovery_note = _run_commerce_post_investigation_recovery(
+                    exec_db,
+                    case_id=claimed_case_id,
+                    session_id=claimed_session_id,
+                    anomaly_id=(
+                        str(claimed_payload.get("anomaly_id"))
+                        if claimed_payload.get("anomaly_id")
+                        else None
+                    ),
+                    commerce_transport=commerce_transport,
+                )
+                if recovery_note:
+                    decision_summary = f"{decision_summary} | {recovery_note}"
     except JobCancelledError as exc:
         terminal_outcome = "CANCELLED"
         exec_error = str(exc)
@@ -2196,12 +2212,153 @@ def _run_case_with_honest_fallback(
     return inv_res
 
 
+def _run_commerce_post_investigation_recovery(
+    db: Session,
+    *,
+    case_id: str,
+    session_id: str,
+    anomaly_id: str | None = None,
+    commerce_transport: Any = None,
+) -> str | None:
+    """Integrate evidence-driven recovery planning, PolicyEngine authorization, durable
+    Commerce execution, and independent verification into the actual Supervisor runtime.
+    """
+    from app.models.cases import CaseEvent, Evidence
+    from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
+    from app.monitoring.recovery_planner import execute_autonomous_recovery_plan
+
+    case_obj = db.scalar(select(Case).where(Case.id == case_id, Case.session_id == session_id))
+    if (
+        case_obj is None
+        or case_obj.source_system != "COMMERCE_HTTP"
+        or not case_obj.source_binding_id
+    ):
+        return None
+
+    # Require authoritative OBSERVED_FACT evidence gathered on this Case before any action!
+    has_obs_evidence = (
+        db.scalar(
+            select(func.count(Evidence.id)).where(
+                Evidence.case_id == case_obj.id,
+                Evidence.session_id == session_id,
+                Evidence.kind == EvidenceKind.OBSERVED_FACT.value,
+            )
+        )
+        or 0
+    )
+    if has_obs_evidence == 0:
+        return None
+
+    binding = db.scalar(
+        select(CommerceSourceBinding).where(
+            CommerceSourceBinding.id == case_obj.source_binding_id,
+            CommerceSourceBinding.session_id == session_id,
+            CommerceSourceBinding.is_enabled.is_(True),
+        )
+    )
+    if binding is None:
+        return None
+
+    obs: AnomalyObservation | None = None
+    if anomaly_id:
+        obs = db.scalar(
+            select(AnomalyObservation).where(
+                AnomalyObservation.id == anomaly_id,
+                AnomalyObservation.session_id == session_id,
+            )
+        )
+    if obs is None:
+        obs = db.scalar(
+            select(AnomalyObservation)
+            .where(
+                AnomalyObservation.linked_case_id == case_obj.id,
+                AnomalyObservation.session_id == session_id,
+            )
+            .order_by(AnomalyObservation.first_observed_at.desc())
+            .limit(1)
+        )
+    if obs is None or obs.lifecycle_state == "RECOVERED":
+        return None
+
+    now = datetime.now(UTC)
+    plan, exec_res = execute_autonomous_recovery_plan(
+        db,
+        binding=binding,
+        obs=obs,
+        transport=commerce_transport,
+    )
+    db.add(
+        CaseEvent(
+            id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
+            case_id=case_obj.id,
+            session_id=session_id,
+            type="AUTONOMOUS_RECOVERY_PLANNED",
+            payload_json={
+                "anomaly_id": obs.id,
+                "proposed_command": plan.proposed_command,
+                "policy_ids": plan.policy_ids,
+                "planning_mode": plan.planning_mode,
+                "requires_human_approval": plan.requires_human_approval,
+                "preconditions_met": plan.preconditions_met,
+                "evidence_refs": plan.evidence_refs,
+                "similar_experience_count": len(plan.similar_experiences),
+            },
+            created_at=now,
+        )
+    )
+
+    if exec_res is None:
+        db.add(
+            CaseEvent(
+                id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
+                case_id=case_obj.id,
+                session_id=session_id,
+                type="AUTONOMOUS_RECOVERY_ESCALATED",
+                payload_json={
+                    "anomaly_id": obs.id,
+                    "proposed_command": plan.proposed_command,
+                    "rationale": plan.rationale,
+                    "uncertainty_note": plan.uncertainty_note,
+                },
+                created_at=datetime.now(UTC),
+            )
+        )
+        db.commit()
+        return f"Escalated safely ({plan.proposed_command}): {plan.rationale[:180]}"
+
+    if exec_res.verified_recovery:
+        db.add(
+            CaseEvent(
+                id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
+                case_id=case_obj.id,
+                session_id=session_id,
+                type="AUTONOMOUS_RECOVERY_VERIFIED",
+                payload_json={
+                    "command_id": exec_res.command_id,
+                    "command": exec_res.command,
+                    "verdict": exec_res.verdict,
+                    "recovery_source": exec_res.recovery_source,
+                    "detail": exec_res.detail,
+                },
+                created_at=datetime.now(UTC),
+            )
+        )
+        case_obj.state = CaseState.RESOLVED.value
+        case_obj.updated_at = datetime.now(UTC)
+        db.commit()
+        return f"Autonomous recovery verified ({exec_res.command} -> {exec_res.verdict})"
+
+    db.commit()
+    return f"Recovery attempted ({exec_res.command} -> {exec_res.verdict})"
+
+
 def drain_session_supervisor_jobs(
     session_id: str,
     *,
     max_jobs: int = 5,
     force_when_paused: bool = False,
     worker_id: str | None = None,
+    commerce_transport: Any = None,
 ) -> list[dict[str, Any]]:
     """Process up to `max_jobs` queued Supervisor jobs (for standalone worker & tests)."""
     results: list[dict[str, Any]] = []
@@ -2210,6 +2367,7 @@ def drain_session_supervisor_jobs(
             session_id=session_id,
             worker_id=worker_id,
             force_when_paused=force_when_paused,
+            commerce_transport=commerce_transport,
         )
         if res is None:
             break
