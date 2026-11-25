@@ -8,6 +8,7 @@ Public HTTPS Gateway. Never accessible to FinResolve Agent read tools.
 from __future__ import annotations
 
 import hmac
+import threading
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header
@@ -91,10 +92,22 @@ def api_chaos_restore(
     return restore_chaos_faults(db, merchant_id=merchant_id)
 
 
+_TRAFFIC_STOP_EVENT = threading.Event()
+
+
 class FreeformTrafficRequest(BaseModel):
-    request_count: int = Field(default=15, ge=1, le=50)
+    request_count: int = Field(default=15, ge=1, le=200)
     concurrency: int = Field(default=5, ge=1, le=10)
     endpoint: str = Field(default="/api/v1/store/products", max_length=128)
+    max_duration_seconds: float = Field(default=10.0, ge=0.5, le=30.0)
+    transport_mode: str = Field(default="IN_PROCESS", pattern="^(LOCAL_HTTP|IN_PROCESS)$")
+
+
+@router.post("/controls/traffic-stop")
+def api_stop_traffic_load(_: None = Depends(_require_chaos_admin)) -> dict[str, Any]:
+    """Emergency stop for any in-flight bounded local traffic experiment."""
+    _TRAFFIC_STOP_EVENT.set()
+    return {"emergency_stop_signaled": True}
 
 
 class ScopedRestoreRequest(BaseModel):
@@ -107,10 +120,11 @@ def api_freeform_traffic_load(
     payload: FreeformTrafficRequest,
     _: None = Depends(_require_chaos_admin),
 ) -> dict[str, Any]:
-    """Bounded local concurrent HTTP load experiment recording real request telemetry."""
+    """Bounded local concurrent HTTP load experiment against fixed server-approved destination."""
     import concurrent.futures
     import time
 
+    import httpx
     from fastapi.testclient import TestClient
 
     from app.core.telemetry import get_telemetry_collector
@@ -125,26 +139,57 @@ def api_freeform_traffic_load(
             status_code=400,
         )
 
-    app_inst = create_app()
+    _TRAFFIC_STOP_EVENT.clear()
+    fixed_local_base = "http://127.0.0.1:8100"
+    app_inst = create_app() if payload.transport_mode == "IN_PROCESS" else None
     t0 = time.perf_counter()
+    deadline = t0 + float(payload.max_duration_seconds)
     statuses: dict[int, int] = {}
+    latencies_ms: list[float] = []
+    executed = 0
 
-    def _one_req(_: int) -> int:
+    def _one_req(_: int) -> tuple[int, float] | None:
+        if _TRAFFIC_STOP_EVENT.is_set() or time.perf_counter() >= deadline:
+            return None
+        req_t0 = time.perf_counter()
+        if payload.transport_mode == "LOCAL_HTTP":
+            try:
+                with httpx.Client(timeout=3.0, follow_redirects=False) as hc:
+                    r = hc.get(f"{fixed_local_base}{target}")
+                    return int(r.status_code), round((time.perf_counter() - req_t0) * 1000.0, 2)
+            except Exception:
+                return 599, round((time.perf_counter() - req_t0) * 1000.0, 2)
+        if app_inst is None:
+            return None
         with TestClient(app_inst) as tc:
             r = tc.get(target)
-            return int(r.status_code)
+            return int(r.status_code), round((time.perf_counter() - req_t0) * 1000.0, 2)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=payload.concurrency) as pool:
-        for code in pool.map(_one_req, range(payload.request_count)):
+        for res in pool.map(_one_req, range(payload.request_count)):
+            if res is None:
+                continue
+            code, lat = res
+            executed += 1
             statuses[code] = statuses.get(code, 0) + 1
+            latencies_ms.append(lat)
 
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    sorted_lats = sorted(latencies_ms)
+    p95 = sorted_lats[int(round(0.95 * (len(sorted_lats) - 1)))] if sorted_lats else 0.0
+    error_count = sum(v for k, v in statuses.items() if k >= 500 or k == 429)
     snap = get_telemetry_collector().snapshot_window(60)
     return {
         "endpoint": target,
-        "requests_executed": payload.request_count,
+        "transport_mode": payload.transport_mode,
+        "fixed_destination": fixed_local_base,
+        "requests_executed": executed,
         "concurrency": payload.concurrency,
+        "max_duration_seconds": payload.max_duration_seconds,
+        "stopped_early": _TRAFFIC_STOP_EVENT.is_set(),
         "elapsed_ms": elapsed_ms,
+        "measured_p95_latency_ms": p95,
+        "measured_error_rate": round(error_count / max(1, executed), 4),
         "status_codes": statuses,
         "measured_window_60s": snap,
     }

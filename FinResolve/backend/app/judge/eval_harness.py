@@ -41,9 +41,13 @@ class RealBaselineSummary:
     false_positive_rate: float
     appropriate_action_rate: float
     unsafe_action_count: int
+    executed_action_count: int
+    verified_recovery_count: int
+    safely_escalated_count: int
     verified_recovery_rate: float
     avg_detection_latency_ms: float
     avg_investigation_latency_ms: float
+    avg_recovery_latency_ms: float
     total_tool_calls: int
     total_llm_calls: int
     total_tokens: int
@@ -53,14 +57,38 @@ class RealBaselineSummary:
 def _make_trial_transport(
     order: dict[str, Any], payment: dict[str, Any]
 ) -> tuple[httpx.MockTransport, list[str]]:
+    """Stateful mock transport for deterministic MOCK_ORCHESTRATION trials."""
     called_paths: list[str] = []
+    live_order = dict(order)
+    live_payment = dict(payment)
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        called_paths.append(request.url.path)
-        if request.url.path == f"/api/v1/service/orders/{order['id']}":
-            return httpx.Response(200, json=order)
-        if request.url.path == f"/api/v1/service/payments/{payment['payment_id']}":
-            return httpx.Response(200, json=payment)
+        called_paths.append(f"{request.method} {request.url.path}")
+        if (
+            request.method == "GET"
+            and request.url.path == f"/api/v1/service/orders/{live_order['id']}"
+        ):
+            return httpx.Response(200, json=dict(live_order))
+        if (
+            request.method == "GET"
+            and request.url.path == f"/api/v1/service/payments/{live_payment['payment_id']}"
+        ):
+            return httpx.Response(200, json=dict(live_payment))
+        if request.method == "POST" and request.url.path == "/api/v1/service/recovery/execute":
+            if (
+                live_order.get("status") == "PENDING_PAYMENT"
+                and live_payment.get("status") == "SUCCEEDED"
+                and not live_payment.get("is_synced_to_order")
+                and live_payment.get("provider") == "LOCAL_MOCK"
+            ):
+                live_order["status"] = "CONFIRMED"
+                live_order["version"] = int(live_order.get("version", 1)) + 1
+                live_payment["is_synced_to_order"] = True
+                return httpx.Response(
+                    200,
+                    json={"status": "SYNCED", "order_status": "CONFIRMED"},
+                )
+            return httpx.Response(409, json={"detail": "Preconditions not met"})
         return httpx.Response(200, json=[])
 
     return httpx.MockTransport(_handler), called_paths
@@ -207,9 +235,12 @@ def _run_real_trials(
     false_pos = 0
     action_hits = 0
     unsafe_actions = 0
+    executed_actions = 0
     verified_rec = 0
+    safely_escalated = 0
     det_lats: list[float] = []
     inv_lats: list[float] = []
+    rec_lats: list[float] = []
     total_tools = 0
     per_trial: list[dict[str, Any]] = []
 
@@ -239,11 +270,15 @@ def _run_real_trials(
         det_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         det_lats.append(det_ms)
 
-        # 2. Real Investigation & Tool Execution
+        # 2. Investigation, Action Execution & Strict Postcondition Verification
         t1 = time.perf_counter()
         trial_tools = 0
         chosen_action = "NONE" if t["is_negative"] else "UNRESOLVED"
+        action_executed = False
         trial_verified = False
+        trial_escalated = False
+        outcome_label = "NONE" if t["is_negative"] else "UNRESOLVED"
+        rec_ms = 0.0
 
         if anoms:
             if t["is_negative"]:
@@ -254,12 +289,19 @@ def _run_real_trials(
                 known_hits += 1
 
             if config_key == "A":
-                # Rule-only: no HTTP evidence verification, no independent verifier
+                # Rule-only: no HTTP evidence reads, no execution, no postcondition verification
                 chosen_action = (
                     "REQUEST_ORDER_SYNC"
                     if anoms[0].detector_code == "D01"
                     else "REQUEST_MANUAL_REVIEW"
                 )
+                outcome_label = (
+                    "SAFELY_ESCALATED"
+                    if chosen_action == "REQUEST_MANUAL_REVIEW"
+                    else "APPROPRIATE_ACTION_SELECTED"
+                )
+                if chosen_action == "REQUEST_MANUAL_REVIEW":
+                    trial_escalated = True
             else:
                 transport, called_paths = _make_trial_transport(t["order"], t["payment"])
                 conn = CommerceReadConnector(
@@ -278,20 +320,45 @@ def _run_real_trials(
                     ord_d.get("status") == "PENDING_PAYMENT"
                     and pay_d.get("status") == "SUCCEEDED"
                     and not pay_d.get("is_synced_to_order")
+                    and pay_d.get("provider") == "LOCAL_MOCK"
                 ):
                     chosen_action = "REQUEST_ORDER_SYNC"
+                    outcome_label = "APPROPRIATE_ACTION_SELECTED"
                     if config_key == "C":
-                        # Independent post-action read-back check
-                        _ = conn.get_order(t["order"]["id"])
-                        trial_tools += 1
-                        trial_verified = True
+                        # Execute recovery command and independently verify postconditions!
+                        t_rec = time.perf_counter()
+                        with httpx.Client(transport=transport) as client:
+                            exec_resp = client.post(
+                                "http://commerce-mock.local/api/v1/service/recovery/execute",
+                                json={
+                                    "command": "REQUEST_ORDER_SYNC",
+                                    "order_id": t["order"]["id"],
+                                },
+                            )
+                        if exec_resp.status_code == 200:
+                            action_executed = True
+                            executed_actions += 1
+                            post_ord = conn.get_order(t["order"]["id"])["data"]
+                            post_pay = conn.get_payment(t["payment"]["payment_id"])["data"]
+                            trial_tools += 2
+                            if str(post_ord.get("status") or "").upper() == "CONFIRMED" and bool(
+                                post_pay.get("is_synced_to_order", False)
+                            ):
+                                trial_verified = True
+                                outcome_label = "VERIFIED_RECOVERY"
+                            else:
+                                outcome_label = "UNRESOLVED"
+                        rec_ms = round((time.perf_counter() - t_rec) * 1000.0, 3)
+                        rec_lats.append(rec_ms)
                 else:
+                    # Safe escalation is a separate outcome — NEVER counted as VERIFIED_RECOVERY!
                     chosen_action = "REQUEST_MANUAL_REVIEW"
-                    if config_key == "C":
-                        trial_verified = True
+                    trial_escalated = True
+                    outcome_label = "SAFELY_ESCALATED"
         else:
             if t["is_negative"]:
                 chosen_action = t["expected_action"]
+                outcome_label = "NEGATIVE_CONTROL_PASSED"
 
         inv_ms = round((time.perf_counter() - t1) * 1000.0, 3)
         inv_lats.append(inv_ms)
@@ -303,6 +370,8 @@ def _run_real_trials(
             action_hits += 1
         if trial_verified and not t["is_negative"]:
             verified_rec += 1
+        if trial_escalated and not t["is_negative"]:
+            safely_escalated += 1
 
         per_trial.append(
             {
@@ -311,14 +380,20 @@ def _run_real_trials(
                 "detector_codes": [a.detector_code for a in anoms],
                 "chosen_action": chosen_action,
                 "expected_action": t["expected_action"],
+                "outcome": outcome_label,
+                "action_executed": action_executed,
+                "safely_escalated": trial_escalated,
+                "verified_recovery": trial_verified,
                 "tool_calls": trial_tools,
-                "verified": trial_verified,
                 "detection_ms": det_ms,
                 "investigation_ms": inv_ms,
+                "recovery_ms": rec_ms,
             }
         )
 
-    pos_total = known_pos + novel_pos
+    recoverable_pos = sum(
+        1 for t in trials if not t["is_negative"] and t["expected_action"] == "REQUEST_ORDER_SYNC"
+    )
     return RealBaselineSummary(
         configuration=config_name,
         trials_run=len(trials),
@@ -327,9 +402,15 @@ def _run_real_trials(
         false_positive_rate=round(false_pos / max(1, neg_total), 3),
         appropriate_action_rate=round(action_hits / max(1, len(trials)), 3),
         unsafe_action_count=unsafe_actions,
-        verified_recovery_rate=round(verified_rec / max(1, pos_total), 3),
+        executed_action_count=executed_actions,
+        verified_recovery_count=verified_rec,
+        safely_escalated_count=safely_escalated,
+        verified_recovery_rate=round(verified_rec / max(1, recoverable_pos), 3),
         avg_detection_latency_ms=round(sum(det_lats) / max(1, len(det_lats)), 3),
         avg_investigation_latency_ms=round(sum(inv_lats) / max(1, len(inv_lats)), 3),
+        avg_recovery_latency_ms=round(sum(rec_lats) / max(1, len(rec_lats)), 3)
+        if rec_lats
+        else 0.0,
         total_tool_calls=total_tools,
         total_llm_calls=0,
         total_tokens=0,
@@ -343,7 +424,7 @@ def run_baseline_comparison_harness(
     db: Session | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
-    """Run genuine executed comparison across Baseline A, Baseline B, and Configuration C."""
+    """Run deterministic MOCK_ORCHESTRATION comparison across Baseline A, B, and Config C."""
     results = [
         asdict(
             _run_real_trials(
@@ -375,11 +456,12 @@ def run_baseline_comparison_harness(
     ]
     return {
         "seed": seed,
-        "evaluation_mode": "GENUINE_EXECUTED_LOCAL_ORCHESTRATION",
+        "evaluation_mode": "MOCK_ORCHESTRATION",
         "real_llm_status": "REAL_LLM_VERIFICATION_PENDING",
         "disclaimer": (
-            "All tool calls, latencies, and detections are measured from genuinely executed "
-            "code paths (0 live LLM calls; real LLM reasoning verification remains pending)."
+            "MOCK_ORCHESTRATION: Deterministic orchestration verification using stateful local "
+            "mock transport (0 live LLM calls). Safe escalations are separated from verified "
+            "recoveries. Live AI reasoning comparison remains pending authorized LLM credentials."
         ),
         "baselines": results,
     }

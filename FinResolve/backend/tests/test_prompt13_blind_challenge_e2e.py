@@ -277,7 +277,7 @@ def test_reproducible_baseline_evaluation_harness(
     res = client.post("/api/v1/judge/evaluation-harness/run?seed=42", headers=jh)
     assert res.status_code == 200
     body = res.json()
-    assert body["evaluation_mode"] == "GENUINE_EXECUTED_LOCAL_ORCHESTRATION"
+    assert body["evaluation_mode"] == "MOCK_ORCHESTRATION"
     assert body["real_llm_status"] == "REAL_LLM_VERIFICATION_PENDING"
     assert len(body["baselines"]) == 3
     for row in body["baselines"]:
@@ -287,3 +287,15 @@ def test_reproducible_baseline_evaluation_harness(
     # Configuration C detects held-out novel multivariate anomaly; Baseline A does not
     assert body["baselines"][0]["novel_anomaly_detection_rate"] == 0.0
     assert body["baselines"][2]["novel_anomaly_detection_rate"] == 1.0
+    # Manual review / safe escalation is NEVER counted as VERIFIED_RECOVERY
+    cfg_c = body["baselines"][2]
+    assert cfg_c["verified_recovery_count"] == 1
+    assert cfg_c["executed_action_count"] == 1
+    assert cfg_c["safely_escalated_count"] >= 1
+    novel_trial = next(
+        t
+        for t in cfg_c["per_trial_results"]
+        if t["trial"] == "HELD_OUT_NOVEL_MULTIVARIATE_DEGRADATION"
+    )
+    assert novel_trial["outcome"] == "SAFELY_ESCALATED"
+    assert novel_trial["verified_recovery"] is False
