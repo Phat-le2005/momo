@@ -224,3 +224,262 @@ def test_agent_proposal_respects_escalation_rejects_bad_evidence_and_executes_va
     assert res_valid.verified_recovery is True
     assert len(exec_calls) == 1
     assert "." in exec_calls[0]
+
+
+def test_prompt14_3_proposal_fencing_rejects_stale_run_expired_superseded_and_wrong_target(
+    db: Session, active_session: dict[str, str]
+) -> None:
+    """Prompt 14.3 Fix 2: Prove proposals are strictly fenced to current run, active job,
+    exact anomaly/order/payment target, non-expired lifecycle, and exact expected_version.
+    """
+    from app.models.actions import ActionProposal
+    from app.models.supervisor import SupervisorJob
+    from app.supervisor.service import _run_commerce_post_investigation_recovery
+
+    sid = active_session["id"]
+    now = datetime.now(UTC)
+
+    binding = CommerceSourceBinding(
+        id=f"BIND-FENCE-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        world_epoch=1,
+        base_url="http://127.0.0.1:8100",
+        merchant_id="MERCHANT_FINSHOP_01",
+        commerce_session_id="CSESS_FINSHOP_DEFAULT_01",
+        commerce_world_epoch=1,
+        is_enabled=True,
+    )
+    db.add(binding)
+    db.flush()
+
+    case_obj = Case(
+        id=f"CASE-FENCE-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        type="PAYMENT_SYNC",
+        goal="Fencing test",
+        state=CaseState.INVESTIGATING.value,
+        owner="autonomous-monitor",
+        source_system="COMMERCE_HTTP",
+        source_binding_id=binding.id,
+        idempotency_key=f"IDEMP-FENCE-{uuid.uuid4().hex[:8]}",
+    )
+    db.add(case_obj)
+    db.flush()
+
+    ev = Evidence(
+        id=f"EVD-FENCE-{uuid.uuid4().hex[:8].upper()}",
+        case_id=case_obj.id,
+        session_id=sid,
+        kind=EvidenceKind.OBSERVED_FACT.value,
+        source="MINI_STORE_COMMERCE_HTTP",
+        source_ref="/api/v1/service/orders/ORD-FENCE-01",
+        payload_json={"order_id": "ORD-FENCE-01"},
+        observed_at=now,
+    )
+    db.add(ev)
+
+    obs = AnomalyObservation(
+        id=f"ANOM-FENCE-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        world_epoch=1,
+        source_binding_id=binding.id,
+        merchant_id="MERCHANT_FINSHOP_01",
+        detector_code="D01",
+        anomaly_type="PAYMENT_SUCCEEDED_ORDER_NOT_CONFIRMED",
+        severity="HIGH",
+        fingerprint=f"fp-fence-{uuid.uuid4().hex[:8]}",
+        affected_order_id="ORD-FENCE-01",
+        affected_payment_id="PAY-FENCE-01",
+        linked_case_id=case_obj.id,
+        rationale="Payment succeeded while order still PENDING_PAYMENT",
+        lifecycle_state="INVESTIGATING",
+    )
+    db.add(obs)
+
+    superseded_job = SupervisorJob(
+        id=f"JOB-SUPER-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        world_epoch=1,
+        job_type="ANOMALY_INVESTIGATION",
+        dedupe_key=f"dedupe-super-{uuid.uuid4().hex[:8]}",
+        target_case_id=case_obj.id,
+        status="SUPERSEDED",
+    )
+    db.add(superseded_job)
+
+    # An older proposal from 10 minutes ago (earlier run) and a REJECTED proposal
+    old_prop = ActionProposal(
+        id=f"AP-OLD-{uuid.uuid4().hex[:8].upper()}",
+        case_id=case_obj.id,
+        session_id=sid,
+        action_type="REQUEST_ORDER_SYNC",
+        params_json={"order_id": "ORD-FENCE-01", "expected_version": 1},
+        expected_version=1,
+        status="PROPOSED",
+        created_at=now - timedelta(minutes=10),
+    )
+    rejected_prop = ActionProposal(
+        id=f"AP-REJ-{uuid.uuid4().hex[:8].upper()}",
+        case_id=case_obj.id,
+        session_id=sid,
+        action_type="REQUEST_ORDER_SYNC",
+        params_json={"order_id": "ORD-FENCE-01", "expected_version": 1},
+        expected_version=1,
+        status="REJECTED",
+        created_at=now + timedelta(seconds=1),
+    )
+    db.add_all([old_prop, rejected_prop])
+    db.commit()
+
+    exec_calls: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/timeline"):
+            return httpx.Response(200, json=[])
+        if request.url.path.startswith("/api/v1/service/orders/"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "ORD-FENCE-01",
+                    "status": "PENDING_PAYMENT",
+                    "version": 3,
+                    "total_vnd": 100000,
+                },
+            )
+        if request.url.path.startswith("/api/v1/service/payments/"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "PAY-FENCE-01",
+                    "order_id": "ORD-FENCE-01",
+                    "provider": "LOCAL_MOCK",
+                    "status": "SUCCEEDED",
+                    "is_synced_to_order": False,
+                    "amount_vnd": 100000,
+                    "confirmed_at": (now - timedelta(minutes=3)).isoformat(),
+                },
+            )
+        if request.method == "POST" and request.url.path == "/api/v1/service/recovery/execute":
+            exec_calls.append("EXECUTED")
+            return httpx.Response(200, json={"status": "SYNCED", "order_status": "CONFIRMED"})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_handler)
+
+    # 1. Post-investigation recovery with run_started_at=now MUST ignore old_prop & rejected_prop
+    msg = _run_commerce_post_investigation_recovery(
+        db,
+        case_id=case_obj.id,
+        session_id=sid,
+        run_id="RUN-CURR-01",
+        run_started_at=now,
+        is_fallback_mode=False,
+        anomaly_id=obs.id,
+        commerce_transport=transport,
+    )
+    assert msg is not None and "Escalated safely" in msg
+    assert len(exec_calls) == 0
+
+    # 2. Proposal with mismatched run_id -> 409 REJECTED
+    with pytest.raises(AppError) as exc_run:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=StructuredAgentRecoveryProposal(
+                case_id=case_obj.id,
+                run_id="RUN-OLD-99",
+                anomaly_id=obs.id,
+                supporting_evidence_ids=[ev.id],
+                proposed_command="REQUEST_ORDER_SYNC",
+                action_params={"expected_version": 3},
+            ),
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-CURR-01",
+            transport=transport,
+        )
+    assert exc_run.value.status_code == 403
+    assert "PROPOSAL_RUN_MISMATCH" in exc_run.value.message
+
+    # 3. Expired proposal -> 403 REJECTED
+    with pytest.raises(AppError) as exc_exp:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=StructuredAgentRecoveryProposal(
+                case_id=case_obj.id,
+                run_id="RUN-CURR-01",
+                anomaly_id=obs.id,
+                supporting_evidence_ids=[ev.id],
+                proposed_command="REQUEST_ORDER_SYNC",
+                expires_at=now - timedelta(seconds=5),
+            ),
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-CURR-01",
+            transport=transport,
+        )
+    assert exc_exp.value.status_code == 403
+    assert "PROPOSAL_EXPIRED" in exc_exp.value.message
+
+    # 4. Superseded Supervisor job -> 409 REJECTED
+    with pytest.raises(AppError) as exc_job:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=StructuredAgentRecoveryProposal(
+                case_id=case_obj.id,
+                run_id="RUN-CURR-01",
+                supervisor_job_id=superseded_job.id,
+                anomaly_id=obs.id,
+                supporting_evidence_ids=[ev.id],
+                proposed_command="REQUEST_ORDER_SYNC",
+            ),
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-CURR-01",
+            expected_job_id=superseded_job.id,
+            transport=transport,
+        )
+    assert exc_job.value.status_code == 409
+    assert "SUPERSEDED_SUPERVISOR_JOB" in exc_job.value.message
+
+    # 5. Wrong target_order_id -> 403 REJECTED
+    with pytest.raises(AppError) as exc_ord:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=StructuredAgentRecoveryProposal(
+                case_id=case_obj.id,
+                run_id="RUN-CURR-01",
+                anomaly_id=obs.id,
+                target_order_id="ORD-WRONG-99",
+                supporting_evidence_ids=[ev.id],
+                proposed_command="REQUEST_ORDER_SYNC",
+            ),
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-CURR-01",
+            transport=transport,
+        )
+    assert exc_ord.value.status_code == 403
+    assert "PROPOSAL_TARGET_MISMATCH" in exc_ord.value.message
+
+    # 6. Stale expected_version (1 != authoritative 3) -> 409 REJECTED
+    with pytest.raises(AppError) as exc_ver:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=StructuredAgentRecoveryProposal(
+                case_id=case_obj.id,
+                run_id="RUN-CURR-01",
+                anomaly_id=obs.id,
+                target_order_id="ORD-FENCE-01",
+                expected_version=1,
+                supporting_evidence_ids=[ev.id],
+                proposed_command="REQUEST_ORDER_SYNC",
+                action_params={"expected_version": 1},
+            ),
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-CURR-01",
+            transport=transport,
+        )
+    assert exc_ver.value.status_code == 409
+    assert "PROPOSAL_STALE_VERSION" in exc_ver.value.message
+    assert len(exec_calls) == 0

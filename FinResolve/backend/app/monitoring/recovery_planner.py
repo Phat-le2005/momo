@@ -14,6 +14,7 @@ current authoritative business state before proposing or executing any capabilit
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 import httpx
@@ -50,12 +51,22 @@ PROPOSABLE_RECOVERY_COMMANDS: frozenset[str] = frozenset(
 
 
 class StructuredAgentRecoveryProposal(BaseModel):
-    """Machine-readable structured recovery proposal produced by the Agent (Prompt 14.2 Fix 3)."""
+    """Machine-readable structured recovery proposal bound to one investigation run."""
 
     model_config = ConfigDict(extra="forbid")
 
+    proposal_id: str | None = Field(default=None, max_length=64)
     case_id: str = Field(..., min_length=3, max_length=64)
     run_id: str = Field(..., min_length=3, max_length=64)
+    supervisor_job_id: str | None = Field(default=None, max_length=64)
+    anomaly_id: str | None = Field(default=None, max_length=64)
+    anomaly_occurrence: int = Field(default=1, ge=1)
+    target_order_id: str | None = Field(default=None, max_length=64)
+    target_payment_id: str | None = Field(default=None, max_length=64)
+    expected_version: int | None = Field(default=None, ge=1)
+    created_at: datetime | None = None
+    expires_at: datetime | None = None
+    lifecycle_state: str = Field(default="PROPOSED", max_length=32)
     affected_entities: dict[str, Any] = Field(default_factory=dict)
     observed_symptoms: list[str] = Field(default_factory=list)
     candidate_causes: list[str] = Field(default_factory=list)
@@ -327,22 +338,23 @@ def validate_and_execute_agent_proposal(
     proposal: StructuredAgentRecoveryProposal,
     binding: CommerceSourceBinding,
     obs: AnomalyObservation,
+    expected_run_id: str | None = None,
+    expected_job_id: str | None = None,
+    expected_world_epoch: int | None = None,
     write_key: str | None = None,
     read_key: str | None = None,
     transport: httpx.BaseTransport | None = None,
     approval_id: str | None = None,
     require_human_approval: bool = False,
 ) -> tuple[StructuredAgentRecoveryProposal, RecoveryExecutionResult | None]:
-    """Validate an Agent's structured recovery proposal against DB evidence and PolicyEngine.
+    """Validate an Agent recovery proposal against run fencing, evidence, and PolicyEngine.
 
-    Hard Invariants (Prompt 14.2 Fix 3):
-    - NEVER silently replaces the Agent's proposed command with a predefined rule action!
-    - If the Agent recommends `REQUEST_MANUAL_REVIEW`, `WAIT_FOR_OBSERVATION`, or
-      `COLLECT_MORE_EVIDENCE`, respects that decision and executes ZERO state-changing commands.
-    - Rejects any state-changing proposal whose `supporting_evidence_ids` are missing, belong to
-      another Case/session, or are not authoritative `OBSERVED_FACT` rows.
-    - Passes the Agent's exact proposed command through deterministic `PolicyEngine` -> HMAC-SHA256
-      signed authorization -> MiniStore atomic execution -> independent Verifier.
+    Hard Invariants (Prompt 14.2 Fix 3 + Prompt 14.3 Fix 2):
+    - Rejects rejected, expired, superseded, or earlier-run proposals.
+    - Rejects target anomaly/order/payment mismatches (never silently substitutes defaults!).
+    - Rejects superseded Supervisor jobs or stale world_epoch.
+    - NEVER silently refreshes stale expected_version to force execution.
+    - Respects REQUEST_MANUAL_REVIEW / WAIT_FOR_OBSERVATION / COLLECT_MORE_EVIDENCE directly.
     """
     norm_cmd = proposal.proposed_command.strip().upper()
     if norm_cmd not in PROPOSABLE_RECOVERY_COMMANDS:
@@ -352,11 +364,82 @@ def validate_and_execute_agent_proposal(
             status_code=403,
         )
 
+    # 1. Lifecycle, expiration, run & job fencing
+    if proposal.lifecycle_state.strip().upper() != "PROPOSED":
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            f"PROPOSAL_NOT_EXECUTABLE: lifecycle_state is '{proposal.lifecycle_state}'",
+            status_code=403,
+        )
+    if proposal.expires_at is not None:
+        exp = proposal.expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=UTC)
+        if exp <= datetime.now(UTC):
+            raise AppError(
+                ErrorCode.FORBIDDEN,
+                f"PROPOSAL_EXPIRED: proposal expired at {exp.isoformat()}",
+                status_code=403,
+            )
+    if expected_run_id and proposal.run_id != expected_run_id:
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            f"PROPOSAL_RUN_MISMATCH: run '{proposal.run_id}' != current '{expected_run_id}'",
+            status_code=403,
+        )
+    if expected_job_id:
+        from app.models.supervisor import SupervisorJob
+
+        job_row = db.get(SupervisorJob, expected_job_id)
+        if job_row is not None and job_row.status in ("SUPERSEDED", "CANCELLED", "CANCELLING"):
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"SUPERSEDED_SUPERVISOR_JOB: job '{expected_job_id}' is '{job_row.status}'",
+                status_code=409,
+            )
+    if expected_world_epoch is not None and binding.commerce_world_epoch != expected_world_epoch:
+        raise AppError(
+            ErrorCode.CONFLICT,
+            f"STALE_WORLD_EPOCH: expected {expected_world_epoch}, binding at "
+            f"{binding.commerce_world_epoch}",
+            status_code=409,
+        )
+
+    # 2. Exact target correspondence (never silently replace Agent targets with anomaly defaults!)
+    if proposal.anomaly_id and proposal.anomaly_id != obs.id:
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            f"PROPOSAL_ANOMALY_MISMATCH: proposal targets '{proposal.anomaly_id}', not '{obs.id}'",
+            status_code=403,
+        )
+    if (
+        proposal.target_order_id
+        and obs.affected_order_id
+        and proposal.target_order_id != obs.affected_order_id
+    ):
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            f"PROPOSAL_TARGET_MISMATCH: proposal order '{proposal.target_order_id}' != "
+            f"'{obs.affected_order_id}'",
+            status_code=403,
+        )
+    if (
+        proposal.target_payment_id
+        and obs.affected_payment_id
+        and proposal.target_payment_id != obs.affected_payment_id
+    ):
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            f"PROPOSAL_TARGET_MISMATCH: proposal payment '{proposal.target_payment_id}' != "
+            f"'{obs.affected_payment_id}'",
+            status_code=403,
+        )
+
     # Non-mutating Agent recommendations are respected directly (NO hidden auto-recovery!)
     if norm_cmd in ("REQUEST_MANUAL_REVIEW", "WAIT_FOR_OBSERVATION", "COLLECT_MORE_EVIDENCE"):
         return proposal, None
 
-    # Validate supporting_evidence_ids belong to this exact Case + session and are OBSERVED_FACT
+    # 3. Validate supporting_evidence_ids belong to this exact Case + session and are OBSERVED_FACT
     if not proposal.supporting_evidence_ids:
         raise AppError(
             ErrorCode.FORBIDDEN,
@@ -383,10 +466,34 @@ def validate_and_execute_agent_proposal(
         )
 
     reader = build_connector_for_binding(binding, service_key=read_key, transport=transport)
-    expected_ver_raw = proposal.action_params.get("expected_version")
-    expected_version = int(expected_ver_raw) if isinstance(expected_ver_raw, int) else None
+    expected_version = proposal.expected_version
+    if expected_version is None:
+        raw_v = proposal.action_params.get("expected_version")
+        if isinstance(raw_v, int):
+            expected_version = raw_v
 
-    idemp_key = f"AGT-{proposal.run_id[:16]}-{obs.id[:16]}-{norm_cmd}"[:128]
+    if expected_version is not None and obs.affected_order_id:
+        try:
+            live_resp = reader.get_order(obs.affected_order_id)
+            live_order = (
+                live_resp.get("data")
+                if isinstance(live_resp, dict) and isinstance(live_resp.get("data"), dict)
+                else live_resp
+            )
+        except Exception:
+            live_order = None
+        if isinstance(live_order, dict) and live_order.get("version") is not None:
+            live_ver = int(live_order["version"])
+            if live_ver != expected_version:
+                raise AppError(
+                    ErrorCode.CONFLICT,
+                    f"PROPOSAL_STALE_VERSION: proposal expected_version={expected_version} "
+                    f"!= authoritative version={live_ver}",
+                    status_code=409,
+                )
+
+    # Coordinate duplicate workers on the same incident occurrence via stable occurrence idemp_key
+    idemp_key = f"AGT-{obs.id[:16]}-OCC{obs.occurrence_count}-{norm_cmd}"[:128]
     exec_res = execute_and_verify_commerce_recovery(
         db,
         binding=binding,
@@ -403,7 +510,9 @@ def validate_and_execute_agent_proposal(
     )
 
     if exec_res.verified_recovery:
-        cause = proposal.candidate_causes[0] if proposal.candidate_causes else obs.anomaly_type
+        cause = f"[EVIDENCE_SUPPORTED:{','.join(sorted(valid_obs_ids)[:3])}] " + (
+            proposal.candidate_causes[0] if proposal.candidate_causes else obs.anomaly_type
+        )
         record_verified_experience(
             db,
             session_id=obs.session_id,
@@ -411,7 +520,7 @@ def validate_and_execute_agent_proposal(
             case_id=proposal.case_id,
             symptom_summary="; ".join(proposal.observed_symptoms) or obs.rationale,
             symptom_tags=[obs.detector_code, obs.anomaly_type, norm_cmd, proposal.proposal_source],
-            validated_root_cause=str(cause),
+            validated_root_cause=str(cause)[:255],
             evidence_refs=list(proposal.supporting_evidence_ids),
             actions_attempted=[norm_cmd],
             verified_recovery_steps=[f"{norm_cmd} -> VERIFIED_RECOVERY"],

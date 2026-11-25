@@ -1956,6 +1956,7 @@ def process_next_supervisor_job(
                         "và phân công Taskforce điều tra."
                     )
             elif claimed_case_id:
+                inv_started_at = datetime.now(UTC)
                 inv_res = _run_case_with_honest_fallback(
                     exec_db,
                     case_id=claimed_case_id,
@@ -1969,12 +1970,15 @@ def process_next_supervisor_job(
                 step_traces = list(inv_res.step_traces)
                 decision_summary = inv_res.decision_summary
 
-                # Prompt 14.2 Fix 3: Consume structured Agent proposal -> PolicyEngine -> Commerce
+                # Prompt 14.3 Fix 2: Fence proposals strictly to current run & active job
                 recovery_note = _run_commerce_post_investigation_recovery(
                     exec_db,
                     case_id=claimed_case_id,
                     session_id=claimed_session_id,
                     run_id=run_id,
+                    job_id=claimed_job_id,
+                    expected_world_epoch=claimed_world_epoch,
+                    run_started_at=inv_started_at,
                     is_fallback_mode=is_fallback or (model_mode_val == "DEMO_RULES"),
                     anomaly_id=(
                         str(claimed_payload.get("anomaly_id"))
@@ -2220,12 +2224,16 @@ def _run_commerce_post_investigation_recovery(
     case_id: str,
     session_id: str,
     run_id: str = "RUN-SUP",
+    job_id: str | None = None,
+    expected_world_epoch: int | None = None,
+    run_started_at: datetime | None = None,
     is_fallback_mode: bool = False,
     anomaly_id: str | None = None,
     commerce_transport: Any = None,
 ) -> str | None:
-    """Consume the Agent's structured recovery proposal (or explicitly labeled fallback),
-    validate evidence provenance, authorize via PolicyEngine, execute atomically, and verify.
+    """Consume the Agent's structured recovery proposal from the CURRENT investigation run
+    (or explicitly labeled fallback), validate fencing & evidence provenance, authorize via
+    PolicyEngine, execute atomically, and verify.
     """
     from app.models.cases import CaseEvent, Evidence
     from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
@@ -2288,12 +2296,18 @@ def _run_commerce_post_investigation_recovery(
     if obs is None or obs.lifecycle_state == "RECOVERED":
         return None
 
+    # Prompt 14.3 Fix 2: Fence ActionProposal strictly to PROPOSED status AND current run window
+    prop_filters: list[Any] = [
+        ActionProposal.case_id == case_obj.id,
+        ActionProposal.session_id == session_id,
+        ActionProposal.status == "PROPOSED",
+    ]
+    if run_started_at is not None:
+        prop_filters.append(ActionProposal.created_at >= run_started_at)
+
     agent_action_prop = db.scalar(
         select(ActionProposal)
-        .where(
-            ActionProposal.case_id == case_obj.id,
-            ActionProposal.session_id == session_id,
-        )
+        .where(*prop_filters)
         .order_by(ActionProposal.created_at.desc())
         .limit(1)
     )
@@ -2302,24 +2316,50 @@ def _run_commerce_post_investigation_recovery(
         db, binding=binding, obs=obs, connector=reader
     )
 
+    now = datetime.now(UTC)
     if agent_action_prop is not None:
         act_map = {
             "ORDER_SYNC": "REQUEST_ORDER_SYNC",
             "REQUEST_ORDER_SYNC": "REQUEST_ORDER_SYNC",
             "REQUEST_EVENT_REDELIVERY": "REQUEST_EVENT_REDELIVERY",
             "REQUEST_PAYMENT_RECONCILIATION": "REQUEST_PAYMENT_RECONCILIATION",
+            "WAIT_FOR_OBSERVATION": "WAIT_FOR_OBSERVATION",
+            "REQUEST_MANUAL_REVIEW": "REQUEST_MANUAL_REVIEW",
         }
         proposed_cmd = act_map.get(agent_action_prop.action_type.upper(), "REQUEST_MANUAL_REVIEW")
         proposal_source: Any = (
             "DETERMINISTIC_FALLBACK" if is_fallback_mode else "AGENT_STRUCTURED_PROPOSAL"
         )
         action_params = dict(agent_action_prop.params_json or {})
-        if "expected_version" not in action_params and safety_plan.expected_version is not None:
-            action_params["expected_version"] = safety_plan.expected_version
+        raw_ev_refs = action_params.get("evidence_refs")
+        supporting_ev_ids = (
+            [str(x) for x in raw_ev_refs]
+            if isinstance(raw_ev_refs, list) and len(raw_ev_refs) > 0
+            else obs_ev_ids
+        )
+        # Preserve Agent's exact expected_version (never silently refresh stale version)
+        raw_exp_ver = action_params.get("expected_version")
+        prop_exp_ver: int | None = int(raw_exp_ver) if raw_exp_ver is not None else None
+        prop_id = agent_action_prop.id
+        target_ord = (
+            str(action_params["order_id"])
+            if action_params.get("order_id") is not None
+            else obs.affected_order_id
+        )
+        target_pay = (
+            str(action_params["payment_id"])
+            if action_params.get("payment_id") is not None
+            else obs.affected_payment_id
+        )
     elif not is_fallback_mode:
         proposed_cmd = "REQUEST_MANUAL_REVIEW"
         proposal_source = "AGENT_STRUCTURED_PROPOSAL"
         action_params = {}
+        supporting_ev_ids = obs_ev_ids
+        prop_exp_ver = None
+        prop_id = f"PROP-NOACT-{uuid.uuid4().hex[:10].upper()}"
+        target_ord = obs.affected_order_id
+        target_pay = obs.affected_payment_id
     else:
         proposed_cmd = (
             safety_plan.proposed_command
@@ -2332,14 +2372,26 @@ def _run_commerce_post_investigation_recovery(
             if safety_plan.expected_version is not None
             else {}
         )
+        supporting_ev_ids = obs_ev_ids
+        prop_exp_ver = safety_plan.expected_version
+        prop_id = f"PROP-FB-{uuid.uuid4().hex[:10].upper()}"
+        target_ord = obs.affected_order_id
+        target_pay = obs.affected_payment_id
 
     structured_prop = StructuredAgentRecoveryProposal(
+        proposal_id=prop_id,
         case_id=case_obj.id,
         run_id=run_id,
+        supervisor_job_id=job_id,
+        anomaly_id=obs.id,
+        anomaly_occurrence=int(obs.occurrence_count or 1),
+        target_order_id=target_ord,
+        target_payment_id=target_pay,
+        expected_version=prop_exp_ver,
         affected_entities=dict(obs.affected_entities_json or {}),
         observed_symptoms=[obs.rationale],
         candidate_causes=[h.get("cause", obs.anomaly_type) for h in safety_plan.hypotheses],
-        supporting_evidence_ids=obs_ev_ids,
+        supporting_evidence_ids=supporting_ev_ids,
         missing_information=list(safety_plan.missing_evidence),
         proposed_command=proposed_cmd,
         action_params=action_params,
@@ -2348,13 +2400,17 @@ def _run_commerce_post_investigation_recovery(
             "Authoritative state match",
         ],
         expected_postconditions=list(safety_plan.expected_postconditions),
-        policy_references=list(safety_plan.policy_ids),
+        policy_references=list(safety_plan.policy_references)
+        if hasattr(safety_plan, "policy_references")
+        else list(safety_plan.policy_ids),
         uncertainty_summary=safety_plan.uncertainty_note,
         alternative_safe_outcomes=["REQUEST_MANUAL_REVIEW", "WAIT_FOR_OBSERVATION"],
         proposal_source=proposal_source,
+        created_at=now,
+        expires_at=now + timedelta(minutes=15),
+        lifecycle_state="PROPOSED",
     )
 
-    now = datetime.now(UTC)
     db.add(
         CaseEvent(
             id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
@@ -2362,6 +2418,9 @@ def _run_commerce_post_investigation_recovery(
             session_id=session_id,
             type="AUTONOMOUS_RECOVERY_PLANNED",
             payload_json={
+                "proposal_id": structured_prop.proposal_id,
+                "run_id": structured_prop.run_id,
+                "supervisor_job_id": structured_prop.supervisor_job_id,
                 "anomaly_id": obs.id,
                 "proposed_command": structured_prop.proposed_command,
                 "proposal_source": structured_prop.proposal_source,
@@ -2379,10 +2438,15 @@ def _run_commerce_post_investigation_recovery(
         proposal=structured_prop,
         binding=binding,
         obs=obs,
+        expected_run_id=run_id,
+        expected_job_id=job_id,
+        expected_world_epoch=expected_world_epoch,
         transport=commerce_transport,
     )
 
     if exec_res is None:
+        if agent_action_prop is not None:
+            agent_action_prop.status = "ESCALATED"
         db.add(
             CaseEvent(
                 id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
@@ -2390,6 +2454,7 @@ def _run_commerce_post_investigation_recovery(
                 session_id=session_id,
                 type="AUTONOMOUS_RECOVERY_ESCALATED",
                 payload_json={
+                    "proposal_id": structured_prop.proposal_id,
                     "anomaly_id": obs.id,
                     "proposed_command": structured_prop.proposed_command,
                     "proposal_source": structured_prop.proposal_source,
@@ -2403,6 +2468,9 @@ def _run_commerce_post_investigation_recovery(
             f"Escalated safely ({structured_prop.proposed_command}, "
             f"source={structured_prop.proposal_source})"
         )
+
+    if agent_action_prop is not None and exec_res.executed:
+        agent_action_prop.status = "EXECUTED"
 
     if exec_res.verified_recovery:
         db.add(
