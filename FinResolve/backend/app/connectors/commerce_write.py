@@ -37,6 +37,7 @@ from app.monitoring.service import (
     build_connector_for_binding,
     verify_anomaly_recovery,
 )
+from app.policy.engine import CommercePolicyDecision, PolicyEngine
 
 LOW_RISK_AUTO_COMMANDS: frozenset[str] = frozenset(
     {
@@ -116,6 +117,7 @@ class CommerceWriteConnector:
         *,
         command: str,
         idempotency_key: str,
+        authorization_digest: str,
         order_id: str | None = None,
         payment_id: str | None = None,
         event_id: str | None = None,
@@ -129,12 +131,19 @@ class CommerceWriteConnector:
                 status_code=403,
                 retryable=False,
             )
+        if not authorization_digest or len(authorization_digest.strip()) < 32:
+            raise CommerceConnectorError(
+                "MISSING_POLICY_AUTHORIZATION_DIGEST: PolicyEngine authorization required",
+                status_code=403,
+                retryable=False,
+            )
         url = f"{self.base_url}/api/v1/service/recovery/execute"
         headers = {
             "X-Commerce-Write-Key": self._write_key,
             "X-Merchant-Id": self.merchant_id,
             "X-Commerce-Session-Id": self.commerce_session_id,
             "X-World-Epoch": str(self.world_epoch),
+            "X-Authorization-Digest": authorization_digest.strip(),
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
@@ -190,33 +199,57 @@ def execute_and_verify_commerce_recovery(
     idempotency_key: str,
     expected_version: int | None = None,
     approval_id: str | None = None,
+    require_human_approval: bool = False,
+    order_snapshot: dict[str, Any] | None = None,
+    payment_snapshot: dict[str, Any] | None = None,
     write_key: str | None = None,
     read_key: str | None = None,
     transport: httpx.BaseTransport | None = None,
     read_connector: CommerceReadConnector | None = None,
 ) -> RecoveryExecutionResult:
-    """Durable Recovery Command Protocol: PROPOSED -> EXECUTING -> VERIFYING -> VERIFIED.
+    """Durable Recovery Command Protocol: PROPOSED -> POLICY -> EXECUTING -> VERIFYING -> VERIFIED.
 
+    - ALWAYS evaluates deterministic `PolicyEngine.evaluate_commerce_recovery(...)` against fresh
+      authoritative Commerce state immediately before execution; NEVER uses hardcoded allow labels.
     - Enforces idempotency_key uniqueness and rejects conflicting payload reuse (`409 CONFLICT`).
     - Never blindly retries `UNKNOWN_OUTCOME` commands!
     - Independently re-reads authoritative MiniStore state after execution.
     """
     norm_cmd = command.strip().upper()
-    if norm_cmd not in LOW_RISK_AUTO_COMMANDS:
-        raise AppError(
-            ErrorCode.FORBIDDEN,
-            f"POLICY_REJECTED_COMMAND: '{norm_cmd}' is not an authorized recovery capability",
-            status_code=403,
-        )
-
     target_event_id = (obs.affected_entities_json or {}).get("event_id")
+    reader = read_connector or build_connector_for_binding(
+        binding, service_key=read_key, transport=transport
+    )
+
+    # Refresh authoritative evidence immediately before PolicyEngine evaluation
+    fresh_order = order_snapshot
+    fresh_payment = payment_snapshot
+    if fresh_order is None and obs.affected_order_id:
+        try:
+            fresh_order = reader.get_order(obs.affected_order_id)["data"]
+        except CommerceConnectorError:
+            fresh_order = None
+    if fresh_payment is None and obs.affected_payment_id:
+        try:
+            fresh_payment = reader.get_payment(obs.affected_payment_id)["data"]
+        except CommerceConnectorError:
+            fresh_payment = None
+
+    effective_expected_version = expected_version
+    if (
+        effective_expected_version is None
+        and fresh_order is not None
+        and isinstance(fresh_order.get("version"), int)
+    ):
+        effective_expected_version = int(fresh_order["version"])
+
     req_hash = _compute_command_hash(
         command=norm_cmd,
         binding_id=binding.id,
         order_id=obs.affected_order_id,
         payment_id=obs.affected_payment_id,
         event_id=str(target_event_id) if target_event_id else None,
-        expected_version=expected_version,
+        expected_version=effective_expected_version,
     )
 
     # 1. Check durable idempotency record under lock
@@ -254,7 +287,82 @@ def execute_and_verify_commerce_recovery(
             idempotent_replay=True,
         )
 
+    # 2. Mandatory deterministic PolicyEngine evaluation (NO bypass, NO hardcoded allow!)
+    policy_engine = PolicyEngine(db, binding.session_id)
+    decision: CommercePolicyDecision = policy_engine.evaluate_commerce_recovery(
+        binding=binding,
+        obs=obs,
+        command=norm_cmd,
+        request_hash=req_hash,
+        expected_version=effective_expected_version,
+        order_snapshot=fresh_order,
+        payment_snapshot=fresh_payment,
+        target_event_id=str(target_event_id) if target_event_id else None,
+        approval_id=approval_id,
+        require_human_approval=require_human_approval,
+    )
+
     now = datetime.now(UTC)
+    if not decision.allowed or not decision.authorization_digest:
+        rejected_cmd = RecoveryCommand(
+            id=f"RCMD-{uuid.uuid4().hex[:10].upper()}",
+            session_id=binding.session_id,
+            idempotency_key=idempotency_key,
+            request_hash=req_hash,
+            command=norm_cmd,
+            case_id=obs.linked_case_id,
+            anomaly_id=obs.id,
+            source_binding_id=binding.id,
+            merchant_id=binding.merchant_id,
+            commerce_session_id=binding.commerce_session_id,
+            world_epoch=binding.commerce_world_epoch,
+            target_order_id=obs.affected_order_id,
+            target_payment_id=obs.affected_payment_id,
+            target_event_id=str(target_event_id) if target_event_id else None,
+            expected_version=effective_expected_version,
+            policy_decision=decision.decision_code[:32],
+            approval_id=approval_id,
+            state="REJECTED",
+            response_json={
+                "violation_code": decision.violation_code,
+                "violation_message": decision.violation_message,
+                "policy_version": decision.policy_version,
+                "checked_preconditions": decision.checked_preconditions,
+            },
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(rejected_cmd)
+        if obs.linked_case_id:
+            db.add(
+                CaseEvent(
+                    id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
+                    case_id=obs.linked_case_id,
+                    session_id=obs.session_id,
+                    type="COMMERCE_RECOVERY_POLICY_DENIED",
+                    payload_json={
+                        "command_id": rejected_cmd.id,
+                        "command": norm_cmd,
+                        "decision_code": decision.decision_code,
+                        "violation_code": decision.violation_code,
+                        "violation_message": decision.violation_message,
+                        "policy_version": decision.policy_version,
+                    },
+                    created_at=now,
+                )
+            )
+        db.commit()
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            f"POLICY_ENGINE_DENIED ({decision.violation_code}): {decision.violation_message}",
+            status_code=403,
+            details={
+                "command_id": rejected_cmd.id,
+                "decision_code": decision.decision_code,
+                "violation_code": decision.violation_code,
+            },
+        )
+
     cmd_row = RecoveryCommand(
         id=f"RCMD-{uuid.uuid4().hex[:10].upper()}",
         session_id=binding.session_id,
@@ -270,9 +378,9 @@ def execute_and_verify_commerce_recovery(
         target_order_id=obs.affected_order_id,
         target_payment_id=obs.affected_payment_id,
         target_event_id=str(target_event_id) if target_event_id else None,
-        expected_version=expected_version,
-        policy_decision="ALLOW_LOW_RISK_LOCAL_MOCK",
-        approval_id=approval_id,
+        expected_version=effective_expected_version,
+        policy_decision=decision.decision_code[:32],
+        approval_id=decision.approval_id,
         state="EXECUTING",
         created_at=now,
         updated_at=now,
@@ -291,18 +399,16 @@ def execute_and_verify_commerce_recovery(
         timeout_seconds=settings.commerce_connector_timeout_seconds,
         transport=transport,
     )
-    reader = read_connector or build_connector_for_binding(
-        binding, service_key=read_key, transport=transport
-    )
 
     try:
         http_status, resp_data = writer.execute_command(
             command=norm_cmd,
             idempotency_key=idempotency_key,
+            authorization_digest=decision.authorization_digest,
             order_id=obs.affected_order_id,
             payment_id=obs.affected_payment_id,
             event_id=str(target_event_id) if target_event_id else None,
-            expected_version=expected_version,
+            expected_version=effective_expected_version,
         )
     except CommerceConnectorError as exc:
         is_timeout = "timed out" in str(exc).lower()

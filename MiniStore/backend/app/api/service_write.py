@@ -13,7 +13,6 @@ Hard Security & Isolation Invariants:
 
 from __future__ import annotations
 
-import hmac
 from datetime import UTC, datetime
 from typing import Any
 
@@ -22,10 +21,17 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.config import get_settings
+from app.core.auth import hash_token
 from app.core.errors import CommerceError, ErrorCode
 from app.db.session import get_db
-from app.models.entities import CommerceEvent, EventOutbox, Order, Payment
+from app.models.entities import (
+    CommerceEvent,
+    CommerceSession,
+    EventOutbox,
+    Order,
+    Payment,
+    ServiceCredential,
+)
 from app.models.enums import (
     OutboxStatus,
     PaymentProvider,
@@ -45,11 +51,23 @@ ALLOWED_RECOVERY_COMMANDS: frozenset[str] = frozenset(
     }
 )
 
+STATE_CHANGING_COMMANDS: frozenset[str] = frozenset(
+    {
+        "REQUEST_ORDER_SYNC",
+        "REQUEST_EVENT_REDELIVERY",
+        "REQUEST_PAYMENT_RECONCILIATION",
+    }
+)
+
 
 class WritePrincipal(BaseModel):
+    credential_id: str
+    service_name: str
     merchant_id: str
     commerce_session_id: str
     world_epoch: int
+    allowed_commands: list[str]
+    authorization_digest: str
 
 
 def _require_write_principal(
@@ -57,25 +75,111 @@ def _require_write_principal(
     x_merchant_id: str = Header(default=""),
     x_commerce_session_id: str = Header(default=""),
     x_world_epoch: int = Header(default=0),
+    x_authorization_digest: str = Header(default=""),
+    db: Session = Depends(get_db),
 ) -> WritePrincipal:
-    settings = get_settings()
-    expected = settings.service_write_api_key.get_secret_value().strip()
-    if not expected or not hmac.compare_digest(x_commerce_write_key.strip(), expected):
+    """Authenticate write credential strictly from server-side `service_credentials` records.
+
+    Hard Security Invariants (Prompt 14.1 P0):
+    - Read credentials (missing `recovery:*` scopes) are ALWAYS rejected.
+    - Merchant and commerce_session_id are enforced from server-side credential records;
+      caller-supplied headers CANNOT expand or override authorized scope.
+    - Revoked or expired credentials are rejected.
+    - `X-World-Epoch` is validated against authoritative `CommerceSession.world_epoch` in DB
+      to prevent historical/stale-world writes.
+    """
+    raw_key = x_commerce_write_key.strip()
+    if not raw_key:
         raise CommerceError(
             ErrorCode.UNAUTHORIZED,
-            "Invalid or missing X-Commerce-Write-Key (read key is not permitted for writes)",
+            "Missing X-Commerce-Write-Key (read key is not permitted for writes)",
             status_code=401,
         )
-    if not x_merchant_id.strip() or not x_commerce_session_id.strip() or x_world_epoch < 1:
+
+    key_digest = hash_token(raw_key)
+    cred = db.scalar(select(ServiceCredential).where(ServiceCredential.key_hash == key_digest))
+    if cred is None:
         raise CommerceError(
-            ErrorCode.BAD_REQUEST,
-            "Missing required scope headers (X-Merchant-Id, X-Commerce-Session-Id, X-World-Epoch)",
-            status_code=400,
+            ErrorCode.UNAUTHORIZED,
+            "Invalid X-Commerce-Write-Key (unrecognized write credential)",
+            status_code=401,
         )
+
+    now = datetime.now(UTC)
+    if not cred.is_active or cred.revoked_at is not None:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "WRITE_CREDENTIAL_REVOKED: credential is inactive or revoked",
+            status_code=403,
+        )
+    if cred.expires_at is not None:
+        exp = cred.expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=UTC)
+        if exp <= now:
+            raise CommerceError(
+                ErrorCode.FORBIDDEN,
+                "WRITE_CREDENTIAL_EXPIRED: credential has expired",
+                status_code=403,
+            )
+
+    allowed_cmds = [
+        s.split("recovery:", 1)[1].strip().upper()
+        for s in (cred.allowed_scopes_json or [])
+        if isinstance(s, str) and s.startswith("recovery:")
+    ]
+    if not allowed_cmds:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "READ_CREDENTIAL_FORBIDDEN_FOR_WRITES: credential lacks recovery write capabilities",
+            status_code=403,
+        )
+
+    # Server-side scope isolation: caller headers MUST NOT expand or cross credential scope
+    req_merchant = x_merchant_id.strip()
+    req_session = x_commerce_session_id.strip()
+    if req_merchant and req_merchant != cred.merchant_id:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "CREDENTIAL_SCOPE_VIOLATION: X-Merchant-Id does not match credential merchant scope",
+            status_code=403,
+        )
+    if req_session and req_session != cred.commerce_session_id:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "CREDENTIAL_SCOPE_VIOLATION: X-Commerce-Session-Id does not match credential scope",
+            status_code=403,
+        )
+
+    # Validate authoritative world_epoch against CommerceSession in DB
+    csess = db.scalar(
+        select(CommerceSession).where(
+            CommerceSession.id == cred.commerce_session_id,
+            CommerceSession.merchant_id == cred.merchant_id,
+        )
+    )
+    if csess is None or not csess.is_active:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "COMMERCE_SESSION_INACTIVE: authoritative commerce session not found or inactive",
+            status_code=403,
+        )
+    if x_world_epoch < 1 or x_world_epoch != csess.world_epoch:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            f"STALE_WORLD_EPOCH: requested world_epoch={x_world_epoch} does not match "
+            f"authoritative world_epoch={csess.world_epoch}",
+            status_code=409,
+        )
+
     return WritePrincipal(
-        merchant_id=x_merchant_id.strip(),
-        commerce_session_id=x_commerce_session_id.strip(),
-        world_epoch=x_world_epoch,
+        credential_id=cred.id,
+        service_name=cred.service_name,
+        merchant_id=cred.merchant_id,
+        commerce_session_id=cred.commerce_session_id,
+        world_epoch=csess.world_epoch,
+        allowed_commands=allowed_cmds,
+        authorization_digest=x_authorization_digest.strip(),
     )
 
 
@@ -100,6 +204,19 @@ def execute_recovery_command(
         raise CommerceError(
             ErrorCode.FORBIDDEN,
             f"UNSUPPORTED_RECOVERY_COMMAND: '{cmd}' is not in the permitted allowlist",
+            status_code=403,
+        )
+    if cmd not in principal.allowed_commands:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            f"CAPABILITY_NOT_GRANTED: credential '{principal.credential_id}' is not authorized "
+            f"for command '{cmd}'",
+            status_code=403,
+        )
+    if cmd in STATE_CHANGING_COMMANDS and len(principal.authorization_digest) < 32:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "MISSING_COMMAND_AUTHORIZATION: verified PolicyEngine X-Authorization-Digest required",
             status_code=403,
         )
 

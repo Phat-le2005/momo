@@ -1,0 +1,310 @@
+"""Prompt 14.1 Phase 1 Security Tests: Actual PolicyEngine Enforcement & Approval Validation."""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import httpx
+import pytest
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.connectors.commerce import CommerceReadConnector
+from app.connectors.commerce_write import execute_and_verify_commerce_recovery
+from app.core.errors import AppError
+from app.db.session import get_sessionmaker
+from app.models.actions import ActionProposal, Approval
+from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
+from app.models.open_world import RecoveryCommand
+
+
+@pytest.fixture
+def db(clean_database: None) -> Iterator[Session]:
+    with get_sessionmaker()() as session:
+        yield session
+
+
+def _make_session_binding_obs(
+    db: Session,
+    *,
+    session_id: str,
+    order_id: str = "ORD-SEC-01",
+    payment_id: str = "PAY-SEC-01",
+    world_epoch: int = 1,
+) -> tuple[str, CommerceSourceBinding, AnomalyObservation]:
+    binding = CommerceSourceBinding(
+        id=f"BIND-{uuid.uuid4().hex[:8].upper()}",
+        session_id=session_id,
+        world_epoch=world_epoch,
+        base_url="http://127.0.0.1:8100",
+        merchant_id="MERCHANT_FINSHOP_01",
+        commerce_session_id="CSESS_FINSHOP_DEFAULT_01",
+        commerce_world_epoch=world_epoch,
+        is_enabled=True,
+    )
+    db.add(binding)
+    db.flush()
+
+    obs = AnomalyObservation(
+        id=f"ANOM-{uuid.uuid4().hex[:8].upper()}",
+        session_id=session_id,
+        world_epoch=world_epoch,
+        source_binding_id=binding.id,
+        merchant_id="MERCHANT_FINSHOP_01",
+        detector_code="D02",
+        anomaly_type="PAYMENT_SUCCEEDED_ORDER_NOT_CONFIRMED",
+        severity="HIGH",
+        fingerprint=f"fp-{uuid.uuid4().hex[:10]}",
+        affected_order_id=order_id,
+        affected_payment_id=payment_id,
+        rationale="Authoritative payment succeeded while order still PENDING_PAYMENT",
+        lifecycle_state="OBSERVED",
+    )
+    db.add(obs)
+    db.commit()
+    return session_id, binding, obs
+
+
+def _mock_transport(
+    *,
+    order_state: dict[str, Any],
+    payment_state: dict[str, Any],
+    exec_calls: list[dict[str, Any]],
+    mutate_on_exec: bool = True,
+) -> httpx.MockTransport:
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.startswith("/api/v1/service/orders/"):
+            return httpx.Response(200, json=dict(order_state))
+        if request.method == "GET" and path.startswith("/api/v1/service/payments/"):
+            return httpx.Response(200, json=dict(payment_state))
+        if request.method == "POST" and path == "/api/v1/service/recovery/execute":
+            exec_calls.append(
+                {
+                    "headers": dict(request.headers),
+                    "body": request.content.decode("utf-8"),
+                }
+            )
+            if mutate_on_exec:
+                order_state["status"] = "CONFIRMED"
+                order_state["version"] = int(order_state.get("version", 1)) + 1
+                payment_state["is_synced_to_order"] = True
+            return httpx.Response(
+                200,
+                json={
+                    "command": "REQUEST_ORDER_SYNC",
+                    "status": "SYNCED",
+                    "order_id": order_state["id"],
+                    "order_status": order_state["status"],
+                },
+            )
+        return httpx.Response(404, json={"detail": "not found"})
+
+    return httpx.MockTransport(_handler)
+
+
+def test_policy_engine_enforces_authoritative_evidence_and_blocks_bypasses(
+    db: Session, active_session: dict[str, str]
+) -> None:
+    """PolicyEngine denies unauthorized mutations without mutating Commerce state."""
+    _, binding, obs = _make_session_binding_obs(db, session_id=active_session["id"])
+    exec_calls: list[dict[str, Any]] = []
+
+    # 1. External VNPAY provider MUST be denied by PolicyEngine before any HTTP write
+    vnpay_transport = _mock_transport(
+        order_state={"id": "ORD-SEC-01", "status": "PENDING_PAYMENT", "version": 1},
+        payment_state={
+            "id": "PAY-SEC-01",
+            "order_id": "ORD-SEC-01",
+            "status": "SUCCEEDED",
+            "provider": "VNPAY_SANDBOX",
+            "is_synced_to_order": False,
+        },
+        exec_calls=exec_calls,
+    )
+    reader = CommerceReadConnector(
+        base_url=binding.base_url,
+        service_key="test-read-key",
+        merchant_id=binding.merchant_id,
+        commerce_session_id=binding.commerce_session_id,
+        transport=vnpay_transport,
+    )
+    with pytest.raises(AppError) as exc_vnpay:
+        execute_and_verify_commerce_recovery(
+            db,
+            binding=binding,
+            obs=obs,
+            command="REQUEST_ORDER_SYNC",
+            idempotency_key=f"IDEMP-VNPAY-{uuid.uuid4().hex[:6]}",
+            expected_version=1,
+            write_key="test-write-key",
+            transport=vnpay_transport,
+            read_connector=reader,
+        )
+    assert exc_vnpay.value.status_code == 403
+    assert "EXTERNAL_PROVIDER_WRITE_FORBIDDEN" in exc_vnpay.value.message
+    assert len(exec_calls) == 0
+
+    # 2. Cancelled order resurrection MUST be denied by PolicyEngine
+    cancel_transport = _mock_transport(
+        order_state={"id": "ORD-SEC-01", "status": "CANCELLED", "version": 2},
+        payment_state={
+            "id": "PAY-SEC-01",
+            "order_id": "ORD-SEC-01",
+            "status": "SUCCEEDED",
+            "provider": "LOCAL_MOCK",
+            "is_synced_to_order": False,
+        },
+        exec_calls=exec_calls,
+    )
+    cancel_reader = CommerceReadConnector(
+        base_url=binding.base_url,
+        service_key="test-read-key",
+        merchant_id=binding.merchant_id,
+        commerce_session_id=binding.commerce_session_id,
+        transport=cancel_transport,
+    )
+    with pytest.raises(AppError) as exc_cancel:
+        execute_and_verify_commerce_recovery(
+            db,
+            binding=binding,
+            obs=obs,
+            command="REQUEST_ORDER_SYNC",
+            idempotency_key=f"IDEMP-CANCEL-{uuid.uuid4().hex[:6]}",
+            expected_version=2,
+            write_key="test-write-key",
+            transport=cancel_transport,
+            read_connector=cancel_reader,
+        )
+    assert exc_cancel.value.status_code == 403
+    assert "CANCELLED_ORDER_RESURRECTION_FORBIDDEN" in exc_cancel.value.message
+    assert len(exec_calls) == 0
+
+    # 3. Valid LOCAL_MOCK evidence -> PolicyEngine authorizes and sends X-Authorization-Digest
+    ok_transport = _mock_transport(
+        order_state={"id": "ORD-SEC-01", "status": "PENDING_PAYMENT", "version": 1},
+        payment_state={
+            "id": "PAY-SEC-01",
+            "order_id": "ORD-SEC-01",
+            "status": "SUCCEEDED",
+            "provider": "LOCAL_MOCK",
+            "is_synced_to_order": False,
+        },
+        exec_calls=exec_calls,
+    )
+    ok_reader = CommerceReadConnector(
+        base_url=binding.base_url,
+        service_key="test-read-key",
+        merchant_id=binding.merchant_id,
+        commerce_session_id=binding.commerce_session_id,
+        transport=ok_transport,
+    )
+    res = execute_and_verify_commerce_recovery(
+        db,
+        binding=binding,
+        obs=obs,
+        command="REQUEST_ORDER_SYNC",
+        idempotency_key=f"IDEMP-OK-{uuid.uuid4().hex[:6]}",
+        expected_version=1,
+        write_key="test-write-key",
+        transport=ok_transport,
+        read_connector=ok_reader,
+    )
+    assert res.executed is True
+    assert len(exec_calls) == 1
+    assert len(exec_calls[0]["headers"].get("x-authorization-digest", "")) == 64
+
+    cmd_row = db.scalar(select(RecoveryCommand).where(RecoveryCommand.id == res.command_id))
+    assert cmd_row is not None
+    assert cmd_row.policy_decision != "ALLOW_LOW_RISK_LOCAL_MOCK"
+    assert cmd_row.policy_decision.startswith("ALLOW_POLICY_ENGINE")
+
+
+def test_policy_engine_rejects_missing_or_expired_human_approval(
+    db: Session, active_session: dict[str, str]
+) -> None:
+    """When human approval is required, missing or expired Approval records are rejected."""
+    sid, binding, obs = _make_session_binding_obs(
+        db, session_id=active_session["id"], order_id="ORD-APPR-01", payment_id="PAY-APPR-01"
+    )
+    exec_calls: list[dict[str, Any]] = []
+    transport = _mock_transport(
+        order_state={"id": "ORD-APPR-01", "status": "PENDING_PAYMENT", "version": 1},
+        payment_state={
+            "id": "PAY-APPR-01",
+            "order_id": "ORD-APPR-01",
+            "status": "SUCCEEDED",
+            "provider": "LOCAL_MOCK",
+            "is_synced_to_order": False,
+        },
+        exec_calls=exec_calls,
+    )
+    reader = CommerceReadConnector(
+        base_url=binding.base_url,
+        service_key="test-read-key",
+        merchant_id=binding.merchant_id,
+        commerce_session_id=binding.commerce_session_id,
+        transport=transport,
+    )
+
+    # Missing approval
+    with pytest.raises(AppError) as exc_missing:
+        execute_and_verify_commerce_recovery(
+            db,
+            binding=binding,
+            obs=obs,
+            command="REQUEST_ORDER_SYNC",
+            idempotency_key=f"IDEMP-NOAPPR-{uuid.uuid4().hex[:6]}",
+            expected_version=1,
+            require_human_approval=True,
+            write_key="test-write-key",
+            transport=transport,
+            read_connector=reader,
+        )
+    assert exc_missing.value.status_code == 403
+    assert "HUMAN_APPROVAL_REQUIRED" in exc_missing.value.message
+
+    # Expired approval
+    prop = ActionProposal(
+        id=f"PROP-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        action_type="ORDER_SYNC",
+        params_json={"order_id": "ORD-APPR-01"},
+        expected_version=1,
+        status="APPROVED",
+    )
+    db.add(prop)
+    db.flush()
+    expired_appr = Approval(
+        id=f"APPR-{uuid.uuid4().hex[:8].upper()}",
+        proposal_id=prop.id,
+        approver_role="OPS_MANAGER",
+        approver_id="mgr_01",
+        policy_version="FinResolve-Policy-v1.2",
+        decision="APPROVED",
+        digest="a" * 64,
+        expiry=datetime.now(UTC) - timedelta(minutes=5),
+    )
+    db.add(expired_appr)
+    db.commit()
+
+    with pytest.raises(AppError) as exc_exp:
+        execute_and_verify_commerce_recovery(
+            db,
+            binding=binding,
+            obs=obs,
+            command="REQUEST_ORDER_SYNC",
+            idempotency_key=f"IDEMP-EXPAPPR-{uuid.uuid4().hex[:6]}",
+            expected_version=1,
+            require_human_approval=True,
+            approval_id=expired_appr.id,
+            write_key="test-write-key",
+            transport=transport,
+            read_connector=reader,
+        )
+    assert exc_exp.value.status_code == 403
+    assert "APPROVAL_EXPIRED" in exc_exp.value.message
+    assert len(exec_calls) == 0

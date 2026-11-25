@@ -120,6 +120,7 @@ def test_closed_loop_c01_recovery_c02_lookalike_and_independent_oracle(
             "PAY-C01": {
                 "payment_id": "PAY-C01",
                 "order_id": "ORD-C01",
+                "provider": "LOCAL_MOCK",
                 "status": "SUCCEEDED",
                 "is_synced_to_order": False,
                 "amount_vnd": 250000,
