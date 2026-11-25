@@ -89,3 +89,104 @@ def api_chaos_restore(
     db: Session = Depends(get_db),
 ) -> dict[str, int]:
     return restore_chaos_faults(db, merchant_id=merchant_id)
+
+
+class FreeformTrafficRequest(BaseModel):
+    request_count: int = Field(default=15, ge=1, le=50)
+    concurrency: int = Field(default=5, ge=1, le=10)
+    endpoint: str = Field(default="/api/v1/store/products", max_length=128)
+
+
+class ScopedRestoreRequest(BaseModel):
+    order_id: str | None = Field(default=None, max_length=64)
+    event_id: str | None = Field(default=None, max_length=128)
+
+
+@router.post("/controls/traffic-load")
+def api_freeform_traffic_load(
+    payload: FreeformTrafficRequest,
+    _: None = Depends(_require_chaos_admin),
+) -> dict[str, Any]:
+    """Bounded local concurrent HTTP load experiment recording real request telemetry."""
+    import concurrent.futures
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from app.core.telemetry import get_telemetry_collector
+    from app.main import create_app
+
+    allowed_endpoints = ("/api/v1/store/products", "/api/v1/store/bootstrap", "/healthz")
+    target = payload.endpoint.strip()
+    if target not in allowed_endpoints:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST,
+            f"Endpoint '{target}' not allowed for local traffic experiment",
+            status_code=400,
+        )
+
+    app_inst = create_app()
+    t0 = time.perf_counter()
+    statuses: dict[int, int] = {}
+
+    def _one_req(_: int) -> int:
+        with TestClient(app_inst) as tc:
+            r = tc.get(target)
+            return int(r.status_code)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=payload.concurrency) as pool:
+        for code in pool.map(_one_req, range(payload.request_count)):
+            statuses[code] = statuses.get(code, 0) + 1
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    snap = get_telemetry_collector().snapshot_window(60)
+    return {
+        "endpoint": target,
+        "requests_executed": payload.request_count,
+        "concurrency": payload.concurrency,
+        "elapsed_ms": elapsed_ms,
+        "status_codes": statuses,
+        "measured_window_60s": snap,
+    }
+
+
+@router.post("/controls/restore-scoped")
+def api_scoped_restore(
+    payload: ScopedRestoreRequest,
+    _: None = Depends(_require_chaos_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Restore ONLY explicitly scoped outbox event(s) — never global repair!"""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from app.models.entities import CommerceEvent, EventOutbox
+    from app.models.enums import OutboxStatus
+
+    if not payload.order_id and not payload.event_id:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST,
+            "order_id or event_id required for scoped restore",
+            status_code=400,
+        )
+    stmt = (
+        select(EventOutbox)
+        .join(CommerceEvent, EventOutbox.commerce_event_id == CommerceEvent.id)
+        .where(EventOutbox.status == OutboxStatus.FAILED.value)
+    )
+    if payload.order_id:
+        stmt = stmt.where(CommerceEvent.order_id == payload.order_id)
+    if payload.event_id:
+        stmt = stmt.where(EventOutbox.event_id == payload.event_id)
+    rows = list(db.scalars(stmt.with_for_update()).all())
+    now = datetime.now(UTC)
+    for row in rows:
+        row.status = OutboxStatus.PENDING.value
+        row.next_attempt_at = now
+    db.commit()
+    return {
+        "scoped_order_id": payload.order_id,
+        "scoped_event_id": payload.event_id,
+        "outbox_resumed": len(rows),
+    }
