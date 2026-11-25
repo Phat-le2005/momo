@@ -1079,21 +1079,73 @@ def evaluate_recovery_postconditions(
             telem_payload, _ = connector.get_telemetry()
             metrics, _ = connector.get_metrics()
             w60 = (telem_payload.get("windows") or {}).get("60s") or {}
+            req_count = int(w60.get("request_count") or 0)
+            has_samples = bool(w60.get("has_samples", req_count > 0))
+            truncated = bool(w60.get("truncated", False))
+            last_age_ms = w60.get("last_sample_age_ms")
+            win_id = str(w60.get("window_id") or "")
             lat_p95 = float((w60.get("latency_ms") or {}).get("p95") or 0.0)
             err_rate = float(w60.get("error_rate") or 0.0)
             outbox_lag = float(metrics.outbox_lag_count)
+
+            evidence["window_id"] = win_id
+            evidence["has_samples"] = has_samples
+            evidence["request_count"] = req_count
+            evidence["truncated"] = truncated
+            evidence["last_sample_age_ms"] = last_age_ms
             evidence["current_p95_latency_ms"] = lat_p95
             evidence["current_error_rate"] = err_rate
             evidence["current_outbox_lag"] = outbox_lag
 
-            # Compare against baseline recorded during detection (never mark recovered merely
-            # because deterministic D01..D08 detectors do not fire!)
+            # Missing telemetry, zero traffic, truncated or stale samples NEVER prove recovery!
+            if not has_samples or req_count <= 0:
+                return VerificationResult(
+                    RecoveryVerdict.INSUFFICIENT_EVIDENCE,
+                    False,
+                    "UNKNOWN",
+                    f"{code} cannot verify recovery without valid business traffic samples",
+                    evidence,
+                )
+            if truncated:
+                return VerificationResult(
+                    RecoveryVerdict.INSUFFICIENT_EVIDENCE,
+                    False,
+                    "UNKNOWN",
+                    f"{code} telemetry window is truncated; insufficient coverage for recovery",
+                    evidence,
+                )
+            if isinstance(last_age_ms, (int, float)) and float(last_age_ms) > 120_000.0:
+                return VerificationResult(
+                    RecoveryVerdict.INSUFFICIENT_EVIDENCE,
+                    False,
+                    "UNKNOWN",
+                    f"{code} telemetry samples are stale ({last_age_ms}ms old)",
+                    evidence,
+                )
+
             prior_verif = dict(obs.verification_json or {})
             healthy_streak = int(prior_verif.get("consecutive_healthy_windows") or 0)
-            # Determine baseline upper bounds from persisted evidence_refs
+            last_win_id = str(prior_verif.get("last_recovery_window_id") or "")
+
+            # Deduplicate repeated identical observation windows (MUST NOT advance streak!)
+            if win_id and last_win_id and win_id == last_win_id:
+                evidence["consecutive_healthy_windows"] = healthy_streak
+                evidence["last_recovery_window_id"] = last_win_id
+                return VerificationResult(
+                    RecoveryVerdict.STILL_INCONSISTENT,
+                    False,
+                    "UNKNOWN",
+                    f"{code} duplicate telemetry window '{win_id}'; awaiting distinct window",
+                    evidence,
+                )
+
+            # Revalidate ALL original triggering conditions (latency, error, lag, AND refunds!)
             lat_limit = 250.0
             err_limit = 0.05
             lag_limit = 5.0
+            refund_limit: float | None = None
+            triggers_text = str(obs.affected_entities_json or "")
+            is_refund_anomaly = "refund" in triggers_text.lower()
             for ref in obs.evidence_refs_json or []:
                 for m in ref.get("metrics") or []:
                     mname = str(m.get("metric") or "")
@@ -1104,34 +1156,54 @@ def evaluate_recovery_postconditions(
                         err_limit = max(bmed + 0.05, 0.05)
                     elif mname == "outbox_lag":
                         lag_limit = max(bmed + 3.0, 5.0)
+                bcomp = ref.get("baseline_comparison") or {}
+                if isinstance(bcomp, dict) and "refund_count" in bcomp:
+                    rbmed = float((bcomp["refund_count"] or {}).get("baseline_median") or 0.0)
+                    refund_limit = max(rbmed * 1.5, rbmed + 2.0)
+
+            refund_ok = True
+            if is_refund_anomaly:
+                cur_refunds, _ = connector.list_refunds(limit=200)
+                cur_ref_count = float(len(cur_refunds))
+                evidence["current_refund_count"] = cur_ref_count
+                eff_ref_limit = refund_limit if refund_limit is not None else 2.0
+                refund_ok = cur_ref_count <= eff_ref_limit
 
             is_healthy_now = (
-                lat_p95 <= lat_limit and err_rate <= err_limit and outbox_lag <= lag_limit
+                lat_p95 <= lat_limit
+                and err_rate <= err_limit
+                and outbox_lag <= lag_limit
+                and refund_ok
             )
             if is_healthy_now:
                 healthy_streak += 1
                 evidence["consecutive_healthy_windows"] = healthy_streak
+                if win_id:
+                    evidence["last_recovery_window_id"] = win_id
                 if healthy_streak >= 2:
                     return VerificationResult(
                         RecoveryVerdict.VERIFIED_RECOVERY,
                         True,
                         "OBSERVED_BASELINE_RETURN",
-                        f"{code} verified sustained recovery across {healthy_streak} fresh windows",
+                        f"{code} verified sustained recovery across {healthy_streak} windows",
                         evidence,
                     )
                 return VerificationResult(
                     RecoveryVerdict.STILL_INCONSISTENT,
                     False,
                     "UNKNOWN",
-                    f"{code} healthy window ({healthy_streak}/2); awaiting sustained recovery",
+                    f"{code} healthy window ({healthy_streak}/2); awaiting distinct fresh window",
                     evidence,
                 )
             evidence["consecutive_healthy_windows"] = 0
+            if win_id:
+                evidence["last_recovery_window_id"] = win_id
             return VerificationResult(
                 RecoveryVerdict.STILL_INCONSISTENT,
                 False,
                 "UNKNOWN",
-                f"{code} still anomalous (p95={lat_p95}ms, err_rate={err_rate}, lag={outbox_lag})",
+                f"{code} still anomalous (p95={lat_p95}ms, err_rate={err_rate}, lag={outbox_lag}, "
+                f"refund_ok={refund_ok})",
                 evidence,
             )
 

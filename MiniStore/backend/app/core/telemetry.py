@@ -11,6 +11,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 MAX_SAMPLES = 5000
@@ -77,6 +78,8 @@ class OperationalTelemetryCollector:
 
     def snapshot_window(self, window_seconds: int) -> dict[str, Any]:
         now_mono = time.monotonic()
+        now_utc = datetime.now(UTC)
+        win_start = now_utc - timedelta(seconds=window_seconds)
         cutoff = now_mono - float(window_seconds)
         with self._lock:
             total_buffered = len(self._samples)
@@ -85,7 +88,11 @@ class OperationalTelemetryCollector:
         total = len(rows)
         if total == 0:
             return {
+                "window_id": f"W{window_seconds}:EMPTY",
                 "window_seconds": window_seconds,
+                "window_start": win_start.isoformat(),
+                "window_end": now_utc.isoformat(),
+                "collected_at": now_utc.isoformat(),
                 "has_samples": False,
                 "truncated": total_buffered >= MAX_SAMPLES,
                 "last_sample_age_ms": None,
@@ -101,6 +108,8 @@ class OperationalTelemetryCollector:
         durations = sorted(s.duration_ms for s in rows)
         errors = sum(1 for s in rows if s.status_code >= 500 or s.status_code == 429)
         last_age_ms = round(max(0.0, (now_mono - rows[-1].ts) * 1000.0), 1)
+        last_ts_bucket = int(rows[-1].ts * 1000)
+        window_id = f"W{window_seconds}:{total}:{last_ts_bucket}"
         status_dist: dict[str, int] = {}
         route_counts: dict[str, int] = {}
         for s in rows:
@@ -109,7 +118,11 @@ class OperationalTelemetryCollector:
             route_counts[s.route_group] = route_counts.get(s.route_group, 0) + 1
 
         return {
+            "window_id": window_id,
             "window_seconds": window_seconds,
+            "window_start": win_start.isoformat(),
+            "window_end": now_utc.isoformat(),
+            "collected_at": now_utc.isoformat(),
             "has_samples": True,
             "truncated": total_buffered >= MAX_SAMPLES,
             "last_sample_age_ms": last_age_ms,

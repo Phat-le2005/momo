@@ -54,10 +54,13 @@ def test_monitor_scan_automatically_detects_novel_anomaly_and_verifies_sustained
 
     # Mutable live telemetry state returned by MiniStore `/api/v1/service/telemetry`
     telem_state: dict[str, Any] = {
+        "window_id": "W60:INIT:0",
         "rps": 2.0,
         "p95": 35.0,
         "error_rate": 0.0,
         "request_count": 20,
+        "truncated": False,
+        "last_sample_age_ms": 120.0,
     }
 
     def _handler(request: httpx.Request) -> httpx.Response:
@@ -88,10 +91,11 @@ def test_monitor_scan_automatically_detects_novel_anomaly_and_verifies_sustained
             )
         if path == "/api/v1/service/telemetry":
             win = {
+                "window_id": telem_state["window_id"],
                 "window_seconds": 60,
-                "has_samples": True,
-                "truncated": False,
-                "last_sample_age_ms": 120.0,
+                "has_samples": telem_state["request_count"] > 0,
+                "truncated": telem_state["truncated"],
+                "last_sample_age_ms": telem_state["last_sample_age_ms"],
                 "request_count": telem_state["request_count"],
                 "rps": telem_state["rps"],
                 "error_count": int(telem_state["request_count"] * telem_state["error_rate"]),
@@ -181,9 +185,40 @@ def test_monitor_scan_automatically_detects_novel_anomaly_and_verifies_sustained
     assert "challenge_code" not in str(ev_rows[0].payload_json)
     assert "expected_root_cause" not in str(ev_rows[0].payload_json)
 
-    # 3. Recovery verification requires sustained healthy windows (>= 2 consecutive scans)
+    # 3. Recovery: zero traffic, truncated, stale, and duplicate windows MUST NOT recover!
     telem_state["p95"] = 35.0
     telem_state["error_rate"] = 0.0
+
+    # 3a. Zero traffic -> INSUFFICIENT_EVIDENCE (cannot recover)
+    telem_state["window_id"] = "W60:ZERO"
+    telem_state["request_count"] = 0
+    rec_zero = run_binding_scan(
+        db,
+        binding=binding,
+        transport=transport,
+        service_key="test-read-key",
+        auto_create_cases=True,
+    )
+    assert rec_zero.recoveries_verified == 0
+    db.refresh(anom)
+    assert anom.verification_verdict == "INSUFFICIENT_EVIDENCE"
+
+    # 3b. Truncated window -> INSUFFICIENT_EVIDENCE (cannot recover)
+    telem_state["window_id"] = "W60:TRUNC"
+    telem_state["request_count"] = 20
+    telem_state["truncated"] = True
+    rec_trunc = run_binding_scan(
+        db,
+        binding=binding,
+        transport=transport,
+        service_key="test-read-key",
+        auto_create_cases=True,
+    )
+    assert rec_trunc.recoveries_verified == 0
+    telem_state["truncated"] = False
+
+    # 3c. First valid healthy window -> streak = 1/2
+    telem_state["window_id"] = "W60:HEALTHY:1"
     rec1 = run_binding_scan(
         db,
         binding=binding,
@@ -195,7 +230,20 @@ def test_monitor_scan_automatically_detects_novel_anomaly_and_verifies_sustained
     db.refresh(anom)
     assert anom.lifecycle_state != "RECOVERED"
 
-    # 2nd consecutive healthy window -> sustained VERIFIED_RECOVERY!
+    # 3d. Repeated IDENTICAL window_id -> MUST NOT advance streak!
+    rec_dup = run_binding_scan(
+        db,
+        binding=binding,
+        transport=transport,
+        service_key="test-read-key",
+        auto_create_cases=True,
+    )
+    assert rec_dup.recoveries_verified == 0
+    db.refresh(anom)
+    assert anom.lifecycle_state != "RECOVERED"
+
+    # 3e. Second DISTINCT valid healthy window -> sustained VERIFIED_RECOVERY!
+    telem_state["window_id"] = "W60:HEALTHY:2"
     rec2 = run_binding_scan(
         db,
         binding=binding,
