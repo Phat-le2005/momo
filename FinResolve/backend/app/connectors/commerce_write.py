@@ -189,6 +189,31 @@ class CommerceWriteConnector:
                 retryable=False,
             ) from exc
 
+    def get_command_status(self, idempotency_key: str) -> tuple[int, dict[str, Any]]:
+        """Authoritative receiver-side command status lookup for unknown-outcome reconciliation."""
+        url = f"{self.base_url}/api/v1/service/recovery/commands/{idempotency_key}"
+        headers = {
+            "X-Commerce-Write-Key": self._write_key,
+            "X-Merchant-Id": self.merchant_id,
+            "X-Commerce-Session-Id": self.commerce_session_id,
+            "X-World-Epoch": str(self.world_epoch),
+            "Accept": "application/json",
+        }
+        try:
+            with httpx.Client(
+                timeout=self.timeout_seconds,
+                transport=self._transport,
+                follow_redirects=False,
+            ) as client:
+                resp = client.get(url, headers=headers)
+            data = resp.json() if resp.content else {}
+            return resp.status_code, data if isinstance(data, dict) else {"raw": data}
+        except Exception as exc:  # noqa: BLE001
+            raise CommerceConnectorError(
+                self._scrub(f"Status lookup failed for {idempotency_key}: {str(exc)[:200]}"),
+                retryable=True,
+            ) from exc
+
 
 def execute_and_verify_commerce_recovery(
     db: Session,
@@ -494,4 +519,112 @@ def execute_and_verify_commerce_recovery(
         recovery_source=obs.recovery_source,
         detail=detail,
         response_payload=resp_data,
+    )
+
+
+def reconcile_unknown_recovery_command(
+    db: Session,
+    *,
+    cmd_row: RecoveryCommand,
+    binding: CommerceSourceBinding,
+    obs: AnomalyObservation,
+    write_key: str | None = None,
+    read_key: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+    read_connector: CommerceReadConnector | None = None,
+) -> RecoveryExecutionResult:
+    """Reconcile a RecoveryCommand stuck in EXECUTING or UNKNOWN_OUTCOME via authoritative lookup.
+
+    NEVER blindly retries the mutation! Queries MiniStore `GET /commands/{idempotency_key}` first,
+    then runs independent business postcondition verification if MiniStore confirms execution.
+    """
+    settings = get_settings()
+    w_key = write_key if write_key is not None else settings.commerce_write_key.get_secret_value()
+    writer = CommerceWriteConnector(
+        base_url=binding.base_url,
+        write_key=w_key,
+        merchant_id=binding.merchant_id,
+        commerce_session_id=binding.commerce_session_id,
+        world_epoch=binding.commerce_world_epoch,
+        timeout_seconds=settings.commerce_connector_timeout_seconds,
+        transport=transport,
+    )
+    reader = read_connector or build_connector_for_binding(
+        binding, service_key=read_key, transport=transport
+    )
+
+    try:
+        status_code, status_data = writer.get_command_status(cmd_row.idempotency_key)
+    except CommerceConnectorError as exc:
+        return RecoveryExecutionResult(
+            command_id=cmd_row.id,
+            command=cmd_row.command,
+            executed=False,
+            http_status=exc.status_code,
+            verified_recovery=False,
+            verdict=RecoveryVerdict.UNKNOWN_OUTCOME.value,
+            recovery_source=None,
+            detail=f"Authoritative status lookup unavailable: {exc}",
+            response_payload={},
+        )
+
+    if status_code == 404:
+        cmd_row.state = "FAILED"
+        cmd_row.http_status = 404
+        cmd_row.response_json = {"reconciliation": "NOT_RECEIVED_BY_COMMERCE"}
+        cmd_row.updated_at = datetime.now(UTC)
+        db.commit()
+        return RecoveryExecutionResult(
+            command_id=cmd_row.id,
+            command=cmd_row.command,
+            executed=False,
+            http_status=404,
+            verified_recovery=False,
+            verdict=RecoveryVerdict.STILL_INCONSISTENT.value,
+            recovery_source=None,
+            detail="Receiver confirmed command was never executed (404); safe to re-plan",
+            response_payload=status_data,
+        )
+
+    remote_status = str(status_data.get("status") or "").upper()
+    if status_code == 200 and remote_status == "EXECUTED":
+        cmd_row.http_status = 200
+        cmd_row.response_json = dict(status_data.get("result") or status_data)
+        cmd_row.state = "VERIFYING"
+        cmd_row.updated_at = datetime.now(UTC)
+        db.commit()
+
+        recovered, detail = verify_anomaly_recovery(db, obs=obs, connector=reader)
+        cmd_row.state = "VERIFIED" if recovered else "MANUAL_REVIEW"
+        cmd_row.verification_json = {
+            "recovered": recovered,
+            "verdict": obs.verification_verdict,
+            "recovery_source": obs.recovery_source,
+            "detail": detail,
+            "reconciled_from_unknown": True,
+        }
+        cmd_row.updated_at = datetime.now(UTC)
+        db.commit()
+        return RecoveryExecutionResult(
+            command_id=cmd_row.id,
+            command=cmd_row.command,
+            executed=True,
+            http_status=200,
+            verified_recovery=recovered,
+            verdict=obs.verification_verdict or RecoveryVerdict.STILL_INCONSISTENT.value,
+            recovery_source=obs.recovery_source,
+            detail=f"Reconciled via receiver status lookup: {detail}",
+            response_payload=cmd_row.response_json,
+        )
+
+    return RecoveryExecutionResult(
+        command_id=cmd_row.id,
+        command=cmd_row.command,
+        executed=False,
+        http_status=status_code,
+        verified_recovery=False,
+        verdict=RecoveryVerdict.UNKNOWN_OUTCOME.value,
+        recovery_source=None,
+        detail=f"Receiver command still in state '{remote_status}' (HTTP {status_code})",
+        response_payload=status_data,
     )

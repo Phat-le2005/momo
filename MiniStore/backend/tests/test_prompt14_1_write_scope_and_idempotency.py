@@ -215,3 +215,69 @@ def test_write_credential_scope_isolation_and_capability_enforcement(client: Tes
         )
         assert r_ok.status_code == 200
         assert r_ok.json()["status"] == "ESCALATED_MANUAL_REVIEW"
+
+
+def test_receiver_side_durable_idempotency_conflict_and_status_lookup(client: TestClient) -> None:
+    """Verify receiver-side idempotent replay, conflicting payload 409, and status lookup."""
+    settings = get_settings()
+    write_key = settings.service_write_api_key.get_secret_value()
+    valid_digest = "b" * 64
+    with get_sessionmaker()() as db:
+        csess = db.get(CommerceSession, DEFAULT_SESSION_ID)
+        assert csess is not None
+        epoch = csess.world_epoch
+
+    headers = {
+        "X-Commerce-Write-Key": write_key,
+        "X-Merchant-Id": DEFAULT_MERCHANT_ID,
+        "X-Commerce-Session-Id": DEFAULT_SESSION_ID,
+        "X-World-Epoch": str(epoch),
+        "X-Authorization-Digest": valid_digest,
+    }
+    idemp_key = f"IDEMP-RCV-{uuid.uuid4().hex[:8]}"
+
+    # 1. Initial execution succeeds
+    r1 = client.post(
+        "/api/v1/service/recovery/execute",
+        headers=headers,
+        json={
+            "command": "REQUEST_MANUAL_REVIEW",
+            "order_id": "ORD-TEST-01",
+            "idempotency_key": idemp_key,
+        },
+    )
+    assert r1.status_code == 200
+    assert r1.json().get("idempotent_replay") is not True
+
+    # 2. Exact same idempotency_key + payload returns idempotent replay
+    r2 = client.post(
+        "/api/v1/service/recovery/execute",
+        headers=headers,
+        json={
+            "command": "REQUEST_MANUAL_REVIEW",
+            "order_id": "ORD-TEST-01",
+            "idempotency_key": idemp_key,
+        },
+    )
+    assert r2.status_code == 200
+    assert r2.json().get("idempotent_replay") is True
+
+    # 3. Conflicting payload with same idempotency_key returns 409 CONFLICT
+    r3 = client.post(
+        "/api/v1/service/recovery/execute",
+        headers=headers,
+        json={
+            "command": "REQUEST_MANUAL_REVIEW",
+            "order_id": "ORD-DIFFERENT-99",
+            "idempotency_key": idemp_key,
+        },
+    )
+    assert r3.status_code == 409
+
+    # 4. Authenticated command status lookup returns durable outcome
+    r_stat = client.get(f"/api/v1/service/recovery/commands/{idemp_key}", headers=headers)
+    assert r_stat.status_code == 200
+    body = r_stat.json()
+    assert body["idempotency_key"] == idemp_key
+    assert body["status"] == "EXECUTED"
+    assert body["http_status"] == 200

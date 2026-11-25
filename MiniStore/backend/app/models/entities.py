@@ -962,3 +962,48 @@ class EventOutbox(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )
+
+
+class ReceivedRecoveryCommand(Base):
+    """Receiver-side durable idempotency & execution ledger for FinResolve recovery commands."""
+
+    __tablename__ = "received_recovery_commands"
+    __table_args__ = (
+        UniqueConstraint(
+            "merchant_id",
+            "commerce_session_id",
+            "idempotency_key",
+            name="uq_received_recovery_cmd_scope_idemp",
+        ),
+        Index("ix_received_recovery_cmd_status", "merchant_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    merchant_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("merchants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    commerce_session_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("commerce_sessions.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    world_epoch: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    command: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    target_payment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    target_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    expected_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    authorization_digest: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    credential_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="EXECUTING", nullable=False)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    executed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )

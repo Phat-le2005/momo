@@ -13,12 +13,16 @@ Hard Security & Isolation Invariants:
 
 from __future__ import annotations
 
+import hashlib
+import json
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.auth import hash_token
@@ -30,6 +34,7 @@ from app.models.entities import (
     EventOutbox,
     Order,
     Payment,
+    ReceivedRecoveryCommand,
     ServiceCredential,
 )
 from app.models.enums import (
@@ -193,6 +198,61 @@ class RecoveryCommandRequest(BaseModel):
     reason: str = Field(default="FinResolve policy-gated recovery command", max_length=500)
 
 
+def _compute_receiver_request_hash(
+    *,
+    principal: WritePrincipal,
+    cmd: str,
+    payload: RecoveryCommandRequest,
+) -> str:
+    canonical = {
+        "merchant_id": principal.merchant_id,
+        "commerce_session_id": principal.commerce_session_id,
+        "world_epoch": principal.world_epoch,
+        "command": cmd,
+        "order_id": payload.order_id,
+        "payment_id": payload.payment_id,
+        "event_id": payload.event_id,
+        "expected_version": payload.expected_version,
+    }
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+@router.get("/commands/{idempotency_key}")
+def get_recovery_command_status(
+    idempotency_key: str,
+    principal: WritePrincipal = Depends(_require_write_principal),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Authenticated authoritative command-status lookup for unknown-outcome reconciliation."""
+    row = db.scalar(
+        select(ReceivedRecoveryCommand).where(
+            ReceivedRecoveryCommand.merchant_id == principal.merchant_id,
+            ReceivedRecoveryCommand.commerce_session_id == principal.commerce_session_id,
+            ReceivedRecoveryCommand.idempotency_key == idempotency_key,
+        )
+    )
+    if row is None:
+        raise CommerceError(
+            ErrorCode.NOT_FOUND,
+            f"Recovery command '{idempotency_key}' not found in authorized scope",
+            status_code=404,
+        )
+    return {
+        "id": row.id,
+        "idempotency_key": row.idempotency_key,
+        "request_hash": row.request_hash,
+        "command": row.command,
+        "world_epoch": row.world_epoch,
+        "status": row.status,
+        "http_status": row.http_status,
+        "result": row.result_json,
+        "executed_at": row.executed_at.isoformat(),
+        "updated_at": row.updated_at.isoformat(),
+    }
+
+
 @router.post("/execute")
 def execute_recovery_command(
     payload: RecoveryCommandRequest,
@@ -221,160 +281,231 @@ def execute_recovery_command(
         )
 
     now = datetime.now(UTC)
+    req_hash = _compute_receiver_request_hash(principal=principal, cmd=cmd, payload=payload)
 
-    if cmd == "REQUEST_ORDER_SYNC":
-        if not payload.order_id:
-            raise CommerceError(
-                ErrorCode.BAD_REQUEST,
-                "order_id is required for REQUEST_ORDER_SYNC",
-                status_code=400,
-            )
-        # Resolve payment strictly within authorized scope and verify LOCAL_MOCK before syncing
-        pay_stmt = (
-            select(Payment)
-            .join(Order, Payment.order_id == Order.id)
-            .where(
-                Payment.order_id == payload.order_id,
-                Payment.merchant_id == principal.merchant_id,
-                Payment.commerce_session_id == principal.commerce_session_id,
-                Order.world_epoch == principal.world_epoch,
-            )
+    # Receiver-side durable idempotency check under row lock
+    existing = db.scalar(
+        select(ReceivedRecoveryCommand)
+        .where(
+            ReceivedRecoveryCommand.merchant_id == principal.merchant_id,
+            ReceivedRecoveryCommand.commerce_session_id == principal.commerce_session_id,
+            ReceivedRecoveryCommand.idempotency_key == payload.idempotency_key,
         )
-        if payload.payment_id:
-            pay_stmt = pay_stmt.where(Payment.id == payload.payment_id)
-        pay_ref = db.scalar(pay_stmt.order_by(Payment.created_at.desc()).limit(1))
-        if pay_ref is None:
-            raise CommerceError(
-                ErrorCode.NOT_FOUND,
-                "Payment/Order not found in authorized write scope",
-                status_code=404,
-            )
-        if pay_ref.provider != PaymentProvider.LOCAL_MOCK.value:
-            raise CommerceError(
-                ErrorCode.FORBIDDEN,
-                f"VNPAY_OR_EXTERNAL_WRITE_FORBIDDEN: provider '{pay_ref.provider}' blocked",
-                status_code=403,
-            )
-
-        # P0.1: Target-specific transactional sync (NEVER mutates any unrelated order!)
-        order, pay, outcome_status = sync_single_confirmed_payment_to_order(
-            db,
-            order_id=payload.order_id,
-            payment_id=pay_ref.id,
-            merchant_id=principal.merchant_id,
-            commerce_session_id=principal.commerce_session_id,
-            world_epoch=principal.world_epoch,
-            expected_version=payload.expected_version,
-            sync_source="FINRESOLVE_RECOVERY_COMMAND",
-        )
-        return {
-            "command": cmd,
-            "status": outcome_status,
-            "order_id": order.id,
-            "order_status": order.status,
-            "order_version": order.version,
-            "payment_id": pay.id,
-            "is_synced_to_order": pay.is_synced_to_order,
-            "idempotency_key": payload.idempotency_key,
-        }
-
-    if cmd == "REQUEST_EVENT_REDELIVERY":
-        # P0.2: Strictly scoped event redelivery requiring explicit event_id or order_id
-        if not payload.event_id and not payload.order_id:
-            raise CommerceError(
-                ErrorCode.BAD_REQUEST,
-                "SCOPED_TARGET_REQUIRED: event_id or order_id required for redelivery",
-                status_code=400,
-            )
-        stmt = (
-            select(EventOutbox)
-            .join(CommerceEvent, EventOutbox.commerce_event_id == CommerceEvent.id)
-            .where(
-                CommerceEvent.merchant_id == principal.merchant_id,
-                CommerceEvent.commerce_session_id == principal.commerce_session_id,
-                CommerceEvent.world_epoch == principal.world_epoch,
-                EventOutbox.status.in_([OutboxStatus.FAILED.value, OutboxStatus.PENDING.value]),
-            )
-        )
-        if payload.event_id:
-            stmt = stmt.where(EventOutbox.event_id == payload.event_id)
-        if payload.order_id:
-            stmt = stmt.where(CommerceEvent.order_id == payload.order_id)
-
-        rows = list(db.scalars(stmt.limit(25).with_for_update()).all())
-        redelivered = 0
-        for row in rows:
-            row.status = OutboxStatus.PENDING.value
-            row.next_attempt_at = now
-            redelivered += 1
-        db.commit()
-        return {
-            "command": cmd,
-            "status": "EXECUTED",
-            "redelivered_count": redelivered,
-            "event_id": payload.event_id,
-            "order_id": payload.order_id,
-            "idempotency_key": payload.idempotency_key,
-        }
-
-    if cmd == "REQUEST_PAYMENT_RECONCILIATION":
-        if not payload.order_id:
-            raise CommerceError(ErrorCode.BAD_REQUEST, "order_id required", status_code=400)
-        recon_order = db.scalar(
-            select(Order)
-            .where(
-                Order.id == payload.order_id,
-                Order.merchant_id == principal.merchant_id,
-                Order.commerce_session_id == principal.commerce_session_id,
-                Order.world_epoch == principal.world_epoch,
-            )
-            .with_for_update()
-        )
-        if recon_order is None:
-            raise CommerceError(ErrorCode.NOT_FOUND, "Order not found in scope", status_code=404)
-        if payload.expected_version is not None and recon_order.version != payload.expected_version:
+        .with_for_update()
+    )
+    if existing is not None:
+        if existing.request_hash != req_hash:
             raise CommerceError(
                 ErrorCode.CONFLICT,
-                f"VERSION_MISMATCH: expected {payload.expected_version}, got {recon_order.version}",
+                "IDEMPOTENCY_KEY_CONFLICT: idempotency_key reused with different payload",
                 status_code=409,
             )
-        recon_order.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
-        recon_order.reconciliation_reason = payload.reason
-        recon_order.updated_at = now
-        if payload.payment_id:
-            pay_row = db.get(Payment, payload.payment_id)
-            if pay_row is not None and pay_row.order_id == recon_order.id:
-                pay_row.reconciliation_required = True
-                pay_row.reconciliation_note = payload.reason
-        db.commit()
-        return {
-            "command": cmd,
-            "status": "EXECUTED",
-            "order_id": recon_order.id,
-            "reconciliation_status": recon_order.reconciliation_status,
-            "idempotency_key": payload.idempotency_key,
-        }
+        if existing.status == "EXECUTING":
+            raise CommerceError(
+                ErrorCode.CONFLICT,
+                "COMMAND_IN_FLIGHT: concurrent duplicate execution blocked",
+                status_code=409,
+            )
+        if existing.status == "EXECUTED":
+            replayed = dict(existing.result_json or {})
+            replayed["idempotent_replay"] = True
+            return replayed
 
-    # REQUEST_MANUAL_REVIEW (pure audit event, zero financial mutation)
-    record_commerce_event(
-        db,
+    rec = ReceivedRecoveryCommand(
+        id=f"RCV-{uuid.uuid4().hex[:10].upper()}",
         merchant_id=principal.merchant_id,
         commerce_session_id=principal.commerce_session_id,
         world_epoch=principal.world_epoch,
-        event_type="MANUAL_REVIEW_REQUESTED",
-        order_id=payload.order_id,
-        payment_id=payload.payment_id,
-        payload={
-            "reason": payload.reason,
-            "idempotency_key": payload.idempotency_key,
-            "requested_by": "FINRESOLVE_RECOVERY_COMMAND",
-        },
+        idempotency_key=payload.idempotency_key,
+        request_hash=req_hash,
+        command=cmd,
+        target_order_id=payload.order_id,
+        target_payment_id=payload.payment_id,
+        target_event_id=payload.event_id,
+        expected_version=payload.expected_version,
+        authorization_digest=principal.authorization_digest or None,
+        credential_id=principal.credential_id,
+        status="EXECUTING",
+        result_json={},
+        executed_at=now,
+        updated_at=now,
     )
+    try:
+        db.add(rec)
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            "COMMAND_IN_FLIGHT: concurrent duplicate command rejected by unique constraint",
+            status_code=409,
+        ) from exc
+
+    response: dict[str, Any]
+    try:
+        if cmd == "REQUEST_ORDER_SYNC":
+            if not payload.order_id:
+                raise CommerceError(
+                    ErrorCode.BAD_REQUEST,
+                    "order_id is required for REQUEST_ORDER_SYNC",
+                    status_code=400,
+                )
+            pay_stmt = (
+                select(Payment)
+                .join(Order, Payment.order_id == Order.id)
+                .where(
+                    Payment.order_id == payload.order_id,
+                    Payment.merchant_id == principal.merchant_id,
+                    Payment.commerce_session_id == principal.commerce_session_id,
+                    Order.world_epoch == principal.world_epoch,
+                )
+            )
+            if payload.payment_id:
+                pay_stmt = pay_stmt.where(Payment.id == payload.payment_id)
+            pay_ref = db.scalar(pay_stmt.order_by(Payment.created_at.desc()).limit(1))
+            if pay_ref is None:
+                raise CommerceError(
+                    ErrorCode.NOT_FOUND,
+                    "Payment/Order not found in authorized write scope",
+                    status_code=404,
+                )
+            if pay_ref.provider != PaymentProvider.LOCAL_MOCK.value:
+                raise CommerceError(
+                    ErrorCode.FORBIDDEN,
+                    f"VNPAY_OR_EXTERNAL_WRITE_FORBIDDEN: provider '{pay_ref.provider}' blocked",
+                    status_code=403,
+                )
+
+            order, pay, outcome_status = sync_single_confirmed_payment_to_order(
+                db,
+                order_id=payload.order_id,
+                payment_id=pay_ref.id,
+                merchant_id=principal.merchant_id,
+                commerce_session_id=principal.commerce_session_id,
+                world_epoch=principal.world_epoch,
+                expected_version=payload.expected_version,
+                sync_source="FINRESOLVE_RECOVERY_COMMAND",
+            )
+            response = {
+                "command": cmd,
+                "status": outcome_status,
+                "order_id": order.id,
+                "order_status": order.status,
+                "order_version": order.version,
+                "payment_id": pay.id,
+                "is_synced_to_order": pay.is_synced_to_order,
+                "idempotency_key": payload.idempotency_key,
+            }
+        elif cmd == "REQUEST_EVENT_REDELIVERY":
+            if not payload.event_id and not payload.order_id:
+                raise CommerceError(
+                    ErrorCode.BAD_REQUEST,
+                    "SCOPED_TARGET_REQUIRED: event_id or order_id required for redelivery",
+                    status_code=400,
+                )
+            stmt = (
+                select(EventOutbox)
+                .join(CommerceEvent, EventOutbox.commerce_event_id == CommerceEvent.id)
+                .where(
+                    CommerceEvent.merchant_id == principal.merchant_id,
+                    CommerceEvent.commerce_session_id == principal.commerce_session_id,
+                    CommerceEvent.world_epoch == principal.world_epoch,
+                    EventOutbox.status.in_([OutboxStatus.FAILED.value, OutboxStatus.PENDING.value]),
+                )
+            )
+            if payload.event_id:
+                stmt = stmt.where(EventOutbox.event_id == payload.event_id)
+            if payload.order_id:
+                stmt = stmt.where(CommerceEvent.order_id == payload.order_id)
+
+            rows = list(db.scalars(stmt.limit(25).with_for_update()).all())
+            redelivered = 0
+            for row in rows:
+                row.status = OutboxStatus.PENDING.value
+                row.next_attempt_at = now
+                redelivered += 1
+            response = {
+                "command": cmd,
+                "status": "EXECUTED",
+                "redelivered_count": redelivered,
+                "event_id": payload.event_id,
+                "order_id": payload.order_id,
+                "idempotency_key": payload.idempotency_key,
+            }
+        elif cmd == "REQUEST_PAYMENT_RECONCILIATION":
+            if not payload.order_id:
+                raise CommerceError(ErrorCode.BAD_REQUEST, "order_id required", status_code=400)
+            recon_order = db.scalar(
+                select(Order)
+                .where(
+                    Order.id == payload.order_id,
+                    Order.merchant_id == principal.merchant_id,
+                    Order.commerce_session_id == principal.commerce_session_id,
+                    Order.world_epoch == principal.world_epoch,
+                )
+                .with_for_update()
+            )
+            if recon_order is None:
+                raise CommerceError(
+                    ErrorCode.NOT_FOUND, "Order not found in scope", status_code=404
+                )
+            if (
+                payload.expected_version is not None
+                and recon_order.version != payload.expected_version
+            ):
+                raise CommerceError(
+                    ErrorCode.CONFLICT,
+                    (
+                        f"VERSION_MISMATCH: expected {payload.expected_version}, "
+                        f"got {recon_order.version}"
+                    ),
+                    status_code=409,
+                )
+            recon_order.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
+            recon_order.reconciliation_reason = payload.reason
+            recon_order.updated_at = now
+            if payload.payment_id:
+                pay_row = db.get(Payment, payload.payment_id)
+                if pay_row is not None and pay_row.order_id == recon_order.id:
+                    pay_row.reconciliation_required = True
+                    pay_row.reconciliation_note = payload.reason
+            response = {
+                "command": cmd,
+                "status": "EXECUTED",
+                "order_id": recon_order.id,
+                "reconciliation_status": recon_order.reconciliation_status,
+                "idempotency_key": payload.idempotency_key,
+            }
+        else:
+            record_commerce_event(
+                db,
+                merchant_id=principal.merchant_id,
+                commerce_session_id=principal.commerce_session_id,
+                world_epoch=principal.world_epoch,
+                event_type="MANUAL_REVIEW_REQUESTED",
+                order_id=payload.order_id,
+                payment_id=payload.payment_id,
+                payload={
+                    "reason": payload.reason,
+                    "idempotency_key": payload.idempotency_key,
+                    "requested_by": "FINRESOLVE_RECOVERY_COMMAND",
+                },
+            )
+            response = {
+                "command": cmd,
+                "status": "ESCALATED_MANUAL_REVIEW",
+                "order_id": payload.order_id,
+                "payment_id": payload.payment_id,
+                "idempotency_key": payload.idempotency_key,
+            }
+    except CommerceError:
+        db.rollback()
+        raise
+
+    # Persist receiver-side execution result atomically in the same transaction
+    rec.status = "EXECUTED"
+    rec.http_status = 200
+    rec.result_json = response
+    rec.updated_at = datetime.now(UTC)
     db.commit()
-    return {
-        "command": cmd,
-        "status": "ESCALATED_MANUAL_REVIEW",
-        "order_id": payload.order_id,
-        "payment_id": payload.payment_id,
-        "idempotency_key": payload.idempotency_key,
-    }
+    return response

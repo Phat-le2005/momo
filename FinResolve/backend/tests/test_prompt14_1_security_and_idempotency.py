@@ -54,7 +54,7 @@ def _make_session_binding_obs(
         world_epoch=world_epoch,
         source_binding_id=binding.id,
         merchant_id="MERCHANT_FINSHOP_01",
-        detector_code="D02",
+        detector_code="D01",
         anomaly_type="PAYMENT_SUCCEEDED_ORDER_NOT_CONFIRMED",
         severity="HIGH",
         fingerprint=f"fp-{uuid.uuid4().hex[:10]}",
@@ -77,6 +77,8 @@ def _mock_transport(
 ) -> httpx.MockTransport:
     def _handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if request.method == "GET" and path.endswith("/timeline"):
+            return httpx.Response(200, json=[])
         if request.method == "GET" and path.startswith("/api/v1/service/orders/"):
             return httpx.Response(200, json=dict(order_state))
         if request.method == "GET" and path.startswith("/api/v1/service/payments/"):
@@ -308,3 +310,109 @@ def test_policy_engine_rejects_missing_or_expired_human_approval(
     assert exc_exp.value.status_code == 403
     assert "APPROVAL_EXPIRED" in exc_exp.value.message
     assert len(exec_calls) == 0
+
+
+def test_unknown_outcome_reconciliation_via_receiver_status_lookup(
+    db: Session, active_session: dict[str, str]
+) -> None:
+    """Timeout -> UNKNOWN_OUTCOME (no blind retry) -> reconciled via receiver status lookup."""
+    from app.connectors.commerce_write import reconcile_unknown_recovery_command
+
+    _, binding, obs = _make_session_binding_obs(
+        db, session_id=active_session["id"], order_id="ORD-TOUT-01", payment_id="PAY-TOUT-01"
+    )
+    order_state: dict[str, Any] = {
+        "id": "ORD-TOUT-01",
+        "status": "PENDING_PAYMENT",
+        "version": 1,
+    }
+    payment_state: dict[str, Any] = {
+        "id": "PAY-TOUT-01",
+        "order_id": "ORD-TOUT-01",
+        "status": "SUCCEEDED",
+        "provider": "LOCAL_MOCK",
+        "is_synced_to_order": False,
+    }
+    idemp_key = f"IDEMP-TOUT-{uuid.uuid4().hex[:8]}"
+
+    def _timeout_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/timeline"):
+            return httpx.Response(200, json=[])
+        if request.method == "GET" and request.url.path.startswith("/api/v1/service/orders/"):
+            return httpx.Response(200, json=dict(order_state))
+        if request.method == "GET" and request.url.path.startswith("/api/v1/service/payments/"):
+            return httpx.Response(200, json=dict(payment_state))
+        if request.method == "POST" and request.url.path == "/api/v1/service/recovery/execute":
+            # Simulate receiver actually mutating state, then response lost (timeout)
+            order_state["status"] = "CONFIRMED"
+            order_state["version"] = 2
+            payment_state["is_synced_to_order"] = True
+            raise httpx.ReadTimeout("simulated lost response after receiver commit")
+        if request.method == "GET" and request.url.path.endswith(f"/commands/{idemp_key}"):
+            return httpx.Response(
+                200,
+                json={
+                    "idempotency_key": idemp_key,
+                    "status": "EXECUTED",
+                    "http_status": 200,
+                    "result": {"command": "REQUEST_ORDER_SYNC", "status": "SYNCED"},
+                },
+            )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_timeout_handler)
+    reader = CommerceReadConnector(
+        base_url=binding.base_url,
+        service_key="test-read-key",
+        merchant_id=binding.merchant_id,
+        commerce_session_id=binding.commerce_session_id,
+        transport=transport,
+    )
+
+    # 1. Execution times out -> UNKNOWN_OUTCOME recorded
+    res1 = execute_and_verify_commerce_recovery(
+        db,
+        binding=binding,
+        obs=obs,
+        command="REQUEST_ORDER_SYNC",
+        idempotency_key=idemp_key,
+        expected_version=1,
+        write_key="test-write-key",
+        transport=transport,
+        read_connector=reader,
+    )
+    assert res1.verdict == "UNKNOWN_OUTCOME"
+    cmd_row = db.scalar(select(RecoveryCommand).where(RecoveryCommand.id == res1.command_id))
+    assert cmd_row is not None
+    assert cmd_row.state == "UNKNOWN_OUTCOME"
+
+    # 2. Blind retry with same idempotency_key MUST be blocked (409)
+    with pytest.raises(AppError) as exc_retry:
+        execute_and_verify_commerce_recovery(
+            db,
+            binding=binding,
+            obs=obs,
+            command="REQUEST_ORDER_SYNC",
+            idempotency_key=idemp_key,
+            expected_version=1,
+            write_key="test-write-key",
+            transport=transport,
+            read_connector=reader,
+        )
+    assert exc_retry.value.status_code == 409
+    assert "UNKNOWN_OUTCOME_NO_BLIND_RETRY" in exc_retry.value.message
+
+    # 3. Reconcile via receiver status lookup -> verifies actual postconditions -> VERIFIED
+    rec_res = reconcile_unknown_recovery_command(
+        db,
+        cmd_row=cmd_row,
+        binding=binding,
+        obs=obs,
+        write_key="test-write-key",
+        transport=transport,
+        read_connector=reader,
+    )
+    assert rec_res.executed is True
+    assert rec_res.verified_recovery is True
+    db.refresh(cmd_row)
+    assert cmd_row.state == "VERIFIED"
