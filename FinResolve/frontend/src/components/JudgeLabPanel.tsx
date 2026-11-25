@@ -24,11 +24,13 @@ type HarnessResult = {
   baselines: Array<{
     configuration: string;
     trials_run: number;
-    detection_success_rate: number;
+    known_detection_recall: number;
+    novel_anomaly_detection_rate: number;
     false_positive_rate: number;
     appropriate_action_rate: number;
     unsafe_action_count: number;
     verified_recovery_rate: number;
+    total_tool_calls: number;
   }>;
 };
 
@@ -146,8 +148,8 @@ export function JudgeLabPanel() {
   return (
     <div className="space-y-6">
       <Panel
-        title="Isolated Judge Lab & Independent Oracle"
-        subtitle="Giao diện riêng cho Giám khảo (yêu cầu X-Judge-Token). Ground truth hoàn toàn tách biệt khỏi FinResolve Agent."
+        title="Open-World Test Lab & Independent Oracle"
+        subtitle="Giao diện thử nghiệm độc lập (yêu cầu X-Judge-Token). C01–C08 chỉ là bộ kiểm thử hồi quy; FinResolve vận hành theo kiến trúc Open-World Autonomous Guardian."
       >
         <div className="space-y-4">
           <div className="grid gap-3 sm:grid-cols-2">
@@ -245,9 +247,10 @@ export function JudgeLabPanel() {
               <thead>
                 <tr className="border-b border-slate-200 text-slate-500">
                   <th className="py-2 pr-3">Configuration</th>
-                  <th className="py-2 pr-3">Detection</th>
+                  <th className="py-2 pr-3">Known Recall</th>
+                  <th className="py-2 pr-3">Novel Anomaly</th>
                   <th className="py-2 pr-3">False Positive</th>
-                  <th className="py-2 pr-3">Appropriate Action</th>
+                  <th className="py-2 pr-3">Tool Calls</th>
                   <th className="py-2 pr-3">Unsafe Actions</th>
                   <th className="py-2">Verified Recovery</th>
                 </tr>
@@ -256,9 +259,10 @@ export function JudgeLabPanel() {
                 {harness.baselines.map((b) => (
                   <tr key={b.configuration} className="border-b border-slate-100">
                     <td className="py-2 pr-3 font-semibold text-slate-800">{b.configuration}</td>
-                    <td className="py-2 pr-3">{(b.detection_success_rate * 100).toFixed(0)}%</td>
+                    <td className="py-2 pr-3">{(b.known_detection_recall * 100).toFixed(0)}%</td>
+                    <td className="py-2 pr-3">{(b.novel_anomaly_detection_rate * 100).toFixed(0)}%</td>
                     <td className="py-2 pr-3">{(b.false_positive_rate * 100).toFixed(0)}%</td>
-                    <td className="py-2 pr-3">{(b.appropriate_action_rate * 100).toFixed(0)}%</td>
+                    <td className="py-2 pr-3">{b.total_tool_calls}</td>
                     <td className="py-2 pr-3">{b.unsafe_action_count}</td>
                     <td className="py-2">{(b.verified_recovery_rate * 100).toFixed(0)}%</td>
                   </tr>
