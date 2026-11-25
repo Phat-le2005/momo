@@ -50,6 +50,9 @@ from app.models.enums import (
     RefundRequestStatus,
 )
 from app.payments.adapter import MockPaymentAdapter
+from app.payments.registry import list_payment_methods
+from app.payments.vnpay.adapter import VNPaySandboxAdapter
+from app.payments.vnpay.signing import verify_vnpay_params_signature
 from app.schemas.commerce import (
     ApplyVoucherRequest,
     CartItemAddRequest,
@@ -102,7 +105,16 @@ def _to_payment_response(p: Payment) -> PaymentResponse:
         order_id=p.order_id,
         merchant_id=p.merchant_id,
         provider=p.provider,
+        provider_environment=p.provider_environment,
         provider_ref=p.provider_ref,
+        provider_txn_no=p.provider_txn_no,
+        provider_txn_date=p.provider_txn_date,
+        provider_response_code=p.provider_response_code,
+        provider_transaction_status=p.provider_transaction_status,
+        observation_source=p.observation_source,
+        signature_verified=p.signature_verified,
+        last_observed_at=p.last_observed_at,
+        redirect_url=p.redirect_url,
         correlation_id=p.correlation_id,
         amount_vnd=p.amount_vnd,
         refunded_amount_vnd=p.refunded_amount_vnd,
@@ -313,18 +325,7 @@ def store_bootstrap(db: Session = Depends(get_db)) -> dict[str, Any]:
             "world_epoch": csess.world_epoch if csess else 1,
         },
         "categories": categories,
-        "payment_methods": [
-            {
-                "id": "LOCAL_MOCK",
-                "label_vi": "Thanh toán thử nghiệm nội bộ (LOCAL_MOCK)",
-                "available": True,
-            },
-            {
-                "id": "VNPAY_SANDBOX",
-                "label_vi": "VNPAY Sandbox (Sắp ra mắt ở Prompt 11 — chưa khả dụng)",
-                "available": False,
-            },
-        ],
+        "payment_methods": list_payment_methods(),
     }
 
 
@@ -850,6 +851,7 @@ def remove_cart_voucher(
 )
 def checkout_order(
     payload: CheckoutRequest,
+    request: Request,
     response: Response,
     idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"),
     _rl: None = Depends(enforce_checkout_rate_limit),
@@ -875,6 +877,9 @@ def checkout_order(
         if not eff_voucher:
             eff_voucher = cart.applied_voucher_code
 
+    forwarded_for = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    client_ip = forwarded_for or (request.client.host if request.client else "127.0.0.1")
+
     order, payment, replay = create_order_from_items(
         db,
         customer=principal.customer,
@@ -889,6 +894,7 @@ def checkout_order(
         direct_items=direct_items,
         clear_cart=cart if direct_items is None else None,
         expected_total_vnd=payload.expected_total_vnd,
+        client_ip=client_ip,
     )
     if replay:
         response.status_code = status.HTTP_200_OK
@@ -1233,6 +1239,15 @@ def customer_mock_pay_order(
             ErrorCode.CONFLICT, "Đơn hàng chưa có giao dịch thanh toán", status_code=409
         )
     pay = order.payments[0]
+    if pay.provider != "LOCAL_MOCK":
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            (
+                "CROSS_PROVIDER_MUTATION_BLOCKED: Không thể dùng mock-pay cho giao dịch "
+                f"của cổng thanh toán '{pay.provider}'"
+            ),
+            status_code=403,
+        )
     adapter = MockPaymentAdapter()
     notif_id = f"MOCK-CUST-{uuid.uuid4().hex[:12].upper()}"
     updated_pay, is_dup = adapter.process_provider_notification(
@@ -1293,4 +1308,87 @@ def mock_payment_provider_notify(
         "payment": _to_payment_response(payment).model_dump(),
         "is_duplicate_notification": is_duplicate,
         "orders_synced": synced_count,
+    }
+
+
+# --- Official VNPAY Sandbox IPN & Read-Only ReturnURL Verification ---
+@router.get(
+    "/payments/vnpay/ipn",
+    summary="Official VNPAY Sandbox IPN Server-to-Server Callback (API 2.1.0)",
+)
+def vnpay_sandbox_ipn(
+    request: Request,
+    _rl: None = Depends(enforce_payment_rate_limit),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    """Receive and verify VNPAY Sandbox IPN callback.
+
+    Fails closed when VNPAY credentials are unavailable. Never runs LLM reasoning and never
+    blocks on FinResolve. Returns official VNPAY `{"RspCode": "...", "Message": "..."}`.
+    """
+    raw_items = list(request.query_params.multi_items())
+    adapter = VNPaySandboxAdapter()
+    return adapter.process_ipn(db, raw_query_items=raw_items)
+
+
+@router.get(
+    "/store/payments/vnpay/return-verify",
+    summary="Customer-authenticated ReturnURL status lookup (READ-ONLY — never confirms payment)",
+)
+def vnpay_return_verify(
+    request: Request,
+    principal: CustomerPrincipal = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Validate VNPAY ReturnURL signature server-side and return persisted payment/order status.
+
+    HARD INVARIANT: ReturnURL NEVER mutates Payment or Order status! Authoritative confirmation
+    comes ONLY from verified IPN or verified QueryDr.
+    """
+    params = dict(request.query_params.items())
+    txn_ref = params.get("vnp_TxnRef", "").strip()
+    if not txn_ref:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST, "Thiếu mã tham chiếu vnp_TxnRef", status_code=400
+        )
+
+    payment = db.scalar(
+        select(Payment).where(
+            Payment.provider_ref == txn_ref,
+            Payment.provider == "VNPAY_SANDBOX",
+            Payment.merchant_id == principal.merchant_id,
+        )
+    )
+    if payment is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Không tìm thấy giao dịch VNPAY", status_code=404)
+
+    order = db.scalar(
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.payments))
+        .where(
+            Order.id == payment.order_id,
+            Order.customer_id == principal.customer.id,
+            Order.merchant_id == principal.merchant_id,
+        )
+    )
+    if order is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Không tìm thấy đơn hàng", status_code=404)
+
+    settings = get_settings()
+    hash_secret = settings.vnpay_hash_secret.get_secret_value().strip()
+    return_sig_valid = (
+        verify_vnpay_params_signature(params, hash_secret=hash_secret)
+        if hash_secret and params.get("vnp_SecureHash")
+        else False
+    )
+
+    return {
+        "return_signature_valid": return_sig_valid,
+        "return_response_code": params.get("vnp_ResponseCode"),
+        "authoritative_note_vi": (
+            "Kết quả trang ReturnURL chỉ mang tính hiển thị tạm thời. Trạng thái thanh toán "
+            "chính thức được xác nhận bởi IPN có chữ ký hợp lệ hoặc truy vấn QueryDr từ hệ thống."
+        ),
+        "order": _to_order_response(order).model_dump(),
+        "payment": _to_payment_response(payment).model_dump(),
     }

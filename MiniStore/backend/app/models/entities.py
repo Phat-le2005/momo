@@ -548,7 +548,22 @@ class Payment(Base):
         String(64), ForeignKey("commerce_sessions.id", ondelete="CASCADE"), nullable=False
     )
     provider: Mapped[str] = mapped_column(String(32), default="LOCAL_MOCK", nullable=False)
+    provider_environment: Mapped[str] = mapped_column(
+        String(32), default="LOCAL_MOCK", nullable=False
+    )
     provider_ref: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
+    provider_txn_no: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    provider_txn_date: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    provider_response_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    provider_transaction_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    observation_source: Mapped[str] = mapped_column(
+        String(32), default="INTERNAL_LEDGER", nullable=False
+    )
+    signature_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    last_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    redirect_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     correlation_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
     amount_vnd: Mapped[int] = mapped_column(Integer, nullable=False)
     refunded_amount_vnd: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -606,6 +621,58 @@ class ProviderNotification(Base):
     )
 
 
+class PaymentQueryAttempt(Base):
+    __tablename__ = "payment_query_attempts"
+    __table_args__ = (
+        Index("ix_payment_query_attempts_payment_created", "payment_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payment_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("payments.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    order_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    merchant_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    command: Mapped[str] = mapped_column(String(32), default="querydr", nullable=False)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    provider_response_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    provider_transaction_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    signature_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    mapped_payment_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    observation_provenance: Mapped[str] = mapped_column(
+        String(32), default="VNPAY_SANDBOX", nullable=False
+    )
+    error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    response_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class ReconciliationRecord(Base):
+    __tablename__ = "reconciliation_records"
+    __table_args__ = (Index("ix_reconciliation_records_order_created", "order_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    order_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("orders.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    payment_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("payments.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    merchant_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    operator_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    action_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    note: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+    evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    verified_postconditions: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
 class RefundRequest(Base):
     __tablename__ = "refund_requests"
     __table_args__ = (CheckConstraint("requested_amount_vnd > 0", name="ck_refund_req_amt_pos"),)
@@ -659,6 +726,9 @@ class RefundTransaction(Base):
     )
     provider: Mapped[str] = mapped_column(String(32), default="LOCAL_MOCK", nullable=False)
     provider_refund_ref: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    provider_request_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    provider_response_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    provider_transaction_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     amount_vnd: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(

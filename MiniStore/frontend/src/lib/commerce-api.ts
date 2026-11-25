@@ -10,7 +10,9 @@
  */
 
 export const COMMERCE_API_BASE =
-  process.env.NEXT_PUBLIC_COMMERCE_API_BASE_URL || "http://localhost:8100";
+  process.env.NEXT_PUBLIC_COMMERCE_API_BASE_URL !== undefined
+    ? process.env.NEXT_PUBLIC_COMMERCE_API_BASE_URL
+    : "http://localhost:8100";
 
 const CUSTOMER_TOKEN_STORAGE_KEY = "finshop_customer_token_v2";
 const MERCHANT_TOKEN_STORAGE_KEY = "finshop_merchant_token_v2";
@@ -77,13 +79,22 @@ export interface CustomerIdentityDTO {
   is_test_identity: boolean;
 }
 
+export interface PaymentMethodDTO {
+  id: string;
+  label_vi: string;
+  available: boolean;
+  is_mock?: boolean;
+  supports_redirect?: boolean;
+  refund_enabled?: boolean;
+}
+
 export interface StoreBootstrapDTO {
   brand: string;
   source_mode: string;
   merchant: { id: string; name: string; description: string };
   commerce_session: { id: string; world_epoch: number };
   categories: string[];
-  payment_methods: Array<{ id: string; label_vi: string; available: boolean }>;
+  payment_methods: PaymentMethodDTO[];
 }
 
 export interface CartLineDTO {
@@ -118,7 +129,16 @@ export interface PaymentDTO {
   order_id: string;
   merchant_id: string;
   provider: string;
+  provider_environment: string;
   provider_ref: string;
+  provider_txn_no: string | null;
+  provider_txn_date: string | null;
+  provider_response_code: string | null;
+  provider_transaction_status: string | null;
+  observation_source: string;
+  signature_verified: boolean;
+  last_observed_at: string | null;
+  redirect_url: string | null;
   correlation_id: string;
   amount_vnd: number;
   refunded_amount_vnd: number;
@@ -128,6 +148,23 @@ export interface PaymentDTO {
   reconciliation_required: boolean;
   reconciliation_note: string | null;
   confirmed_at: string | null;
+  created_at: string;
+}
+
+export interface PaymentQueryAttemptDTO {
+  id: string;
+  payment_id: string;
+  order_id: string;
+  provider: string;
+  request_id: string;
+  command: string;
+  http_status: number | null;
+  provider_response_code: string | null;
+  provider_transaction_status: string | null;
+  signature_verified: boolean;
+  mapped_payment_status: string | null;
+  observation_provenance: string;
+  error_message: string | null;
   created_at: string;
 }
 

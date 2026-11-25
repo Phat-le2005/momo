@@ -63,6 +63,7 @@ export default function MerchantCenterPage() {
   const [orders, setOrders] = useState<OrderDTO[]>([]);
   const [orderSearch, setOrderSearch] = useState("");
   const [payments, setPayments] = useState<PaymentDTO[]>([]);
+  const [providerFilter, setProviderFilter] = useState<string>("ALL");
   const [refunds, setRefunds] = useState<RefundRequestDTO[]>([]);
   const [complaints, setComplaints] = useState<ComplaintDTO[]>([]);
   const [vouchers, setVouchers] = useState<VoucherDTO[]>([]);
@@ -637,7 +638,23 @@ export default function MerchantCenterPage() {
 
           {tab === "payments" && (
             <div className="space-y-3">
-              <div className="flex justify-end">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex gap-1.5">
+                  {(["ALL", "LOCAL_MOCK", "VNPAY_SANDBOX"] as const).map((prov) => (
+                    <button
+                      key={prov}
+                      type="button"
+                      onClick={() => setProviderFilter(prov)}
+                      className={`rounded-xl px-3 py-1.5 text-xs font-bold ${
+                        providerFilter === prov
+                          ? "bg-[#fe2c55] text-white"
+                          : "border border-slate-300 bg-white text-slate-700"
+                      }`}
+                    >
+                      {prov === "ALL" ? "Tất cả cổng" : prov}
+                    </button>
+                  ))}
+                </div>
                 <button
                   type="button"
                   onClick={() =>
@@ -659,33 +676,78 @@ export default function MerchantCenterPage() {
                 <table className="w-full text-left text-xs">
                   <thead className="border-b border-slate-200 bg-slate-50 text-slate-600">
                     <tr>
-                      <th className="p-3">Mã GD</th>
-                      <th className="p-3">Số tiền</th>
-                      <th className="p-3">Đã hoàn</th>
-                      <th className="p-3">Trạng thái</th>
-                      <th className="p-3">Đồng bộ / Đối soát</th>
+                      <th className="p-3">Cổng / Môi trường</th>
+                      <th className="p-3">Mã GD / TxnNo</th>
+                      <th className="p-3">Số tiền / Đã hoàn</th>
+                      <th className="p-3">Trạng thái & Nguồn</th>
+                      <th className="p-3">Đồng bộ / Thao tác</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {payments.map((p) => (
-                      <tr key={p.id}>
-                        <td className="p-3 font-mono">{p.provider_ref}</td>
-                        <td className="p-3 font-bold">{formatVnd(p.amount_vnd)}</td>
-                        <td className="p-3">{formatVnd(p.refunded_amount_vnd)}</td>
-                        <td className="p-3">{paymentStatusLabelVi(p.status)}</td>
-                        <td className="p-3">
-                          {p.reconciliation_required ? (
-                            <span className="rounded-full bg-amber-100 px-2 py-0.5 font-bold text-amber-900">
-                              Cần đối soát
-                            </span>
-                          ) : p.is_synced_to_order ? (
-                            "Đã đồng bộ"
-                          ) : (
-                            "Chưa đồng bộ"
-                          )}
-                        </td>
-                      </tr>
-                    ))}
+                    {payments
+                      .filter((p) => providerFilter === "ALL" || p.provider === providerFilter)
+                      .map((p) => (
+                        <tr key={p.id}>
+                          <td className="p-3">
+                            <span className="font-bold">{p.provider}</span>
+                            <p className="text-[10px] text-slate-500">{p.provider_environment}</p>
+                          </td>
+                          <td className="p-3 font-mono text-[11px]">
+                            <p>{p.provider_ref}</p>
+                            {p.provider_txn_no && (
+                              <p className="text-[10px] text-slate-500">
+                                TxnNo: {p.provider_txn_no}
+                              </p>
+                            )}
+                          </td>
+                          <td className="p-3">
+                            <p className="font-bold">{formatVnd(p.amount_vnd)}</p>
+                            {p.refunded_amount_vnd > 0 && (
+                              <p className="text-[10px] text-amber-800">
+                                Hoàn: {formatVnd(p.refunded_amount_vnd)}
+                              </p>
+                            )}
+                          </td>
+                          <td className="p-3">
+                            <p className="font-semibold">{paymentStatusLabelVi(p.status)}</p>
+                            <p className="text-[10px] text-slate-500">
+                              {p.observation_source} ·{" "}
+                              {p.signature_verified ? "Chữ ký hợp lệ" : "Chưa xác thực chữ ký"}
+                            </p>
+                          </td>
+                          <td className="p-3 space-y-1">
+                            <div>
+                              {p.reconciliation_required ? (
+                                <span className="rounded-full bg-amber-100 px-2 py-0.5 font-bold text-amber-900">
+                                  Cần đối soát
+                                </span>
+                              ) : p.is_synced_to_order ? (
+                                "Đã đồng bộ"
+                              ) : (
+                                "Chưa đồng bộ"
+                              )}
+                            </div>
+                            {p.provider === "VNPAY_SANDBOX" && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void runAction(
+                                    () =>
+                                      commerceFetch(`/api/v1/merchant/payments/${p.id}/querydr`, {
+                                        method: "POST",
+                                        merchantToken,
+                                      }),
+                                    `Đã gửi truy vấn QueryDr cho ${p.provider_ref}`,
+                                  )
+                                }
+                                className="rounded-lg border border-blue-300 bg-blue-50 px-2 py-1 text-[10px] font-bold text-blue-800 hover:bg-blue-100"
+                              >
+                                Truy vấn QueryDr
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
                   </tbody>
                 </table>
               </div>

@@ -9,6 +9,7 @@ import {
   type CustomerIdentityDTO,
   type OrderDTO,
   type PaymentDTO,
+  type PaymentMethodDTO,
   commerceFetch,
   ensureCustomerBootstrap,
 } from "@/lib/commerce-api";
@@ -27,6 +28,8 @@ function CheckoutContent() {
   const [shippingAddress, setShippingAddress] = useState("");
   const [customerNote, setCustomerNote] = useState("");
   const [voucherCode, setVoucherCode] = useState("");
+  const [paymentMethods, setPaymentMethods] = useState<PaymentMethodDTO[]>([]);
+  const [paymentMethod, setPaymentMethod] = useState<string>("LOCAL_MOCK");
   const [submitting, setSubmitting] = useState(false);
   const [paying, setPaying] = useState(false);
   const [createdOrder, setCreatedOrder] = useState<OrderDTO | null>(null);
@@ -34,12 +37,23 @@ function CheckoutContent() {
   const [error, setError] = useState<string | null>(null);
   const [payNotice, setPayNotice] = useState<string | null>(null);
 
-  // Stable idempotency key per checkout form attempt prevents duplicate orders on double-click
+  // Persisted idempotency key in sessionStorage survives page refresh / network drop (Section 5.4)
   const idempKeyRef = useRef<string>("");
+  const idempStorageKey = `finshop_checkout_idemp_${directVariantId || "cart"}_${directQty}`;
 
   function getOrCreateIdempKey(): string {
     if (!idempKeyRef.current) {
-      idempKeyRef.current = `IDEMP-WEB-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const saved =
+        typeof window !== "undefined" ? window.sessionStorage.getItem(idempStorageKey) : null;
+      if (saved) {
+        idempKeyRef.current = saved;
+      } else {
+        const fresh = `IDEMP-WEB-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        idempKeyRef.current = fresh;
+        if (typeof window !== "undefined") {
+          window.sessionStorage.setItem(idempStorageKey, fresh);
+        }
+      }
     }
     return idempKeyRef.current;
   }
@@ -48,8 +62,9 @@ function CheckoutContent() {
     let mounted = true;
     async function init() {
       try {
-        const { activeCustomer } = await ensureCustomerBootstrap();
+        const { bootstrap, activeCustomer } = await ensureCustomerBootstrap();
         if (!mounted) return;
+        setPaymentMethods(bootstrap.payment_methods || []);
         setCustomer(activeCustomer);
         setRecipientName(activeCustomer.display_name);
         setRecipientPhone(activeCustomer.phone || "0901234567");
@@ -91,7 +106,7 @@ function CheckoutContent() {
         shipping_address: shippingAddress,
         customer_note: customerNote,
         voucher_code: voucherCode.trim() || null,
-        payment_method: "LOCAL_MOCK",
+        payment_method: paymentMethod,
       };
       if (directVariantId) {
         body.direct_items = [{ variant_id: directVariantId, quantity: Math.max(1, directQty) }];
@@ -108,8 +123,15 @@ function CheckoutContent() {
         headers: { "X-Idempotency-Key": getOrCreateIdempKey() },
         body: JSON.stringify(body),
       });
+      if (typeof window !== "undefined") {
+        window.sessionStorage.removeItem(idempStorageKey);
+      }
+      idempKeyRef.current = "";
       setCreatedOrder(res.order);
       setCreatedPayment(res.payment);
+      if (res.payment.provider === "VNPAY_SANDBOX" && res.payment.redirect_url) {
+        window.location.assign(res.payment.redirect_url);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Không thể tạo đơn hàng");
     } finally {
@@ -203,7 +225,30 @@ function CheckoutContent() {
             </div>
           )}
 
-          {createdPayment.status !== "SUCCEEDED" && createdPayment.status !== "FAILED" && (
+          {createdPayment.provider === "VNPAY_SANDBOX" &&
+            createdPayment.redirect_url &&
+            createdPayment.status !== "SUCCEEDED" &&
+            createdPayment.status !== "FAILED" && (
+              <div className="rounded-2xl border border-blue-200 bg-blue-50/70 p-4">
+                <p className="text-xs font-extrabold text-blue-900">
+                  Cổng Thanh Toán VNPAY Sandbox (Môi trường thử nghiệm chính thức)
+                </p>
+                <p className="mt-1 text-[11px] text-blue-800">
+                  Trạng thái đơn sẽ được xác nhận tự động sau khi VNPAY gửi IPN có chữ ký hợp lệ về
+                  hệ thống.
+                </p>
+                <a
+                  href={createdPayment.redirect_url}
+                  className="mt-3 inline-block rounded-xl bg-blue-700 px-4 py-2 text-xs font-extrabold text-white hover:bg-blue-800"
+                >
+                  Chuyển tới cổng VNPAY Sandbox →
+                </a>
+              </div>
+            )}
+
+          {createdPayment.provider === "LOCAL_MOCK" &&
+            createdPayment.status !== "SUCCEEDED" &&
+            createdPayment.status !== "FAILED" && (
             <div className="rounded-2xl border border-amber-200 bg-amber-50/70 p-4">
               <p className="text-xs font-extrabold text-amber-900">
                 Cổng Thanh Toán Thử Nghiệm (LOCAL_MOCK — Không phải tiền thật hay VNPAY)
@@ -306,37 +351,64 @@ function CheckoutContent() {
             <div className="border-t border-slate-100 pt-4">
               <h2 className="text-sm font-extrabold text-slate-900">Phương thức thanh toán</h2>
               <div className="mt-2.5 space-y-2">
-                <label className="flex cursor-pointer items-center justify-between rounded-xl border-2 border-[#fe2c55] bg-rose-50/50 p-3">
-                  <div className="flex items-center gap-2.5">
-                    <input type="radio" name="pm" defaultChecked readOnly />
-                    <div>
-                      <p className="text-xs font-bold text-slate-900">
-                        Thanh toán thử nghiệm nội bộ (LOCAL_MOCK)
-                      </p>
-                      <p className="text-[11px] text-slate-600">
-                        Hỗ trợ mô phỏng SUCCEEDED / PENDING / FAILED / UNKNOWN an toàn
-                      </p>
-                    </div>
-                  </div>
-                  <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-800">
-                    Khả dụng
-                  </span>
-                </label>
-
-                <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 p-3 opacity-60">
-                  <div className="flex items-center gap-2.5">
-                    <input type="radio" name="pm" disabled />
-                    <div>
-                      <p className="text-xs font-bold text-slate-700">VNPAY Sandbox</p>
-                      <p className="text-[11px] text-slate-500">
-                        Chưa khả dụng ở Prompt 10 — sẽ tích hợp chính thức ở Prompt 11
-                      </p>
-                    </div>
-                  </div>
-                  <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] font-bold text-slate-600">
-                    Sắp ra mắt
-                  </span>
-                </div>
+                {(paymentMethods.length > 0
+                  ? paymentMethods
+                  : [
+                      {
+                        id: "LOCAL_MOCK",
+                        label_vi: "Thanh toán thử nghiệm nội bộ (LOCAL_MOCK — mô phỏng)",
+                        available: true,
+                      },
+                      {
+                        id: "VNPAY_SANDBOX",
+                        label_vi: "VNPAY Sandbox (Chưa cấu hình khóa Sandbox — tạm thời chưa khả dụng)",
+                        available: false,
+                      },
+                    ]
+                ).map((pm) => {
+                  const selected = paymentMethod === pm.id;
+                  return (
+                    <label
+                      key={pm.id}
+                      className={`flex items-center justify-between rounded-xl border p-3 transition ${
+                        !pm.available
+                          ? "cursor-not-allowed border-slate-200 bg-slate-50 opacity-60"
+                          : selected
+                            ? "cursor-pointer border-2 border-[#fe2c55] bg-rose-50/50"
+                            : "cursor-pointer border-slate-200 bg-white hover:border-slate-400"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <input
+                          type="radio"
+                          name="pm"
+                          disabled={!pm.available}
+                          checked={selected}
+                          onChange={() => pm.available && setPaymentMethod(pm.id)}
+                        />
+                        <div>
+                          <p className="text-xs font-bold text-slate-900">{pm.label_vi}</p>
+                          <p className="text-[11px] text-slate-500">
+                            {pm.id === "LOCAL_MOCK"
+                              ? "Mô phỏng SUCCEEDED / PENDING / FAILED / UNKNOWN nội bộ"
+                              : pm.available
+                                ? "Chuyển hướng tới cổng thử nghiệm VNPAY Sandbox (API 2.1.0)"
+                                : "Cần cấu hình COMMERCE_VNPAY_TMN_CODE & HASH_SECRET ở backend"}
+                          </p>
+                        </div>
+                      </div>
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                          pm.available
+                            ? "bg-emerald-100 text-emerald-800"
+                            : "bg-slate-200 text-slate-600"
+                        }`}
+                      >
+                        {pm.available ? "Khả dụng" : "Chưa cấu hình"}
+                      </span>
+                    </label>
+                  );
+                })}
               </div>
             </div>
           </div>

@@ -44,6 +44,7 @@ def clean_commerce_db() -> Iterator[None]:
                 "service_credentials, customers, products, product_variants, "
                 "inventories, inventory_reservations, carts, cart_items, vouchers, "
                 "voucher_redemptions, orders, order_items, payments, provider_notifications, "
+                "payment_query_attempts, reconciliation_records, "
                 "refund_requests, refund_transactions, live_sessions, live_products, "
                 "live_comments, complaints, commerce_events, event_outbox CASCADE"
             )

@@ -17,18 +17,27 @@ import threading
 from app.core.config import get_settings
 from app.db.session import get_sessionmaker
 from app.services.events import dispatch_pending_outbox_events
-from app.services.sync import expire_stale_reservations, sync_confirmed_payments_to_orders
+from app.services.sync import (
+    expire_stale_reservations,
+    reconcile_pending_vnpay_payments,
+    sync_confirmed_payments_to_orders,
+)
 
 logger = logging.getLogger("finshop.commerce.worker")
 
 
 def run_business_tick() -> dict[str, int]:
-    """Execute one bounded iteration of order sync and reservation expiry."""
+    """Execute one bounded iteration of VNPAY QueryDr, order sync, and reservation expiry."""
     maker = get_sessionmaker()
     with maker() as db:
+        queried = reconcile_pending_vnpay_payments(db)
         synced = sync_confirmed_payments_to_orders(db)
         expired = expire_stale_reservations(db)
-    return {"synced_orders": synced, "expired_reservations": expired}
+    return {
+        "vnpay_queried": queried,
+        "synced_orders": synced,
+        "expired_reservations": expired,
+    }
 
 
 def run_outbox_tick() -> int:

@@ -1,32 +1,29 @@
-"""Hardened background business processes (Prompt 10.1):
-1. Asynchronous Order Synchronization after `Payment(SUCCEEDED)` (separate from payment capture!).
+"""Hardened background business processes (Prompt 11):
+1. Asynchronous Order Synchronization after `Payment(SUCCEEDED)` (with exact OrderItem vs
+   InventoryReservation quantity validation and safe pre-sync refund reservation release).
 2. Expired `InventoryReservation` release & cancellation of unpaid expired orders.
-
-Safety Invariants:
-- NEVER confirms or fulfills an order whose payment is already `REFUNDED`.
-- NEVER resurrects a `CANCELLED` order or deducts already-released inventory on late payment;
-  instead marks `reconciliation_required=True` and emits `PAYMENT_RECONCILIATION_REQUIRED`.
-- Validates `Inventory.reserved_qty` and `on_hand_qty` strictly without silent clamping.
-- Moves `LiveProduct.flash_sale_reserved_qty -> flash_sale_sold_qty` upon order confirmation.
-- Marks `RECONCILIATION_REQUIRED` if an order expires while payment status is `UNKNOWN`.
+3. Bounded VNPAY Sandbox QueryDr background reconciliation for pending/unknown payments.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, selectinload
 
+from app.core.config import get_settings
 from app.models.entities import (
     Inventory,
     InventoryReservation,
     LiveProduct,
     Order,
     Payment,
+    PaymentQueryAttempt,
 )
 from app.models.enums import (
     OrderStatus,
+    PaymentProvider,
     PaymentStatus,
     ReconciliationStatus,
     ReservationStatus,
@@ -64,7 +61,10 @@ def sync_confirmed_payments_to_orders(db: Session, *, limit: int = 25) -> int:
 
         # Canonical lock order: Order -> Payment
         order = db.scalar(
-            select(Order).where(Order.id == pay_ref.order_id).with_for_update(skip_locked=True)
+            select(Order)
+            .options(selectinload(Order.items))
+            .where(Order.id == pay_ref.order_id)
+            .with_for_update(skip_locked=True)
         )
         if order is None:
             continue
@@ -74,11 +74,20 @@ def sync_confirmed_payments_to_orders(db: Session, *, limit: int = 25) -> int:
         if pay is None or pay.is_synced_to_order:
             continue
 
-        # Case 1: Payment was already fully REFUNDED before order sync -> NEVER confirm!
+        # Case 1 (Section 5.3): Payment fully REFUNDED before sync -> NEVER confirm or fulfill!
+        # Release eligible ACTIVE reservations & voucher capacity exactly once.
         if pay.status == PaymentStatus.REFUNDED.value:
+            released = 0
+            if order.status == OrderStatus.PENDING_PAYMENT.value:
+                released = release_order_reservations_and_voucher(
+                    db, order=order, reason_status=ReservationStatus.RELEASED
+                )
+                order.status = OrderStatus.CANCELLED.value
+                order.version += 1
+
             reason = (
                 "Payment was fully REFUNDED before order synchronization completed. "
-                "Order was NOT confirmed or fulfilled; manual reconciliation required."
+                f"Order was NOT confirmed/fulfilled; released {released} active reservation(s)."
             )
             pay.is_synced_to_order = True
             pay.reconciliation_required = True
@@ -100,6 +109,7 @@ def sync_confirmed_payments_to_orders(db: Session, *, limit: int = 25) -> int:
                 payload={
                     "payment_status": pay.status,
                     "order_status": order.status,
+                    "released_reservations": released,
                     "reason": reason,
                 },
             )
@@ -138,7 +148,7 @@ def sync_confirmed_payments_to_orders(db: Session, *, limit: int = 25) -> int:
             synced += 1
             continue
 
-        # Case 3: Normal confirmation from PENDING_PAYMENT with ACTIVE reservations
+        # Case 3 (Section 5.1): Normal confirmation from PENDING_PAYMENT with FULL reservation match
         if order.status == OrderStatus.PENDING_PAYMENT.value:
             reservations = list(
                 db.scalars(
@@ -151,9 +161,18 @@ def sync_confirmed_payments_to_orders(db: Session, *, limit: int = 25) -> int:
                     .with_for_update()
                 ).all()
             )
-            if not reservations:
+            # Verify ALL order item quantities are covered by ACTIVE reservations
+            expected_qty: dict[str, int] = {}
+            for oi in order.items:
+                expected_qty[oi.variant_id] = expected_qty.get(oi.variant_id, 0) + oi.quantity
+            reserved_qty: dict[str, int] = {}
+            for r in reservations:
+                reserved_qty[r.variant_id] = reserved_qty.get(r.variant_id, 0) + r.quantity
+
+            if not reservations or expected_qty != reserved_qty:
                 reason = (
-                    "No ACTIVE inventory reservations remain for PENDING_PAYMENT order at sync. "
+                    "ACTIVE inventory reservations do not match OrderItems at sync "
+                    f"(expected={expected_qty}, reserved={reserved_qty}). "
                     "Order NOT confirmed; manual reconciliation required."
                 )
                 pay.is_synced_to_order = True
@@ -341,3 +360,79 @@ def expire_stale_reservations(db: Session, *, limit: int = 25) -> int:
     if processed > 0:
         db.commit()
     return processed
+
+
+def reconcile_pending_vnpay_payments(
+    db: Session,
+    *,
+    limit: int = 10,
+    http_client: object | None = None,
+) -> int:
+    """Bounded background QueryDr reconciliation for pending/unknown VNPAY_SANDBOX payments.
+
+    Skips silently when VNPAY is not configured; never queries terminal payments; enforces
+    `vnpay_querydr_max_attempts` and exponential backoff between attempts.
+    """
+    settings = get_settings()
+    if not settings.is_vnpay_configured:
+        return 0
+
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(seconds=settings.vnpay_querydr_min_age_seconds)
+    max_attempts = settings.vnpay_querydr_max_attempts
+
+    candidates = list(
+        db.scalars(
+            select(Payment)
+            .where(
+                Payment.provider == PaymentProvider.VNPAY_SANDBOX.value,
+                Payment.status.in_(
+                    [
+                        PaymentStatus.INITIATED.value,
+                        PaymentStatus.PENDING.value,
+                        PaymentStatus.UNKNOWN.value,
+                    ]
+                ),
+                Payment.created_at <= cutoff,
+            )
+            .order_by(Payment.created_at.asc())
+            .limit(limit)
+        ).all()
+    )
+    if not candidates:
+        return 0
+
+    from app.payments.vnpay.adapter import VNPaySandboxAdapter
+    from app.payments.vnpay.client import VNPayHttpClient
+
+    client_obj = http_client if isinstance(http_client, VNPayHttpClient) else None
+    adapter = VNPaySandboxAdapter(http_client=client_obj)
+    queried = 0
+
+    for pay in candidates:
+        attempt_count = int(
+            db.scalar(
+                select(func.count(PaymentQueryAttempt.id)).where(
+                    PaymentQueryAttempt.payment_id == pay.id
+                )
+            )
+            or 0
+        )
+        if attempt_count >= max_attempts:
+            continue
+
+        last_attempt = db.scalar(
+            select(PaymentQueryAttempt)
+            .where(PaymentQueryAttempt.payment_id == pay.id)
+            .order_by(PaymentQueryAttempt.created_at.desc())
+            .limit(1)
+        )
+        if last_attempt is not None:
+            min_backoff_s = min(300, 15 * (2 ** min(attempt_count, 4)))
+            if (now - last_attempt.created_at).total_seconds() < min_backoff_s:
+                continue
+
+        adapter.query_payment_status(db, payment_id=pay.id)
+        queried += 1
+
+    return queried

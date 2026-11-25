@@ -20,15 +20,17 @@ from app.models.entities import (
     CommerceEvent,
     EventOutbox,
     Inventory,
+    InventoryReservation,
     LiveSession,
     Order,
     Payment,
+    PaymentQueryAttempt,
     ProductVariant,
     RefundTransaction,
     VoucherRedemption,
 )
 from app.models.enums import OrderStatus, OutboxStatus, PaymentStatus, ReconciliationStatus
-from app.payments.adapter import MockPaymentAdapter
+from app.payments.adapter import build_payment_observation
 
 router = APIRouter(prefix="/service", tags=["service-read-connectors"])
 
@@ -74,13 +76,20 @@ def service_get_payment_observation(
         raise CommerceError(
             ErrorCode.NOT_FOUND, "Payment not found in service scope", status_code=404
         )
-    obs = MockPaymentAdapter().get_authoritative_observation(db, payment_id=payment.id)
+    obs = build_payment_observation(db, payment=payment)
     return {
         "payment_id": obs.payment_id,
         "order_id": obs.order_id,
         "merchant_id": obs.merchant_id,
         "provider": obs.provider,
+        "provider_environment": obs.provider_environment,
         "provider_ref": obs.provider_ref,
+        "provider_txn_no": obs.provider_txn_no,
+        "provider_txn_date": obs.provider_txn_date,
+        "provider_response_code": obs.provider_response_code,
+        "provider_transaction_status": obs.provider_transaction_status,
+        "observation_source": obs.observation_source,
+        "signature_verified": obs.signature_verified,
         "status": obs.status,
         "amount_vnd": obs.amount_vnd,
         "refunded_amount_vnd": obs.refunded_amount_vnd,
@@ -91,9 +100,80 @@ def service_get_payment_observation(
         "reconciliation_required": obs.reconciliation_required,
         "reconciliation_note": obs.reconciliation_note,
         "confirmed_at": obs.confirmed_at.isoformat() if obs.confirmed_at else None,
+        "last_observed_at": obs.last_observed_at.isoformat() if obs.last_observed_at else None,
         "observed_at": obs.observed_at.isoformat(),
         "authoritative_provenance": obs.authoritative_provenance,
     }
+
+
+@router.get("/payments/{payment_id}/queries")
+def service_get_payment_query_history(
+    payment_id: str,
+    principal: ServicePrincipal = Depends(get_service_principal),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    rows = list(
+        db.scalars(
+            select(PaymentQueryAttempt)
+            .where(
+                PaymentQueryAttempt.payment_id == payment_id,
+                PaymentQueryAttempt.merchant_id == principal.merchant_id,
+            )
+            .order_by(PaymentQueryAttempt.created_at.desc())
+            .limit(50)
+        ).all()
+    )
+    return [
+        {
+            "id": r.id,
+            "payment_id": r.payment_id,
+            "order_id": r.order_id,
+            "provider": r.provider,
+            "request_id": r.request_id,
+            "command": r.command,
+            "http_status": r.http_status,
+            "provider_response_code": r.provider_response_code,
+            "provider_transaction_status": r.provider_transaction_status,
+            "signature_verified": r.signature_verified,
+            "mapped_payment_status": r.mapped_payment_status,
+            "observation_provenance": r.observation_provenance,
+            "error_message": r.error_message,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]
+
+
+@router.get("/orders/{order_id}/reservations")
+def service_get_order_reservations(
+    order_id: str,
+    principal: ServicePrincipal = Depends(get_service_principal),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    rows = list(
+        db.scalars(
+            select(InventoryReservation)
+            .where(
+                InventoryReservation.order_id == order_id,
+                InventoryReservation.merchant_id == principal.merchant_id,
+                InventoryReservation.commerce_session_id == principal.commerce_session_id,
+            )
+            .order_by(InventoryReservation.variant_id.asc())
+        ).all()
+    )
+    return [
+        {
+            "id": r.id,
+            "order_id": r.order_id,
+            "variant_id": r.variant_id,
+            "live_product_id": r.live_product_id,
+            "quantity": r.quantity,
+            "status": r.status,
+            "expires_at": r.expires_at.isoformat(),
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]
 
 
 @router.get("/payments/{payment_id}/refunds")
