@@ -85,6 +85,68 @@ class ReadToolRegistry:
         self._source_binding_id = source_binding_id
         self._commerce_connector = commerce_connector
 
+    def get_tool_capabilities(self) -> list[dict[str, Any]]:
+        """Machine-readable capability metadata for dynamic Agent tool selection (Prompt 14)."""
+        src = "MINI_STORE_COMMERCE_HTTP" if self._source_system == "COMMERCE_HTTP" else "SIMULATOR"
+        return [
+            {
+                "tool_name": "get_order",
+                "purpose": "Inspect authoritative order state, totals, and reconciliation flags",
+                "source_system": src,
+                "supported_entities": ["order"],
+                "read_only": True,
+                "required_permission": "READ_ORDERS",
+            },
+            {
+                "tool_name": "get_payment_record",
+                "purpose": "Inspect payment status, provider provenance, and sync flag",
+                "source_system": src,
+                "supported_entities": ["payment"],
+                "read_only": True,
+                "required_permission": "READ_PAYMENTS",
+            },
+            {
+                "tool_name": "find_payment_candidates",
+                "purpose": "Search payments linked to an order without cross-order mixing",
+                "source_system": src,
+                "supported_entities": ["payment", "order"],
+                "read_only": True,
+                "required_permission": "READ_PAYMENTS",
+            },
+            {
+                "tool_name": "get_refund_history",
+                "purpose": "Inspect cumulative refund transactions (SUCCEEDED/PENDING/UNKNOWN)",
+                "source_system": src,
+                "supported_entities": ["refund", "payment"],
+                "read_only": True,
+                "required_permission": "READ_REFUNDS",
+            },
+            {
+                "tool_name": "get_inventory",
+                "purpose": "Inspect merchant-shared inventory on_hand and reserved quantities",
+                "source_system": src,
+                "supported_entities": ["inventory", "variant"],
+                "read_only": True,
+                "required_permission": "READ_INVENTORY",
+            },
+            {
+                "tool_name": "get_order_events",
+                "purpose": "Inspect chronological order event timeline and sync audit trail",
+                "source_system": src,
+                "supported_entities": ["order", "event"],
+                "read_only": True,
+                "required_permission": "READ_EVENTS",
+            },
+            {
+                "tool_name": "get_policy",
+                "purpose": "Retrieve advisory versioned sandbox policies for the current incident",
+                "source_system": "POLICY_RAG",
+                "supported_entities": ["policy"],
+                "read_only": True,
+                "required_permission": "READ_POLICY",
+            },
+        ]
+
     def _resolve_commerce_connector(self) -> CommerceReadConnector | None:
         if self._commerce_connector is not None:
             return self._commerce_connector
