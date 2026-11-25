@@ -1717,12 +1717,13 @@ def run_binding_scan(
                     if claimed_ref_hint in cand_refs:
                         matched_payment = cand_p
                         break
-            if matched_payment is None and order_payments:
-                succeeded_ps = [
-                    p for p in order_payments if str(p.get("status") or "").upper() == "SUCCEEDED"
-                ]
-                matched_payment = succeeded_ps[-1] if succeeded_ps else order_payments[-1]
+            if matched_payment is None and len(order_payments) == 1:
+                matched_payment = order_payments[0]
+            elif matched_payment is None and len(order_payments) > 1 and not claimed_ref_hint:
+                # Multiple payments exist and claimed txn_ref is missing -> do NOT substitute!
+                matched_payment = None
 
+            cust_pix_contradiction = bool(img_ext.get("customer_pixel_contradiction", False))
             ocr_unavailable = ext_status in (
                 "OCR_ENGINE_UNAVAILABLE",
                 "UNREADABLE_OR_OCR_UNAVAILABLE",
@@ -1745,6 +1746,11 @@ def run_binding_scan(
                 effective_verdict = "CLAIM_CONTRADICTED"
                 effective_discrepancies.append(
                     "METADATA_PIXEL_CONTRADICTION: image metadata contradicts visible pixel OCR"
+                )
+            if cust_pix_contradiction:
+                effective_verdict = "CLAIM_CONTRADICTED"
+                effective_discrepancies.append(
+                    "CUSTOMER_PIXEL_CONTRADICTION: customer-entered fields contradict pixel OCR"
                 )
             if effective_verdict != "CLAIM_SUPPORTED":
                 claim_candidates.append(

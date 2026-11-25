@@ -6,9 +6,15 @@ import io
 import struct
 import zlib
 
+import pytest
 from PIL import Image, ImageDraw, ImageFont
 
-from app.core.ocr import extract_receipt_with_pixel_ocr, get_ocr_readiness
+from app.core.ocr import (
+    extract_receipt_with_pixel_ocr,
+    get_ocr_readiness,
+    resolve_private_receipt_dir,
+    verify_receipt_storage_writable,
+)
 
 
 def _inject_png_text_chunk(png_bytes: bytes, keyword: str, text: str) -> bytes:
@@ -107,3 +113,18 @@ def test_real_pixel_ocr_on_rendered_receipt_with_zero_metadata() -> None:
     assert res_tampered["provenance"] == "PIXEL_OCR"
     assert res_tampered["extracted_txn_ref"] == "TXN987654321"
     assert res_tampered["metadata_pixel_contradiction"] is True
+
+
+def test_private_receipt_storage_path_traversal_blocked_and_writable() -> None:
+    """Prove private receipt storage is absolute, writable, and blocks path traversal."""
+    info = verify_receipt_storage_writable()
+    assert info["writable"] is True
+    assert info["storage_dir"]
+
+    safe_dir = resolve_private_receipt_dir("MERCHANT_FINSHOP_01")
+    assert safe_dir.is_absolute()
+    assert safe_dir.exists()
+
+    for bad_mid in ("../etc", "MERCHANT/../../escape", "..\\windows", ""):
+        with pytest.raises(ValueError):
+            resolve_private_receipt_dir(bad_mid)

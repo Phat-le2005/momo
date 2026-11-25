@@ -100,18 +100,20 @@ def create_app() -> FastAPI:
 
     @app.get("/readyz", tags=["health"])
     def readyz() -> dict[str, Any]:
-        from app.core.ocr import get_ocr_readiness
+        from app.core.ocr import get_ocr_readiness, verify_receipt_storage_writable
 
         engine = get_engine()
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         ocr_info = get_ocr_readiness()
+        storage_info = verify_receipt_storage_writable()
         return {
-            "status": "ready",
+            "status": "ready" if storage_info["writable"] else "degraded",
             "database": "connected",
             "source_mode": settings.source_mode,
             "ocr_ready": bool(ocr_info["ocr_ready"]),
             "ocr": ocr_info,
+            "receipt_storage_writable": bool(storage_info["writable"]),
         }
 
     @app.get("/api/v1/health/ocr", tags=["health"])

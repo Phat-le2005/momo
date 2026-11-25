@@ -14,7 +14,10 @@ RUN apt-get update \
         tesseract-ocr-vie \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --uid 10001 appuser
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /var/lib/finshop/private_receipts \
+    && chown -R appuser:appuser /var/lib/finshop \
+    && chmod 0700 /var/lib/finshop/private_receipts
 
 COPY pyproject.toml ./
 COPY app ./app

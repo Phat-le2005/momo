@@ -1209,7 +1209,8 @@ def upload_order_receipt_claim(
     """Authenticated customer receipt upload with image decoding, extraction & CLAIM storage."""
     import base64
     import hashlib
-    from pathlib import Path
+
+    from app.core.ocr import resolve_private_receipt_dir
 
     order = db.scalar(
         select(Order).where(
@@ -1232,12 +1233,34 @@ def upload_order_receipt_claim(
     extracted_info = _extract_receipt_from_image_bytes(raw_bytes, payload.content_type)
     sha256_hex = hashlib.sha256(raw_bytes).hexdigest()
 
-    private_dir = Path(".private_receipts") / order.merchant_id
-    private_dir.mkdir(parents=True, exist_ok=True)
+    # Detect contradiction between customer-entered fields and visible PIXEL_OCR fields
+    cust_pixel_contradiction = False
+    pix_ref = extracted_info.get("extracted_txn_ref")
+    pix_amt = extracted_info.get("extracted_amount_vnd")
+    if payload.claimed_txn_ref and pix_ref:
+        if payload.claimed_txn_ref.strip().upper() != str(pix_ref).strip().upper():
+            cust_pixel_contradiction = True
+    if payload.claimed_amount_vnd is not None and pix_amt is not None:
+        if int(payload.claimed_amount_vnd) != int(pix_amt):
+            cust_pixel_contradiction = True
+    extracted_info["customer_pixel_contradiction"] = cust_pixel_contradiction
+
+    try:
+        private_dir = resolve_private_receipt_dir(order.merchant_id)
+    except ValueError as exc:
+        raise CommerceError(ErrorCode.BAD_REQUEST, str(exc), status_code=400) from exc
+
     comp_id = f"CMP-{uuid.uuid4().hex[:10].upper()}"
     ext = payload.content_type.split("/")[-1].split(";")[0].lower()
-    stored_path = private_dir / f"{comp_id}.{ext}"
-    stored_path.write_bytes(raw_bytes)
+    if ext not in ("png", "jpeg", "webp"):
+        ext = "bin"
+    stored_path = (private_dir / f"{comp_id}.{ext}").resolve()
+    try:
+        stored_path.relative_to(private_dir)
+    except ValueError as exc:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST, "PATH_TRAVERSAL_BLOCKED", status_code=400
+        ) from exc
 
     effective_ref = (
         payload.claimed_txn_ref.strip()
@@ -1263,30 +1286,37 @@ def upload_order_receipt_claim(
         evidence_kind="CLAIM",
         status=ComplaintStatus.OPEN.value,
     )
-    db.add(comp)
-    record_commerce_event(
-        db,
-        merchant_id=order.merchant_id,
-        commerce_session_id=order.commerce_session_id,
-        world_epoch=order.world_epoch,
-        event_type="PAYMENT_RECEIPT_CLAIM_SUBMITTED",
-        order_id=order.id,
-        correlation_id=order.correlation_id,
-        payload={
-            "complaint_id": comp.id,
-            "evidence_kind": "CLAIM",
-            "customer_entered": {
-                "claimed_txn_ref": payload.claimed_txn_ref,
-                "claimed_amount_vnd": payload.claimed_amount_vnd,
-                "note": payload.note.strip(),
+    stored_path.write_bytes(raw_bytes)
+    try:
+        db.add(comp)
+        record_commerce_event(
+            db,
+            merchant_id=order.merchant_id,
+            commerce_session_id=order.commerce_session_id,
+            world_epoch=order.world_epoch,
+            event_type="PAYMENT_RECEIPT_CLAIM_SUBMITTED",
+            order_id=order.id,
+            correlation_id=order.correlation_id,
+            payload={
+                "complaint_id": comp.id,
+                "evidence_kind": "CLAIM",
+                "customer_entered": {
+                    "claimed_txn_ref": payload.claimed_txn_ref,
+                    "claimed_amount_vnd": payload.claimed_amount_vnd,
+                    "note": payload.note.strip(),
+                },
+                "image_extracted": extracted_info,
+                "receipt_sha256": sha256_hex,
+                "image_dimensions": [width, height],
+                "ocr_extraction_status": extracted_info["extraction_status"],
             },
-            "image_extracted": extracted_info,
-            "receipt_sha256": sha256_hex,
-            "image_dimensions": [width, height],
-            "ocr_extraction_status": extracted_info["extraction_status"],
-        },
-    )
-    db.commit()
+        )
+        db.commit()
+    except Exception:
+        # Prevent orphaned receipt files if database commit fails
+        stored_path.unlink(missing_ok=True)
+        db.rollback()
+        raise
     return {
         "complaint_id": comp.id,
         "order_id": order.id,
@@ -1307,7 +1337,7 @@ def delete_order_receipt_claim(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Retention & deletion control: customer may delete their own uploaded receipt file."""
-    from pathlib import Path
+    from app.core.ocr import resolve_private_receipt_dir
 
     comp = db.scalar(
         select(Complaint).where(
@@ -1320,7 +1350,7 @@ def delete_order_receipt_claim(
     if comp is None:
         raise CommerceError(ErrorCode.NOT_FOUND, "Không tìm thấy khiếu nại", status_code=404)
 
-    private_dir = Path(".private_receipts") / comp.merchant_id
+    private_dir = resolve_private_receipt_dir(comp.merchant_id)
     deleted_files = 0
     if private_dir.exists():
         for p in private_dir.glob(f"{comp.id}.*"):

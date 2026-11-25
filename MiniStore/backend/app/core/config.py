@@ -81,6 +81,7 @@ class CommerceSettings(BaseSettings):
     outbox_lease_seconds: int = Field(default=30, ge=5, le=300)
     outbox_max_attempts: int = Field(default=10, ge=1, le=50)
     max_request_body_bytes: int = Field(default=1_048_576, ge=1024, le=10_485_760)
+    receipt_storage_dir: str = ""
     rate_limit_checkout_per_minute: int = Field(default=120, ge=1, le=10_000)
     rate_limit_auth_per_minute: int = Field(default=60, ge=1, le=10_000)
     rate_limit_payment_per_minute: int = Field(default=120, ge=1, le=10_000)

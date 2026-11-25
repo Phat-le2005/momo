@@ -12,15 +12,59 @@ Strict Provenance Invariants:
 from __future__ import annotations
 
 import io
+import os
 import re
 import shutil
 import struct
+import tempfile
 import zlib
+from pathlib import Path
 from typing import Any
 
 MAX_RECEIPT_BYTES = 5 * 1024 * 1024
 MAX_RECEIPT_DIM = 8000
 MAX_RECEIPT_PIXELS = 25_000_000
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def get_receipt_storage_root() -> Path:
+    """Return the resolved absolute path for private receipt storage (never relative)."""
+    from app.core.config import get_settings
+
+    configured = get_settings().receipt_storage_dir.strip()
+    if configured:
+        root = Path(configured).expanduser().resolve()
+    else:
+        root = (Path(tempfile.gettempdir()) / "finshop_private_receipts").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def resolve_private_receipt_dir(merchant_id: str) -> Path:
+    """Resolve a merchant's private receipt directory with strict path-traversal protection."""
+    clean_mid = merchant_id.strip()
+    if not _SAFE_ID_RE.match(clean_mid):
+        raise ValueError(f"INVALID_MERCHANT_PATH_SEGMENT: '{merchant_id}'")
+    root = get_receipt_storage_root()
+    target = (root / clean_mid).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("PATH_TRAVERSAL_BLOCKED: receipt path escapes storage root") from exc
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def verify_receipt_storage_writable() -> dict[str, Any]:
+    """Verify the configured private receipt storage directory is absolute and writable."""
+    try:
+        root = get_receipt_storage_root()
+        probe = root / f".write_probe_{os.getpid()}"
+        probe.write_bytes(b"ok")
+        probe.unlink(missing_ok=True)
+        return {"writable": True, "storage_dir": str(root)}
+    except Exception as exc:  # noqa: BLE001
+        return {"writable": False, "storage_dir": "", "error": f"{type(exc).__name__}: {exc}"}
 
 
 def parse_receipt_fields(raw_text: str) -> dict[str, Any]:
