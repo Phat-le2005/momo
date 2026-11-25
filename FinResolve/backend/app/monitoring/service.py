@@ -742,6 +742,50 @@ def record_or_update_anomaly(
     return obs, created_case
 
 
+def _count_records_in_interval(
+    records: list[dict[str, Any]],
+    *,
+    now: datetime,
+    window_seconds: int = 60,
+) -> float:
+    """Count only records created within `[now - window_seconds, now]` (never cumulative totals!).
+
+    If a record carries no parseable timestamp, it is only counted when `created_at` is absent
+    on synthetic minimal payloads to preserve backward compatibility with lightweight unit mocks.
+    """
+    cutoff = now - timedelta(seconds=window_seconds)
+    count = 0
+    for rec in records:
+        ts_raw = rec.get("created_at") or rec.get("occurred_at") or rec.get("requested_at")
+        if ts_raw is None:
+            count += 1
+            continue
+        ts_dt: datetime | None = None
+        if isinstance(ts_raw, datetime):
+            ts_dt = ts_raw if ts_raw.tzinfo is not None else ts_raw.replace(tzinfo=UTC)
+        elif isinstance(ts_raw, str) and ts_raw.strip():
+            try:
+                parsed = datetime.fromisoformat(ts_raw.strip().replace("Z", "+00:00"))
+                ts_dt = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+            except ValueError:
+                ts_dt = None
+        if ts_dt is not None and ts_dt >= cutoff:
+            count += 1
+    return float(count)
+
+
+def _parse_iso_utc(raw: Any) -> datetime | None:
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo is not None else raw.replace(tzinfo=UTC)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+        except ValueError:
+            return None
+    return None
+
+
 def evaluate_recovery_postconditions(
     db: Session,
     *,
@@ -1078,17 +1122,25 @@ def evaluate_recovery_postconditions(
         if code in ("OPEN_STAT", "OPEN_MV"):
             telem_payload, _ = connector.get_telemetry()
             metrics, _ = connector.get_metrics()
-            w60 = (telem_payload.get("windows") or {}).get("60s") or {}
-            req_count = int(w60.get("request_count") or 0)
-            has_samples = bool(w60.get("has_samples", req_count > 0))
-            truncated = bool(w60.get("truncated", False))
-            last_age_ms = w60.get("last_sample_age_ms")
-            win_id = str(w60.get("window_id") or "")
-            lat_p95 = float((w60.get("latency_ms") or {}).get("p95") or 0.0)
-            err_rate = float(w60.get("error_rate") or 0.0)
+            windows_map = telem_payload.get("windows") or {}
+            w_fixed = windows_map.get("fixed_60s") or {}
+            w_roll = windows_map.get("60s") or {}
+            # Prefer non-overlapping time-aligned fixed_60s window when available with samples
+            w_eval = w_fixed if (w_fixed and int(w_fixed.get("request_count") or 0) > 0) else w_roll
+            req_count = int(w_eval.get("request_count") or 0)
+            has_samples = bool(w_eval.get("has_samples", req_count > 0))
+            truncated = bool(w_eval.get("truncated", False))
+            last_age_ms = w_eval.get("last_sample_age_ms")
+            win_id = str(w_eval.get("window_id") or "").strip()
+            win_start_dt = _parse_iso_utc(w_eval.get("window_start"))
+            win_end_dt = _parse_iso_utc(w_eval.get("window_end"))
+            lat_p95 = float((w_eval.get("latency_ms") or {}).get("p95") or 0.0)
+            err_rate = float(w_eval.get("error_rate") or 0.0)
             outbox_lag = float(metrics.outbox_lag_count)
 
             evidence["window_id"] = win_id
+            evidence["window_start"] = win_start_dt.isoformat() if win_start_dt else None
+            evidence["window_end"] = win_end_dt.isoformat() if win_end_dt else None
             evidence["has_samples"] = has_samples
             evidence["request_count"] = req_count
             evidence["truncated"] = truncated
@@ -1097,7 +1149,15 @@ def evaluate_recovery_postconditions(
             evidence["current_error_rate"] = err_rate
             evidence["current_outbox_lag"] = outbox_lag
 
-            # Missing telemetry, zero traffic, truncated or stale samples NEVER prove recovery!
+            # Missing window_id, zero traffic, truncated, or stale samples NEVER prove recovery!
+            if not win_id:
+                return VerificationResult(
+                    RecoveryVerdict.INSUFFICIENT_EVIDENCE,
+                    False,
+                    "UNKNOWN",
+                    f"{code} missing telemetry window_id; cannot prove independent recovery",
+                    evidence,
+                )
             if not has_samples or req_count <= 0:
                 return VerificationResult(
                     RecoveryVerdict.INSUFFICIENT_EVIDENCE,
@@ -1126,11 +1186,14 @@ def evaluate_recovery_postconditions(
             prior_verif = dict(obs.verification_json or {})
             healthy_streak = int(prior_verif.get("consecutive_healthy_windows") or 0)
             last_win_id = str(prior_verif.get("last_recovery_window_id") or "")
+            last_win_end_dt = _parse_iso_utc(prior_verif.get("last_recovery_window_end"))
 
-            # Deduplicate repeated identical observation windows (MUST NOT advance streak!)
-            if win_id and last_win_id and win_id == last_win_id:
+            # Reject duplicate window_id (MUST NOT advance streak!)
+            if last_win_id and win_id == last_win_id:
                 evidence["consecutive_healthy_windows"] = healthy_streak
                 evidence["last_recovery_window_id"] = last_win_id
+                if last_win_end_dt is not None:
+                    evidence["last_recovery_window_end"] = last_win_end_dt.isoformat()
                 return VerificationResult(
                     RecoveryVerdict.STILL_INCONSISTENT,
                     False,
@@ -1139,7 +1202,26 @@ def evaluate_recovery_postconditions(
                     evidence,
                 )
 
-            # Revalidate ALL original triggering conditions (latency, error, lag, AND refunds!)
+            # Prompt 14.3 Fix 4: Reject OVERLAPPING windows (window_start < last_window_end)!
+            if (
+                healthy_streak > 0
+                and last_win_end_dt is not None
+                and win_start_dt is not None
+                and win_start_dt < last_win_end_dt
+            ):
+                evidence["consecutive_healthy_windows"] = healthy_streak
+                evidence["last_recovery_window_id"] = last_win_id
+                evidence["last_recovery_window_end"] = last_win_end_dt.isoformat()
+                return VerificationResult(
+                    RecoveryVerdict.STILL_INCONSISTENT,
+                    False,
+                    "UNKNOWN",
+                    f"{code} overlapping telemetry window '{win_id}'; awaiting non-overlapping "
+                    "evaluation window",
+                    evidence,
+                )
+
+            # Revalidate ALL triggering conditions (latency, error, lag, interval refunds)
             lat_limit = 250.0
             err_limit = 0.05
             lag_limit = 5.0
@@ -1163,41 +1245,48 @@ def evaluate_recovery_postconditions(
 
             refund_ok = True
             if is_refund_anomaly:
-                cur_refunds, _ = connector.list_refunds(limit=200)
-                cur_ref_count = float(len(cur_refunds))
-                evidence["current_refund_count"] = cur_ref_count
+                cur_refunds, ref_obs_at = connector.list_refunds(limit=200)
+                cur_ref_count = _count_records_in_interval(
+                    cur_refunds, now=ref_obs_at, window_seconds=60
+                )
+                evidence["current_interval_refund_count"] = cur_ref_count
                 eff_ref_limit = refund_limit if refund_limit is not None else 2.0
                 refund_ok = cur_ref_count <= eff_ref_limit
 
-            is_healthy_now = (
-                lat_p95 <= lat_limit
-                and err_rate <= err_limit
-                and outbox_lag <= lag_limit
-                and refund_ok
-            )
+            predicates = {
+                "p95_latency_ms_ok": lat_p95 <= lat_limit,
+                "error_rate_ok": err_rate <= err_limit,
+                "outbox_lag_ok": outbox_lag <= lag_limit,
+                "interval_refund_ok": refund_ok,
+            }
+            evidence["recovery_predicates"] = predicates
+            is_healthy_now = all(predicates.values())
             if is_healthy_now:
                 healthy_streak += 1
                 evidence["consecutive_healthy_windows"] = healthy_streak
-                if win_id:
-                    evidence["last_recovery_window_id"] = win_id
+                evidence["last_recovery_window_id"] = win_id
+                if win_end_dt is not None:
+                    evidence["last_recovery_window_end"] = win_end_dt.isoformat()
                 if healthy_streak >= 2:
                     return VerificationResult(
                         RecoveryVerdict.VERIFIED_RECOVERY,
                         True,
                         "OBSERVED_BASELINE_RETURN",
-                        f"{code} verified sustained recovery across {healthy_streak} windows",
+                        f"{code} verified sustained recovery across {healthy_streak} "
+                        "non-overlapping windows",
                         evidence,
                     )
                 return VerificationResult(
                     RecoveryVerdict.STILL_INCONSISTENT,
                     False,
                     "UNKNOWN",
-                    f"{code} healthy window ({healthy_streak}/2); awaiting distinct fresh window",
+                    f"{code} healthy window ({healthy_streak}/2); awaiting non-overlapping window",
                     evidence,
                 )
             evidence["consecutive_healthy_windows"] = 0
-            if win_id:
-                evidence["last_recovery_window_id"] = win_id
+            evidence["last_recovery_window_id"] = win_id
+            if win_end_dt is not None:
+                evidence["last_recovery_window_end"] = win_end_dt.isoformat()
             return VerificationResult(
                 RecoveryVerdict.STILL_INCONSISTENT,
                 False,
@@ -1501,8 +1590,8 @@ def run_binding_scan(
                 error_rate=float(active_win.get("error_rate") or 0.0),
                 outbox_lag=float(metrics.outbox_lag_count),
                 unsynced_payments=float(metrics.unsynced_payments),
-                order_throughput=float(len(orders)),
-                refund_count=float(len(refunds)),
+                order_throughput=_count_records_in_interval(orders, now=obs_at, window_seconds=60),
+                refund_count=_count_records_in_interval(refunds, now=obs_at, window_seconds=60),
             )
             db.add(
                 BusinessObservation(

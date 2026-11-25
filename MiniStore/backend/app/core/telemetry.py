@@ -20,6 +20,7 @@ MAX_SAMPLES = 5000
 @dataclass(frozen=True)
 class _RequestSample:
     ts: float
+    wall_ts: float
     route_group: str
     status_code: int
     duration_ms: float
@@ -69,6 +70,7 @@ class OperationalTelemetryCollector:
             return
         sample = _RequestSample(
             ts=time.monotonic(),
+            wall_ts=time.time(),
             route_group=_normalize_route_group(path),
             status_code=status_code,
             duration_ms=max(0.0, float(duration_ms)),
@@ -140,12 +142,86 @@ class OperationalTelemetryCollector:
             "by_route_group": route_counts,
         }
 
+    def snapshot_fixed_window(self, window_seconds: int = 60) -> dict[str, Any]:
+        """Return a fixed, time-aligned, non-overlapping evaluation window bucket."""
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        now_utc = datetime.fromtimestamp(now_wall, tz=UTC)
+        bucket_start_epoch = int(now_wall // window_seconds) * window_seconds
+        bucket_end_epoch = bucket_start_epoch + window_seconds
+        win_start = datetime.fromtimestamp(bucket_start_epoch, tz=UTC)
+        win_end = datetime.fromtimestamp(bucket_end_epoch, tz=UTC)
+        window_id = f"FIXED{window_seconds}:{bucket_start_epoch}"
+
+        with self._lock:
+            total_buffered = len(self._samples)
+            rows = [s for s in self._samples if bucket_start_epoch <= s.wall_ts < bucket_end_epoch]
+
+        total = len(rows)
+        if total == 0:
+            return {
+                "window_id": window_id,
+                "window_type": "FIXED_NON_OVERLAPPING",
+                "window_seconds": window_seconds,
+                "window_start": win_start.isoformat(),
+                "window_end": win_end.isoformat(),
+                "collected_at": now_utc.isoformat(),
+                "is_complete": now_wall >= bucket_end_epoch,
+                "has_samples": False,
+                "truncated": total_buffered >= MAX_SAMPLES,
+                "last_sample_age_ms": None,
+                "request_count": 0,
+                "rps": 0.0,
+                "error_count": 0,
+                "error_rate": 0.0,
+                "status_distribution": {},
+                "latency_ms": {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0},
+                "by_route_group": {},
+            }
+
+        durations = sorted(s.duration_ms for s in rows)
+        errors = sum(1 for s in rows if s.status_code >= 500 or s.status_code == 429)
+        last_age_ms = round(max(0.0, (now_mono - rows[-1].ts) * 1000.0), 1)
+        status_dist: dict[str, int] = {}
+        route_counts: dict[str, int] = {}
+        for s in rows:
+            bucket = f"{s.status_code // 100}xx"
+            status_dist[bucket] = status_dist.get(bucket, 0) + 1
+            route_counts[s.route_group] = route_counts.get(s.route_group, 0) + 1
+
+        elapsed = max(1.0, min(float(window_seconds), now_wall - float(bucket_start_epoch)))
+        return {
+            "window_id": window_id,
+            "window_type": "FIXED_NON_OVERLAPPING",
+            "window_seconds": window_seconds,
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "collected_at": now_utc.isoformat(),
+            "is_complete": now_wall >= bucket_end_epoch,
+            "has_samples": True,
+            "truncated": total_buffered >= MAX_SAMPLES,
+            "last_sample_age_ms": last_age_ms,
+            "request_count": total,
+            "rps": round(total / elapsed, 3),
+            "error_count": errors,
+            "error_rate": round(errors / total, 4),
+            "status_distribution": status_dist,
+            "latency_ms": {
+                "p50": _percentile(durations, 50.0),
+                "p95": _percentile(durations, 95.0),
+                "p99": _percentile(durations, 99.0),
+                "max": round(durations[-1], 2),
+            },
+            "by_route_group": route_counts,
+        }
+
     def snapshot_all(self) -> dict[str, Any]:
         return {
             "windows": {
                 "10s": self.snapshot_window(10),
                 "60s": self.snapshot_window(60),
                 "300s": self.snapshot_window(300),
+                "fixed_60s": self.snapshot_fixed_window(60),
             },
             "measured_from_real_requests": True,
         }
