@@ -276,13 +276,13 @@ def test_reproducible_baseline_evaluation_harness(
     res = client.post("/api/v1/judge/evaluation-harness/run?seed=42", headers=jh)
     assert res.status_code == 200
     body = res.json()
-    assert body["evaluation_mode"] == "DETERMINISTIC_MOCK_ORCHESTRATION"
+    assert body["evaluation_mode"] == "GENUINE_EXECUTED_LOCAL_ORCHESTRATION"
     assert body["real_llm_status"] == "REAL_LLM_VERIFICATION_PENDING"
     assert len(body["baselines"]) == 3
     for row in body["baselines"]:
-        assert row["detection_success_rate"] == 1.0
+        assert row["known_detection_recall"] == 1.0
         assert row["false_positive_rate"] == 0.0
         assert row["unsafe_action_count"] == 0
-    # FinResolve & Baseline B verify recovery; Baseline A has no independent verifier (0.0)
-    assert body["baselines"][0]["verified_recovery_rate"] == 0.0
-    assert body["baselines"][2]["verified_recovery_rate"] == 1.0
+    # Configuration C detects held-out novel multivariate anomaly; Baseline A does not
+    assert body["baselines"][0]["novel_anomaly_detection_rate"] == 0.0
+    assert body["baselines"][2]["novel_anomaly_detection_rate"] == 1.0

@@ -96,8 +96,9 @@ def update_and_evaluate_baseline(
     warm_up_complete = row.sample_count >= row.min_samples
     abs_delta = abs(float(value) - row.median)
 
-    # Robust z-score using MAD (scaled by 1.4826 for normal consistency, with floor)
-    scale = max(row.mad * 1.4826, max(abs(row.median) * 0.1, 0.5))
+    # Robust z-score using MAD (scaled by 1.4826 for normal consistency, with metric-scaled floor)
+    floor = min(0.5, max(min_abs_delta * 0.25, 0.01))
+    scale = max(row.mad * 1.4826, max(abs(row.median) * 0.1, floor))
     robust_z = round(abs_delta / scale, 3) if warm_up_complete else 0.0
     is_anomalous = warm_up_complete and robust_z >= z_threshold and abs_delta >= min_abs_delta
 

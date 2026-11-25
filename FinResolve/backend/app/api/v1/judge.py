@@ -209,6 +209,8 @@ def abort_challenge_run(
 @router.post("/evaluation-harness/run")
 def api_run_evaluation_harness(
     seed: int = 42,
+    current_session: DemoSession = Depends(get_current_session),
     _: None = Depends(_require_judge_token),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    return run_baseline_comparison_harness(seed=seed)
+    return run_baseline_comparison_harness(seed=seed, db=db, session_id=current_session.id)
