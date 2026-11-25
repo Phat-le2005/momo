@@ -118,8 +118,9 @@ def test_monitor_scan_automatically_detects_novel_anomaly_and_verifies_sustained
 
     transport = httpx.MockTransport(_handler)
 
-    # 1. Establish normal baseline across 5 normal background scans -> ZERO Cases!
+    # 1. Establish normal baseline across 5 distinct normal windows -> ZERO Cases!
     for i in range(5):
+        telem_state["window_id"] = f"W60:WARM:{i}"
         telem_state["p95"] = 34.0 + float(i % 2)
         telem_state["error_rate"] = 0.0
         summary = run_binding_scan(
@@ -138,7 +139,8 @@ def test_monitor_scan_automatically_detects_novel_anomaly_and_verifies_sustained
     assert len(obs_rows) >= 5
     assert binding.last_scan_coverage_json.get("open_world", {}).get("telemetry_available") is True
 
-    # 2. Introduce novel operational degradation (latency 650ms + 35% error rate, zero D01-D08!)
+    # 2. Introduce novel operational degradation in a new window (latency 650ms + 35% error rate!)
+    telem_state["window_id"] = "W60:DEG:1"
     telem_state["p95"] = 650.0
     telem_state["error_rate"] = 0.35
     degraded_summary = run_binding_scan(
