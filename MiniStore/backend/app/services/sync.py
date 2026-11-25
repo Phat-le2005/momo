@@ -33,6 +33,184 @@ from app.services.checkout import release_order_reservations_and_voucher
 from app.services.events import record_commerce_event
 
 
+def sync_single_confirmed_payment_to_order(
+    db: Session,
+    *,
+    order_id: str,
+    payment_id: str,
+    merchant_id: str,
+    commerce_session_id: str,
+    world_epoch: int,
+    expected_version: int | None = None,
+    sync_source: str = "FINRESOLVE_RECOVERY_COMMAND",
+) -> tuple[Order, Payment, str]:
+    """Target-specific, transactionally idempotent order sync for ONE authorized order/payment.
+
+    P0.1 Invariant: NEVER touches or mutates any unrelated order or payment!
+    Enforces merchant/session/world scope, expected_version under row lock, LOCAL_MOCK-only
+    or verified payment status, amount match, and full ACTIVE reservation validation.
+    """
+    from app.core.errors import CommerceError, ErrorCode
+
+    now = datetime.now(UTC)
+    # Canonical lock order: Order -> Payment
+    order = db.scalar(
+        select(Order)
+        .options(selectinload(Order.items))
+        .where(
+            Order.id == order_id,
+            Order.merchant_id == merchant_id,
+            Order.commerce_session_id == commerce_session_id,
+            Order.world_epoch == world_epoch,
+        )
+        .with_for_update()
+    )
+    if order is None:
+        raise CommerceError(
+            ErrorCode.NOT_FOUND, "Order not found in authorized write scope", status_code=404
+        )
+    pay = db.scalar(
+        select(Payment)
+        .where(
+            Payment.id == payment_id,
+            Payment.order_id == order.id,
+            Payment.merchant_id == merchant_id,
+            Payment.commerce_session_id == commerce_session_id,
+        )
+        .with_for_update()
+    )
+    if pay is None:
+        raise CommerceError(
+            ErrorCode.NOT_FOUND, "Payment not found for order in write scope", status_code=404
+        )
+    if expected_version is not None and order.version != expected_version:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            f"VERSION_MISMATCH: expected {expected_version}, got {order.version}",
+            status_code=409,
+        )
+    if order.status == OrderStatus.CANCELLED.value:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            "CANNOT_RESURRECT_CANCELLED_ORDER: cancelled orders require refund/manual review",
+            status_code=409,
+        )
+    if pay.status != PaymentStatus.SUCCEEDED.value:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            f"PAYMENT_NOT_CONFIRMED: cannot sync order while payment status is '{pay.status}'",
+            status_code=409,
+        )
+    if pay.amount_vnd != order.total_vnd:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            f"AMOUNT_MISMATCH: payment {pay.amount_vnd} != order total {order.total_vnd}",
+            status_code=409,
+        )
+
+    # Idempotent replay if already confirmed and synced
+    if order.status == OrderStatus.CONFIRMED.value and pay.is_synced_to_order:
+        return order, pay, "ALREADY_SYNCED"
+
+    if order.status != OrderStatus.PENDING_PAYMENT.value:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            f"Order in status '{order.status}' cannot be synced from PENDING_PAYMENT",
+            status_code=409,
+        )
+
+    reservations = list(
+        db.scalars(
+            select(InventoryReservation)
+            .where(
+                InventoryReservation.order_id == order.id,
+                InventoryReservation.status == ReservationStatus.ACTIVE.value,
+            )
+            .order_by(InventoryReservation.variant_id.asc())
+            .with_for_update()
+        ).all()
+    )
+    expected_qty: dict[str, int] = {}
+    for oi in order.items:
+        expected_qty[oi.variant_id] = expected_qty.get(oi.variant_id, 0) + oi.quantity
+    reserved_qty: dict[str, int] = {}
+    for r in reservations:
+        reserved_qty[r.variant_id] = reserved_qty.get(r.variant_id, 0) + r.quantity
+
+    if not reservations or expected_qty != reserved_qty:
+        reason = (
+            "ACTIVE inventory reservations do not match OrderItems at targeted sync "
+            f"(expected={expected_qty}, reserved={reserved_qty})."
+        )
+        pay.reconciliation_required = True
+        pay.reconciliation_note = reason
+        order.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
+        order.reconciliation_reason = reason
+        order.updated_at = now
+        db.commit()
+        return order, pay, "RECONCILIATION_REQUIRED"
+
+    inv_pairs: list[tuple[InventoryReservation, Inventory]] = []
+    for res in reservations:
+        inv = db.scalar(
+            select(Inventory).where(Inventory.variant_id == res.variant_id).with_for_update()
+        )
+        if inv is None or inv.reserved_qty < res.quantity or inv.on_hand_qty < res.quantity:
+            reason = f"Inventory integrity failure on targeted sync for variant {res.variant_id}"
+            pay.reconciliation_required = True
+            pay.reconciliation_note = reason
+            order.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
+            order.reconciliation_reason = reason
+            order.updated_at = now
+            db.commit()
+            return order, pay, "RECONCILIATION_REQUIRED"
+        inv_pairs.append((res, inv))
+
+    for res, inv in inv_pairs:
+        inv.reserved_qty -= res.quantity
+        inv.on_hand_qty -= res.quantity
+        inv.version += 1
+        inv.updated_at = now
+        res.status = ReservationStatus.CONFIRMED.value
+        res.updated_at = now
+        if res.live_product_id:
+            lp = db.scalar(
+                select(LiveProduct).where(LiveProduct.id == res.live_product_id).with_for_update()
+            )
+            if lp is not None:
+                if lp.flash_sale_reserved_qty >= res.quantity:
+                    lp.flash_sale_reserved_qty -= res.quantity
+                lp.flash_sale_sold_qty += res.quantity
+
+    order.status = OrderStatus.CONFIRMED.value
+    order.payment_status = pay.status
+    order.version += 1
+    order.updated_at = now
+    pay.is_synced_to_order = True
+    pay.updated_at = now
+
+    record_commerce_event(
+        db,
+        merchant_id=order.merchant_id,
+        commerce_session_id=order.commerce_session_id,
+        world_epoch=order.world_epoch,
+        event_type="ORDER_UPDATED",
+        order_id=order.id,
+        payment_id=pay.id,
+        correlation_id=order.correlation_id,
+        payload={
+            "previous_status": OrderStatus.PENDING_PAYMENT.value,
+            "new_status": OrderStatus.CONFIRMED.value,
+            "payment_status": pay.status,
+            "sync_source": sync_source,
+        },
+    )
+    db.commit()
+    db.refresh(order)
+    db.refresh(pay)
+    return order, pay, "EXECUTED"
+
+
 def sync_confirmed_payments_to_orders(db: Session, *, limit: int = 25) -> int:
     """Synchronize unsynced `Payment` records to `Order` safely with reconciliation checks."""
     candidate_ids = list(

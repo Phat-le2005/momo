@@ -61,9 +61,12 @@ def test_policy_gated_recovery_commands_and_safety_guards(
     )
     assert bad_cmd.status_code == 403
 
-    # 3. C01 (paid unsynced) -> version mismatch rejected (409), correct version succeeds!
+    # 3. P0.1: Target-specific C01 sync MUST NOT mutate a second unrelated unsynced C01 order!
     m1 = client.post(
         "/api/v1/chaos/inject", headers=chaos_h, json={"family": "C01", "seed": 501}
+    ).json()
+    m1_other = client.post(
+        "/api/v1/chaos/inject", headers=chaos_h, json={"family": "C01", "seed": 599}
     ).json()
     o1 = client.get(f"/api/v1/service/orders/{m1['affected_order_id']}", headers=read_h).json()
 
@@ -93,6 +96,12 @@ def test_policy_gated_recovery_commands_and_safety_guards(
     )
     assert r_ok.status_code == 200
     assert r_ok.json()["order_status"] == "CONFIRMED"
+
+    # Unrelated C01 order MUST remain untouched (PENDING_PAYMENT)!
+    o1_other = client.get(
+        f"/api/v1/service/orders/{m1_other['affected_order_id']}", headers=read_h
+    ).json()
+    assert o1_other["status"] == "PENDING_PAYMENT"
 
     # 4. C02 (unpaid lookalike) -> MUST be rejected with 409 PAYMENT_NOT_CONFIRMED!
     m2 = client.post(
@@ -126,11 +135,22 @@ def test_policy_gated_recovery_commands_and_safety_guards(
     )
     assert r_c03.status_code == 409
 
-    # 6. Event redelivery & manual review succeed cleanly
+    # 6. P0.2: Unscoped event redelivery rejected (400); scoped event_id succeeds!
+    r_unscoped = client.post(
+        "/api/v1/service/recovery/execute",
+        headers=write_h,
+        json={"command": "REQUEST_EVENT_REDELIVERY", "idempotency_key": "IDEMP-REDEL-BAD"},
+    )
+    assert r_unscoped.status_code == 400
+
     r_redel = client.post(
         "/api/v1/service/recovery/execute",
         headers=write_h,
-        json={"command": "REQUEST_EVENT_REDELIVERY", "idempotency_key": "IDEMP-REDEL-1"},
+        json={
+            "command": "REQUEST_EVENT_REDELIVERY",
+            "order_id": m1["affected_order_id"],
+            "idempotency_key": "IDEMP-REDEL-1",
+        },
     )
     assert r_redel.status_code == 200
     r_rev = client.post(
