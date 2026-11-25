@@ -1514,7 +1514,19 @@ def run_binding_scan(
             if created_case:
                 summary.cases_created += 1
 
-        # Step 7: Independently verify recovery for open anomalies (including same-scan D06!)
+        # Step 7: Reconcile stranded/UNKNOWN_OUTCOME recovery commands, then verify open anomalies
+        try:
+            from app.connectors.commerce_write import reconcile_stranded_recovery_commands
+
+            reconcile_stranded_recovery_commands(
+                db,
+                binding=binding,
+                transport=transport,
+                read_connector=conn,
+            )
+        except Exception as rec_exc:  # noqa: BLE001
+            coverage["stranded_reconciliation_error"] = str(rec_exc)[:200]
+
         open_anomalies = list(
             db.scalars(
                 select(AnomalyObservation).where(

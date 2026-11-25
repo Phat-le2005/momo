@@ -43,6 +43,7 @@ def sync_single_confirmed_payment_to_order(
     world_epoch: int,
     expected_version: int | None = None,
     sync_source: str = "FINRESOLVE_RECOVERY_COMMAND",
+    commit: bool = True,
 ) -> tuple[Order, Payment, str]:
     """Target-specific, transactionally idempotent order sync for ONE authorized order/payment.
 
@@ -147,7 +148,10 @@ def sync_single_confirmed_payment_to_order(
         order.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
         order.reconciliation_reason = reason
         order.updated_at = now
-        db.commit()
+        if commit:
+            db.commit()
+        else:
+            db.flush()
         return order, pay, "RECONCILIATION_REQUIRED"
 
     inv_pairs: list[tuple[InventoryReservation, Inventory]] = []
@@ -162,7 +166,10 @@ def sync_single_confirmed_payment_to_order(
             order.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
             order.reconciliation_reason = reason
             order.updated_at = now
-            db.commit()
+            if commit:
+                db.commit()
+            else:
+                db.flush()
             return order, pay, "RECONCILIATION_REQUIRED"
         inv_pairs.append((res, inv))
 
@@ -205,9 +212,12 @@ def sync_single_confirmed_payment_to_order(
             "sync_source": sync_source,
         },
     )
-    db.commit()
-    db.refresh(order)
-    db.refresh(pay)
+    if commit:
+        db.commit()
+        db.refresh(order)
+        db.refresh(pay)
+    else:
+        db.flush()
     return order, pay, "EXECUTED"
 
 

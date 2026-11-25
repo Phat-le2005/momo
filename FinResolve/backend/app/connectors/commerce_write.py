@@ -601,6 +601,19 @@ def reconcile_unknown_recovery_command(
         )
 
     remote_status = str(status_data.get("status") or "").upper()
+    remote_hash = status_data.get("request_hash")
+    if remote_hash and str(remote_hash) != cmd_row.request_hash:
+        return RecoveryExecutionResult(
+            command_id=cmd_row.id,
+            command=cmd_row.command,
+            executed=False,
+            http_status=status_code,
+            verified_recovery=False,
+            verdict=RecoveryVerdict.UNKNOWN_OUTCOME.value,
+            recovery_source=None,
+            detail="Receiver status lookup request_hash mismatch; refusing reconciliation",
+            response_payload=status_data,
+        )
     if status_code == 200 and remote_status == "EXECUTED":
         cmd_row.http_status = 200
         cmd_row.response_json = dict(status_data.get("result") or status_data)
@@ -642,3 +655,55 @@ def reconcile_unknown_recovery_command(
         detail=f"Receiver command still in state '{remote_status}' (HTTP {status_code})",
         response_payload=status_data,
     )
+
+
+def reconcile_stranded_recovery_commands(
+    db: Session,
+    *,
+    binding: CommerceSourceBinding,
+    write_key: str | None = None,
+    read_key: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+    read_connector: CommerceReadConnector | None = None,
+    stale_executing_seconds: int = 30,
+) -> int:
+    """Background worker reconciliation for commands stranded in EXECUTING or UNKNOWN_OUTCOME."""
+    from datetime import timedelta
+
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(seconds=max(5, stale_executing_seconds))
+    stranded = list(
+        db.scalars(
+            select(RecoveryCommand).where(
+                RecoveryCommand.source_binding_id == binding.id,
+                RecoveryCommand.session_id == binding.session_id,
+                RecoveryCommand.state.in_(["UNKNOWN_OUTCOME", "EXECUTING"]),
+            )
+        ).all()
+    )
+    reconciled = 0
+    for cmd_row in stranded:
+        if cmd_row.state == "EXECUTING":
+            upd = cmd_row.updated_at
+            if upd.tzinfo is None:
+                upd = upd.replace(tzinfo=UTC)
+            if upd > cutoff:
+                continue
+        if not cmd_row.anomaly_id:
+            continue
+        obs = db.get(AnomalyObservation, cmd_row.anomaly_id)
+        if obs is None:
+            continue
+        res = reconcile_unknown_recovery_command(
+            db,
+            cmd_row=cmd_row,
+            binding=binding,
+            obs=obs,
+            write_key=write_key,
+            read_key=read_key,
+            transport=transport,
+            read_connector=read_connector,
+        )
+        if res.executed or cmd_row.state in ("VERIFIED", "FAILED", "MANUAL_REVIEW"):
+            reconciled += 1
+    return reconciled

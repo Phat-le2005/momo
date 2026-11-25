@@ -499,6 +499,7 @@ def execute_recovery_command(
                 world_epoch=principal.world_epoch,
                 expected_version=payload.expected_version,
                 sync_source="FINRESOLVE_RECOVERY_COMMAND",
+                commit=False,
             )
             response = {
                 "command": cmd,
