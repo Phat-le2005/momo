@@ -320,23 +320,38 @@ def execute_and_verify_commerce_recovery(
             idempotent_replay=True,
         )
 
-    # 1b (Prompt 14.3 Fix 5): Block conflicting replanning while an earlier command for the
-    # same target order or anomaly is still in EXECUTING, UNKNOWN_OUTCOME, or VERIFYING!
-    conflict_filters: list[Any] = [
+    # 1b (Prompt 14.3 Fix 5 + Prompt 14.4 Fix 5): Atomic PostgreSQL advisory lock per target
+    # resource prevents concurrent check-then-insert races across competing workers, AND
+    # retains the mutation guard across MANUAL_REVIEW while execution_certainty is uncertain!
+    from sqlalchemy import and_, or_
+    from sqlalchemy import text as sa_text
+
+    target_lock_key = f"rcmd:{binding.id}:{obs.affected_order_id or obs.id}"
+    db.execute(sa_text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": target_lock_key})
+
+    conflict_scope: list[Any] = [
         RecoveryCommand.session_id == binding.session_id,
         RecoveryCommand.source_binding_id == binding.id,
-        RecoveryCommand.state.in_(["EXECUTING", "UNKNOWN_OUTCOME", "VERIFYING"]),
+        or_(
+            RecoveryCommand.state.in_(["EXECUTING", "UNKNOWN_OUTCOME", "VERIFYING"]),
+            and_(
+                RecoveryCommand.state == "MANUAL_REVIEW",
+                RecoveryCommand.execution_certainty.in_(["UNKNOWN", "COMMAND_EXECUTION_UNKNOWN"]),
+                RecoveryCommand.uncertainty_resolved_at.is_(None),
+            ),
+        ),
     ]
     if obs.affected_order_id:
-        conflict_filters.append(RecoveryCommand.target_order_id == obs.affected_order_id)
+        conflict_scope.append(RecoveryCommand.target_order_id == obs.affected_order_id)
     else:
-        conflict_filters.append(RecoveryCommand.anomaly_id == obs.id)
-    in_flight = db.scalar(select(RecoveryCommand).where(*conflict_filters).limit(1))
+        conflict_scope.append(RecoveryCommand.anomaly_id == obs.id)
+    in_flight = db.scalar(select(RecoveryCommand).where(*conflict_scope).limit(1))
     if in_flight is not None:
         raise AppError(
             ErrorCode.CONFLICT,
             f"ACTIVE_OR_UNCERTAIN_COMMAND_IN_FLIGHT: command '{in_flight.id}' "
-            f"is in state '{in_flight.state}'; reconcile before planning another mutation",
+            f"(state='{in_flight.state}', certainty='{in_flight.execution_certainty}') "
+            "blocks conflicting mutations until reconciled or explicitly resolved",
             status_code=409,
         )
 
@@ -532,6 +547,7 @@ def execute_and_verify_commerce_recovery(
         )
 
     # Independent post-action verification (NEVER trust HTTP 200 alone!)
+    cmd_row.execution_certainty = "COMMAND_EXECUTION_VERIFIED"
     recovered, detail = verify_anomaly_recovery(db, obs=obs, connector=reader)
     cmd_row.state = "VERIFIED" if recovered else "MANUAL_REVIEW"
     cmd_row.verification_json = {
@@ -595,6 +611,13 @@ def reconcile_unknown_recovery_command(
         binding, service_key=read_key, transport=transport
     )
 
+    # Serialize concurrent reconciliation workers via row lock on RecoveryCommand
+    locked_cmd = db.scalar(
+        select(RecoveryCommand).where(RecoveryCommand.id == cmd_row.id).with_for_update()
+    )
+    if locked_cmd is not None:
+        cmd_row = locked_cmd
+
     # If already VERIFYING, complete independent postcondition verification directly
     if cmd_row.state == "VERIFYING":
         recovered, detail = verify_anomaly_recovery(db, obs=obs, connector=reader)
@@ -611,7 +634,7 @@ def reconcile_unknown_recovery_command(
         return RecoveryExecutionResult(
             command_id=cmd_row.id,
             command=cmd_row.command,
-            executed=True,
+            executed=cmd_row.execution_certainty == "COMMAND_EXECUTION_VERIFIED",
             http_status=cmd_row.http_status or 200,
             verified_recovery=recovered,
             verdict=obs.verification_verdict or RecoveryVerdict.STILL_INCONSISTENT.value,
@@ -671,12 +694,16 @@ def reconcile_unknown_recovery_command(
             )
 
         # Uncertainty window exhausted: verify authoritative business state before escalating
+        # NEVER set executed=True solely because business state recovered after repeated 404s!
         recovered, detail = verify_anomaly_recovery(db, obs=obs, connector=reader)
         if recovered:
-            cmd_row.state = "VERIFIED"
+            cmd_row.state = "MANUAL_REVIEW"
+            cmd_row.execution_certainty = "COMMAND_EXECUTION_UNKNOWN"
             cmd_row.verification_json = {
+                "outcome_classification": "BUSINESS_STATE_RECOVERED",
+                "command_certainty": "COMMAND_EXECUTION_UNKNOWN",
                 "recovered": True,
-                "verdict": obs.verification_verdict,
+                "verdict": "BUSINESS_STATE_RECOVERED",
                 "recovery_source": obs.recovery_source,
                 "detail": detail,
                 "reconciled_after_404_probes": probes,
@@ -685,22 +712,28 @@ def reconcile_unknown_recovery_command(
             return RecoveryExecutionResult(
                 command_id=cmd_row.id,
                 command=cmd_row.command,
-                executed=True,
+                executed=False,
                 http_status=404,
                 verified_recovery=True,
-                verdict=obs.verification_verdict or RecoveryVerdict.VERIFIED_RECOVERY.value,
+                verdict="BUSINESS_STATE_RECOVERED",
                 recovery_source=obs.recovery_source,
-                detail=f"Authoritative state verified recovered after 404 probes: {detail}",
+                detail=(
+                    f"Business state observed recovered after 404 probes while command execution "
+                    f"remains unconfirmed (COMMAND_EXECUTION_UNKNOWN): {detail}"
+                ),
                 response_payload=status_data,
             )
 
         cmd_row.state = "MANUAL_REVIEW"
+        cmd_row.execution_certainty = "COMMAND_EXECUTION_UNKNOWN"
         cmd_row.verification_json = {
+            "outcome_classification": "SAFELY_ESCALATED",
+            "command_certainty": "COMMAND_EXECUTION_UNKNOWN",
             "recovered": False,
             "verdict": RecoveryVerdict.UNKNOWN_OUTCOME.value,
             "detail": (
                 f"Receiver returned 404 across {probes} probes over {age_sec:.1f}s; "
-                "escalated to MANUAL_REVIEW rather than unsafe blind retry"
+                "escalated to MANUAL_REVIEW with uncertainty guard retained"
             ),
         }
         db.commit()
@@ -750,6 +783,7 @@ def reconcile_unknown_recovery_command(
     if status_code == 200 and remote_status == "EXECUTED":
         cmd_row.http_status = 200
         cmd_row.response_json = dict(status_data.get("result") or status_data)
+        cmd_row.execution_certainty = "COMMAND_EXECUTION_VERIFIED"
         cmd_row.state = "VERIFYING"
         cmd_row.updated_at = datetime.now(UTC)
         db.commit()
@@ -840,3 +874,40 @@ def reconcile_stranded_recovery_commands(
         if res.executed or cmd_row.state in ("VERIFIED", "FAILED", "MANUAL_REVIEW"):
             reconciled += 1
     return reconciled
+
+
+def resolve_uncertain_recovery_command(
+    db: Session,
+    *,
+    command_id: str,
+    session_id: str,
+    resolved_by: str,
+    resolution_note: str = "Explicitly resolved after operator verification",
+) -> RecoveryCommand:
+    """Explicitly release an unresolved uncertainty guard after authorized manual review."""
+    row = db.scalar(
+        select(RecoveryCommand)
+        .where(
+            RecoveryCommand.id == command_id,
+            RecoveryCommand.session_id == session_id,
+        )
+        .with_for_update()
+    )
+    if row is None:
+        raise AppError(
+            ErrorCode.NOT_FOUND,
+            f"RecoveryCommand '{command_id}' not found in session '{session_id}'",
+            status_code=404,
+        )
+    now = datetime.now(UTC)
+    row.uncertainty_resolved_at = now
+    row.uncertainty_resolved_by = resolved_by
+    verif = dict(row.verification_json or {})
+    verif["manual_resolution_note"] = resolution_note
+    verif["manual_resolved_by"] = resolved_by
+    verif["manual_resolved_at"] = now.isoformat()
+    row.verification_json = verif
+    row.updated_at = now
+    db.commit()
+    db.refresh(row)
+    return row

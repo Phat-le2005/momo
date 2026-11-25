@@ -191,3 +191,167 @@ def test_transient_404_preserves_unknown_outcome_blocks_replan_and_reconciles_on
     assert res_ok.verified_recovery is True
     assert cmd.state == "VERIFIED"
     assert obs.lifecycle_state == "RECOVERED"
+
+
+def test_prompt14_4_uncertainty_guard_retained_after_manual_review_and_404_external_recovery(
+    db: Session, active_session: dict[str, str]
+) -> None:
+    """Prove:
+    1. Escalation to MANUAL_REVIEW after 404 probes RETAINS the uncertainty guard (blocks new cmds).
+    2. External business state recovery after repeated 404s NEVER sets executed=True.
+    3. Explicit authorized manual resolution releases the guard cleanly.
+    """
+    from app.connectors.commerce_write import resolve_uncertain_recovery_command
+
+    sid = active_session["id"]
+    now = datetime.now(UTC)
+
+    binding = CommerceSourceBinding(
+        id=f"BIND-MREV-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        world_epoch=1,
+        base_url="http://127.0.0.1:8100",
+        merchant_id="MERCHANT_FINSHOP_01",
+        commerce_session_id="CSESS_FINSHOP_DEFAULT_01",
+        commerce_world_epoch=1,
+        is_enabled=True,
+    )
+    db.add(binding)
+    db.flush()
+
+    obs = AnomalyObservation(
+        id=f"ANOM-MREV-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        world_epoch=1,
+        source_binding_id=binding.id,
+        merchant_id="MERCHANT_FINSHOP_01",
+        detector_code="D01",
+        anomaly_type="PAYMENT_SUCCEEDED_ORDER_NOT_CONFIRMED",
+        severity="HIGH",
+        fingerprint=f"fp-mrev-{uuid.uuid4().hex[:8]}",
+        affected_order_id="ORD-MREV-01",
+        affected_payment_id="PAY-MREV-01",
+        rationale="Unsynced payment",
+        lifecycle_state="INVESTIGATING",
+    )
+    db.add(obs)
+    db.flush()
+
+    cmd = RecoveryCommand(
+        id=f"RCMD-MREV-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        idempotency_key=f"IDEMP-MREV-{uuid.uuid4().hex[:8]}",
+        request_hash="sha256-mrev-01",
+        command="REQUEST_ORDER_SYNC",
+        anomaly_id=obs.id,
+        source_binding_id=binding.id,
+        merchant_id="MERCHANT_FINSHOP_01",
+        commerce_session_id="CSESS_FINSHOP_DEFAULT_01",
+        world_epoch=1,
+        target_order_id="ORD-MREV-01",
+        target_payment_id="PAY-MREV-01",
+        expected_version=1,
+        policy_decision="ALLOW_AUTONOMOUS",
+        state="UNKNOWN_OUTCOME",
+        execution_certainty="UNKNOWN",
+        created_at=now - timedelta(minutes=2),
+        updated_at=now - timedelta(minutes=2),
+    )
+    db.add(cmd)
+    db.commit()
+
+    ext_recovered = {"ok": False}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/api/v1/service/recovery/commands/"):
+            return httpx.Response(404, json={"detail": "Not found"})
+        if request.url.path.endswith("/timeline"):
+            return httpx.Response(200, json=[])
+        if request.url.path.startswith("/api/v1/service/orders/"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "ORD-MREV-01",
+                    "status": "CONFIRMED" if ext_recovered["ok"] else "PENDING_PAYMENT",
+                    "reconciliation_status": "CLEAR",
+                    "version": 2 if ext_recovered["ok"] else 1,
+                    "total_vnd": 150000,
+                },
+            )
+        if request.url.path.startswith("/api/v1/service/payments/"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "PAY-MREV-01",
+                    "order_id": "ORD-MREV-01",
+                    "provider": "LOCAL_MOCK",
+                    "status": "SUCCEEDED",
+                    "is_synced_to_order": ext_recovered["ok"],
+                    "reconciliation_required": False,
+                    "amount_vnd": 150000,
+                    "confirmed_at": (now - timedelta(minutes=3)).isoformat(),
+                },
+            )
+        if request.method == "POST" and request.url.path == "/api/v1/service/recovery/execute":
+            ext_recovered["ok"] = True
+            return httpx.Response(200, json={"status": "SYNCED"})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_handler)
+
+    # 1. Exhaust 404 probes -> escalates to MANUAL_REVIEW with COMMAND_EXECUTION_UNKNOWN
+    res_esc = reconcile_unknown_recovery_command(
+        db,
+        cmd_row=cmd,
+        binding=binding,
+        obs=obs,
+        transport=transport,
+        uncertainty_grace_seconds=0,
+        max_not_found_probes=1,
+    )
+    assert res_esc.executed is False
+    assert cmd.state == "MANUAL_REVIEW"
+    assert cmd.execution_certainty == "COMMAND_EXECUTION_UNKNOWN"
+
+    # 2. Conflicting command AFTER escalation to MANUAL_REVIEW MUST STILL BE BLOCKED (409)!
+    with pytest.raises(AppError) as exc_blk:
+        execute_and_verify_commerce_recovery(
+            db,
+            binding=binding,
+            obs=obs,
+            command="REQUEST_ORDER_SYNC",
+            idempotency_key=f"IDEMP-AFTER-ESC-{uuid.uuid4().hex[:8]}",
+            expected_version=1,
+            transport=transport,
+        )
+    assert exc_blk.value.status_code == 409
+    assert "ACTIVE_OR_UNCERTAIN_COMMAND_IN_FLIGHT" in exc_blk.value.message
+
+    # 3. External business recovery after 404 MUST NEVER set executed=True!
+    ext_recovered["ok"] = True
+    cmd.state = "UNKNOWN_OUTCOME"
+    db.commit()
+    res_ext = reconcile_unknown_recovery_command(
+        db,
+        cmd_row=cmd,
+        binding=binding,
+        obs=obs,
+        transport=transport,
+        uncertainty_grace_seconds=0,
+        max_not_found_probes=1,
+    )
+    assert res_ext.executed is False
+    assert res_ext.verified_recovery is True
+    assert res_ext.verdict == "BUSINESS_STATE_RECOVERED"
+    assert cmd.execution_certainty == "COMMAND_EXECUTION_UNKNOWN"
+
+    # 4. Explicit authorized manual resolution releases the uncertainty guard
+    resolve_uncertain_recovery_command(
+        db,
+        command_id=cmd.id,
+        session_id=sid,
+        resolved_by="demo_manager",
+        resolution_note="Verified externally by operator",
+    )
+    assert cmd.uncertainty_resolved_at is not None
+    assert cmd.uncertainty_resolved_by == "demo_manager"
