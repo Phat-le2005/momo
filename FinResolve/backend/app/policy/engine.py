@@ -1047,11 +1047,18 @@ class PolicyEngine:
                 )
             checked.append("human_approval_record_verified")
 
+        if not self._settings.autonomous_recovery_enabled:
+            return _deny_cmd(
+                "AUTONOMOUS_RECOVERY_DISABLED",
+                "Autonomous recovery is explicitly disabled (read-only mode active)",
+                risk=derived_risk,
+                needs_approval=True,
+            )
         signing_secret = self._settings.command_auth_signing_secret.get_secret_value().strip()
-        if not signing_secret:
+        if len(signing_secret) < 32:
             return _deny_cmd(
                 "SIGNING_SECRET_UNAVAILABLE",
-                "Command authorization signing secret is not configured (fail closed)",
+                "Command authorization signing secret missing or < 256-bit (fail closed)",
                 risk=derived_risk,
                 needs_approval=needs_approval,
             )

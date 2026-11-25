@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from collections.abc import Iterator
 
 import pytest
@@ -17,6 +18,8 @@ os.environ["COMMERCE_APP_ENV"] = "test"
 os.environ["COMMERCE_DATABASE_URL"] = TEST_DB_URL
 os.environ["COMMERCE_WEB_ORIGIN"] = "http://localhost:3100"
 os.environ["COMMERCE_SOURCE_MODE"] = "MOCK"
+os.environ.setdefault("COMMERCE_COMMAND_AUTH_SIGNING_SECRET", secrets.token_hex(32))
+os.environ.setdefault("COMMERCE_SERVICE_WRITE_API_KEY", secrets.token_hex(32))
 
 
 def _clear_caches() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from collections.abc import Iterator
 
 import pytest
@@ -19,6 +20,8 @@ os.environ["WEB_ORIGIN"] = "http://localhost:3000"
 os.environ["SOURCE_MODE"] = "MOCK"
 for _key in ("MODEL_PROVIDER", "MODEL_NAME", "MODEL_API_KEY"):
     os.environ[_key] = ""
+os.environ.setdefault("COMMAND_AUTH_SIGNING_SECRET", secrets.token_hex(32))
+os.environ.setdefault("COMMERCE_WRITE_KEY", secrets.token_hex(32))
 
 
 def _clear_caches() -> None:

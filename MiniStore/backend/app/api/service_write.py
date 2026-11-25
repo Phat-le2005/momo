@@ -204,11 +204,17 @@ def _verify_signed_command_authorization(
 ) -> dict[str, Any]:
     """Independently verify HMAC-SHA256 signed PolicyEngine command authorization (fail-closed)."""
     settings = get_settings()
-    secret = settings.command_auth_signing_secret.get_secret_value().strip()
-    if not secret:
+    if not settings.recovery_write_enabled:
         raise CommerceError(
             ErrorCode.FORBIDDEN,
-            "AUTHORIZATION_VERIFICATION_UNAVAILABLE: signing secret not configured",
+            "RECOVERY_WRITE_DISABLED: autonomous recovery writes are explicitly disabled",
+            status_code=403,
+        )
+    secret = settings.command_auth_signing_secret.get_secret_value().strip()
+    if len(secret) < 32:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "AUTHORIZATION_VERIFICATION_UNAVAILABLE: >= 256-bit signing secret required",
             status_code=403,
         )
     if not token or "." not in token:

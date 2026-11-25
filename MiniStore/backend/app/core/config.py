@@ -33,12 +33,9 @@ class CommerceSettings(BaseSettings):
     service_api_key: SecretStr = SecretStr(
         "finshop-local-only-service-connector-key-2026-change-me"
     )
-    service_write_api_key: SecretStr = SecretStr(
-        "finshop-local-only-service-write-key-2026-change-me"
-    )
-    command_auth_signing_secret: SecretStr = SecretStr(
-        "finresolve-local-only-command-auth-hmac-secret-2026-change-me"
-    )
+    recovery_write_enabled: bool = True
+    service_write_api_key: SecretStr = SecretStr("")
+    command_auth_signing_secret: SecretStr = SecretStr("")
     command_auth_key_id: str = "finresolve-policy-hmac-v1"
     chaos_enabled: bool = False
     chaos_admin_key: SecretStr = SecretStr("finshop-local-only-chaos-admin-key-2026-change-me")
@@ -131,15 +128,50 @@ class CommerceSettings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_secrets(self) -> CommerceSettings:
+        forbidden_rotated = {
+            "finresolve-local-only-command-auth-hmac-secret-2026-change-me",
+            "finshop-local-only-service-write-key-2026-change-me",
+        }
+        sign_sec = self.command_auth_signing_secret.get_secret_value().strip()
+        write_key = self.service_write_api_key.get_secret_value().strip()
+        read_key = self.service_api_key.get_secret_value().strip()
+
+        for name, val in (
+            ("COMMERCE_COMMAND_AUTH_SIGNING_SECRET", sign_sec),
+            ("COMMERCE_SERVICE_WRITE_API_KEY", write_key),
+        ):
+            if val and val.lower() in forbidden_rotated:
+                raise ValueError(
+                    f"{name} cannot use a rotated publicly known repository default secret"
+                )
+        if sign_sec and write_key and sign_sec == write_key:
+            raise ValueError(
+                "COMMERCE_COMMAND_AUTH_SIGNING_SECRET must be separate from "
+                "COMMERCE_SERVICE_WRITE_API_KEY"
+            )
+        if sign_sec and read_key and sign_sec == read_key:
+            raise ValueError(
+                "COMMERCE_COMMAND_AUTH_SIGNING_SECRET must be separate from "
+                "COMMERCE_SERVICE_API_KEY"
+            )
+
         if self.app_env.strip().lower() not in LOCAL_ENVS:
-            for name, secret in (
+            required_pairs = [
                 ("COMMERCE_AUTH_SECRET", self.auth_secret.get_secret_value().strip()),
-                ("COMMERCE_SERVICE_API_KEY", self.service_api_key.get_secret_value().strip()),
+                ("COMMERCE_SERVICE_API_KEY", read_key),
                 (
                     "COMMERCE_MOCK_PROVIDER_SECRET",
                     self.mock_provider_secret.get_secret_value().strip(),
                 ),
-            ):
+            ]
+            if self.recovery_write_enabled:
+                required_pairs.extend(
+                    [
+                        ("COMMERCE_SERVICE_WRITE_API_KEY", write_key),
+                        ("COMMERCE_COMMAND_AUTH_SIGNING_SECRET", sign_sec),
+                    ]
+                )
+            for name, secret in required_pairs:
                 if (
                     len(secret) < 32
                     or "local-only" in secret.lower()

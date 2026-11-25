@@ -448,3 +448,64 @@ def test_unknown_outcome_reconciliation_via_receiver_status_lookup(
     assert rec_res.verified_recovery is True
     db.refresh(cmd_row)
     assert cmd_row.state == "VERIFIED"
+
+
+def test_insecure_default_secrets_rejected_and_readonly_mode_allowed() -> None:
+    """Fix 1 (Prompt 14.3): Reject rotated/missing signing secrets; allow explicit read-only."""
+    import secrets
+
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    strong_approval = secrets.token_hex(32)
+    strong_sign = secrets.token_hex(32)
+    strong_write = secrets.token_hex(32)
+
+    # 1. Publicly known rotated signing secret MUST be rejected even in local env
+    with pytest.raises(ValidationError):
+        Settings(
+            app_env="local",
+            demo_approval_secret=strong_approval,
+            command_auth_signing_secret="finresolve-local-only-command-auth-hmac-secret-2026-change-me",
+        )
+
+    # 2. Deployed env with autonomous_recovery_enabled=True and missing signing secret -> rejected
+    with pytest.raises(ValidationError):
+        Settings(
+            app_env="docker",
+            demo_approval_secret=strong_approval,
+            autonomous_recovery_enabled=True,
+            command_auth_signing_secret="",
+            commerce_write_key="",
+        )
+
+    # 3. Deployed env with signing secret == write key -> rejected (must be separate!)
+    with pytest.raises(ValidationError):
+        Settings(
+            app_env="docker",
+            demo_approval_secret=strong_approval,
+            autonomous_recovery_enabled=True,
+            command_auth_signing_secret=strong_sign,
+            commerce_write_key=strong_sign,
+        )
+
+    # 4. Deployed env with autonomous_recovery_enabled=False -> read-only boots without signing key
+    ro = Settings(
+        app_env="docker",
+        demo_approval_secret=strong_approval,
+        autonomous_recovery_enabled=False,
+        command_auth_signing_secret="",
+        commerce_write_key="",
+    )
+    assert ro.autonomous_recovery_enabled is False
+
+    # 5. Deployed env with distinct strong >= 256-bit secrets succeeds
+    ok = Settings(
+        app_env="docker",
+        demo_approval_secret=strong_approval,
+        autonomous_recovery_enabled=True,
+        command_auth_signing_secret=strong_sign,
+        commerce_write_key=strong_write,
+    )
+    assert len(ok.command_auth_signing_secret.get_secret_value()) == 64
