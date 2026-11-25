@@ -14,6 +14,28 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
+from tests.test_prompt14_1_write_scope_and_idempotency import sign_test_authorization
+
+
+def _signed_write_headers(
+    base_h: dict[str, str],
+    *,
+    command: str,
+    idempotency_key: str,
+    order_id: str | None = None,
+    payment_id: str | None = None,
+    event_id: str | None = None,
+    expected_version: int | None = None,
+) -> dict[str, str]:
+    tok = sign_test_authorization(
+        command=command,
+        idempotency_key=idempotency_key,
+        order_id=order_id,
+        payment_id=payment_id,
+        event_id=event_id,
+        expected_version=expected_version,
+    )
+    return {**base_h, "X-Command-Authorization": tok}
 
 
 def _headers() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
@@ -73,7 +95,14 @@ def test_policy_gated_recovery_commands_and_safety_guards(
 
     r_ver = client.post(
         "/api/v1/service/recovery/execute",
-        headers=write_h,
+        headers=_signed_write_headers(
+            write_h,
+            command="REQUEST_ORDER_SYNC",
+            order_id=m1["affected_order_id"],
+            payment_id=m1["affected_payment_id"],
+            expected_version=o1["version"] + 99,
+            idempotency_key="IDEMP-VER-BAD",
+        ),
         json={
             "command": "REQUEST_ORDER_SYNC",
             "order_id": m1["affected_order_id"],
@@ -86,7 +115,14 @@ def test_policy_gated_recovery_commands_and_safety_guards(
 
     r_ok = client.post(
         "/api/v1/service/recovery/execute",
-        headers=write_h,
+        headers=_signed_write_headers(
+            write_h,
+            command="REQUEST_ORDER_SYNC",
+            order_id=m1["affected_order_id"],
+            payment_id=m1["affected_payment_id"],
+            expected_version=o1["version"],
+            idempotency_key="IDEMP-SYNC-OK",
+        ),
         json={
             "command": "REQUEST_ORDER_SYNC",
             "order_id": m1["affected_order_id"],
@@ -110,7 +146,13 @@ def test_policy_gated_recovery_commands_and_safety_guards(
     ).json()
     r_c02 = client.post(
         "/api/v1/service/recovery/execute",
-        headers=write_h,
+        headers=_signed_write_headers(
+            write_h,
+            command="REQUEST_ORDER_SYNC",
+            order_id=m2["affected_order_id"],
+            payment_id=m2["affected_payment_id"],
+            idempotency_key="IDEMP-C02-BLOCK",
+        ),
         json={
             "command": "REQUEST_ORDER_SYNC",
             "order_id": m2["affected_order_id"],
@@ -126,7 +168,13 @@ def test_policy_gated_recovery_commands_and_safety_guards(
     ).json()
     r_c03 = client.post(
         "/api/v1/service/recovery/execute",
-        headers=write_h,
+        headers=_signed_write_headers(
+            write_h,
+            command="REQUEST_ORDER_SYNC",
+            order_id=m3["affected_order_id"],
+            payment_id=m3["affected_payment_id"],
+            idempotency_key="IDEMP-C03-BLOCK",
+        ),
         json={
             "command": "REQUEST_ORDER_SYNC",
             "order_id": m3["affected_order_id"],
@@ -139,14 +187,23 @@ def test_policy_gated_recovery_commands_and_safety_guards(
     # 6. P0.2: Unscoped event redelivery rejected (400); scoped event_id succeeds!
     r_unscoped = client.post(
         "/api/v1/service/recovery/execute",
-        headers=write_h,
+        headers=_signed_write_headers(
+            write_h,
+            command="REQUEST_EVENT_REDELIVERY",
+            idempotency_key="IDEMP-REDEL-BAD",
+        ),
         json={"command": "REQUEST_EVENT_REDELIVERY", "idempotency_key": "IDEMP-REDEL-BAD"},
     )
     assert r_unscoped.status_code == 400
 
     r_redel = client.post(
         "/api/v1/service/recovery/execute",
-        headers=write_h,
+        headers=_signed_write_headers(
+            write_h,
+            command="REQUEST_EVENT_REDELIVERY",
+            order_id=m1["affected_order_id"],
+            idempotency_key="IDEMP-REDEL-1",
+        ),
         json={
             "command": "REQUEST_EVENT_REDELIVERY",
             "order_id": m1["affected_order_id"],
@@ -156,7 +213,12 @@ def test_policy_gated_recovery_commands_and_safety_guards(
     assert r_redel.status_code == 200
     r_rev = client.post(
         "/api/v1/service/recovery/execute",
-        headers=write_h,
+        headers=_signed_write_headers(
+            write_h,
+            command="REQUEST_MANUAL_REVIEW",
+            order_id=m3["affected_order_id"],
+            idempotency_key="IDEMP-REV-1",
+        ),
         json={
             "command": "REQUEST_MANUAL_REVIEW",
             "order_id": m3["affected_order_id"],

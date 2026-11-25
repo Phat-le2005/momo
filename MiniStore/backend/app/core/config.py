@@ -36,6 +36,10 @@ class CommerceSettings(BaseSettings):
     service_write_api_key: SecretStr = SecretStr(
         "finshop-local-only-service-write-key-2026-change-me"
     )
+    command_auth_signing_secret: SecretStr = SecretStr(
+        "finresolve-local-only-command-auth-hmac-secret-2026-change-me"
+    )
+    command_auth_key_id: str = "finresolve-policy-hmac-v1"
     chaos_enabled: bool = False
     chaos_admin_key: SecretStr = SecretStr("finshop-local-only-chaos-admin-key-2026-change-me")
     mock_provider_secret: SecretStr = SecretStr(

@@ -12,10 +12,13 @@ Hard Domain Invariants:
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
+import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
@@ -63,7 +66,7 @@ class PolicyEvaluationResult:
 
 @dataclass
 class CommercePolicyDecision:
-    """Authoritative PolicyEngine decision for a Commerce recovery command."""
+    """Authoritative PolicyEngine decision with HMAC-SHA256 signed command authorization."""
 
     allowed: bool
     decision_code: str
@@ -71,6 +74,8 @@ class CommercePolicyDecision:
     command: str
     risk_level: str
     requires_human_approval: bool
+    authorization_id: str | None = None
+    authorization_token: str | None = None
     authorization_digest: str | None = None
     approval_id: str | None = None
     violation_code: str | None = None
@@ -741,6 +746,7 @@ class PolicyEngine:
         obs: AnomalyObservation,
         command: str,
         request_hash: str,
+        idempotency_key: str = "",
         expected_version: int | None = None,
         order_snapshot: dict[str, Any] | None = None,
         payment_snapshot: dict[str, Any] | None = None,
@@ -1024,8 +1030,15 @@ class PolicyEngine:
                     risk=derived_risk,
                     needs_approval=True,
                 )
-            prop_hash = prop_params.get("request_hash")
-            if prop_hash and prop_hash != request_hash:
+            prop_hash = str(prop_params.get("request_hash") or "").strip()
+            if not prop_hash:
+                return _deny_cmd(
+                    "APPROVAL_MISSING_REQUEST_HASH",
+                    "Approval proposal must cryptographically bind request_hash",
+                    risk=derived_risk,
+                    needs_approval=True,
+                )
+            if not hmac.compare_digest(prop_hash, request_hash):
                 return _deny_cmd(
                     "APPROVAL_REQUEST_HASH_MISMATCH",
                     "Approval request_hash does not match command payload hash",
@@ -1034,22 +1047,46 @@ class PolicyEngine:
                 )
             checked.append("human_approval_record_verified")
 
+        signing_secret = self._settings.command_auth_signing_secret.get_secret_value().strip()
+        if not signing_secret:
+            return _deny_cmd(
+                "SIGNING_SECRET_UNAVAILABLE",
+                "Command authorization signing secret is not configured (fail closed)",
+                risk=derived_risk,
+                needs_approval=needs_approval,
+            )
+
+        now_ts = datetime.now(UTC)
+        exp_ts = now_ts + timedelta(seconds=self._settings.command_auth_ttl_seconds)
+        auth_id = f"AUTH-{uuid.uuid4().hex[:12].upper()}"
         auth_payload = {
+            "auth_id": auth_id,
+            "key_id": self._settings.command_auth_key_id,
             "policy_version": POLICY_VERSION,
-            "decision_code": decision_code,
-            "session_id": self._session_id,
-            "binding_id": binding.id,
+            "policy_decision": decision_code,
+            "command": norm_cmd,
+            "idempotency_key": idempotency_key,
+            "request_hash": request_hash,
             "merchant_id": binding.merchant_id,
             "commerce_session_id": binding.commerce_session_id,
             "world_epoch": binding.commerce_world_epoch,
-            "command": norm_cmd,
-            "request_hash": request_hash,
+            "source_binding_id": binding.id,
+            "target_order_id": obs.affected_order_id,
+            "target_payment_id": obs.affected_payment_id,
+            "target_event_id": target_event_id,
             "expected_version": expected_version,
             "approval_id": approval_id,
+            "issued_at": int(now_ts.timestamp()),
+            "expires_at": int(exp_ts.timestamp()),
         }
-        auth_digest = hashlib.sha256(
-            json.dumps(auth_payload, sort_keys=True, default=str).encode("utf-8")
+        canonical_bytes = json.dumps(
+            auth_payload, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")
+        sig_hex = hmac.new(
+            signing_secret.encode("utf-8"), canonical_bytes, hashlib.sha256
         ).hexdigest()
+        b64_payload = base64.urlsafe_b64encode(canonical_bytes).decode("ascii").rstrip("=")
+        auth_token = f"{b64_payload}.{sig_hex}"
 
         return CommercePolicyDecision(
             allowed=True,
@@ -1058,7 +1095,9 @@ class PolicyEngine:
             command=norm_cmd,
             risk_level=derived_risk,
             requires_human_approval=needs_approval,
-            authorization_digest=auth_digest,
+            authorization_id=auth_id,
+            authorization_token=auth_token,
+            authorization_digest=sig_hex,
             approval_id=approval_id,
             checked_preconditions=checked,
             context_snapshot=snapshot,

@@ -13,7 +13,9 @@ Hard Security & Isolation Invariants:
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import uuid
 from datetime import UTC, datetime
@@ -26,6 +28,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.auth import hash_token
+from app.core.config import get_settings
 from app.core.errors import CommerceError, ErrorCode
 from app.db.session import get_db
 from app.models.entities import (
@@ -72,6 +75,7 @@ class WritePrincipal(BaseModel):
     commerce_session_id: str
     world_epoch: int
     allowed_commands: list[str]
+    authorization_token: str
     authorization_digest: str
 
 
@@ -80,6 +84,7 @@ def _require_write_principal(
     x_merchant_id: str = Header(default=""),
     x_commerce_session_id: str = Header(default=""),
     x_world_epoch: int = Header(default=0),
+    x_command_authorization: str = Header(default=""),
     x_authorization_digest: str = Header(default=""),
     db: Session = Depends(get_db),
 ) -> WritePrincipal:
@@ -184,8 +189,113 @@ def _require_write_principal(
         commerce_session_id=cred.commerce_session_id,
         world_epoch=csess.world_epoch,
         allowed_commands=allowed_cmds,
+        authorization_token=x_command_authorization.strip(),
         authorization_digest=x_authorization_digest.strip(),
     )
+
+
+def _verify_signed_command_authorization(
+    *,
+    token: str,
+    principal: WritePrincipal,
+    cmd: str,
+    payload: RecoveryCommandRequest,
+    req_hash: str,
+) -> dict[str, Any]:
+    """Independently verify HMAC-SHA256 signed PolicyEngine command authorization (fail-closed)."""
+    settings = get_settings()
+    secret = settings.command_auth_signing_secret.get_secret_value().strip()
+    if not secret:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "AUTHORIZATION_VERIFICATION_UNAVAILABLE: signing secret not configured",
+            status_code=403,
+        )
+    if not token or "." not in token:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "MISSING_OR_MALFORMED_COMMAND_AUTHORIZATION: signed X-Command-Authorization required",
+            status_code=403,
+        )
+    parts = token.split(".", 1)
+    if len(parts) != 2 or not parts[0] or len(parts[1]) != 64:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "MALFORMED_COMMAND_AUTHORIZATION: invalid signed token format",
+            status_code=403,
+        )
+    b64_part, provided_sig = parts
+    try:
+        padded = b64_part + "=" * (-len(b64_part) % 4)
+        raw_bytes = base64.urlsafe_b64decode(padded.encode("ascii"))
+        claims = json.loads(raw_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "INVALID_AUTHORIZATION_ENCODING: unable to decode authorization payload",
+            status_code=403,
+        ) from exc
+
+    if not isinstance(claims, dict):
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "INVALID_AUTHORIZATION_PAYLOAD: payload must be a JSON object",
+            status_code=403,
+        )
+
+    expected_sig = hmac.new(secret.encode("utf-8"), raw_bytes, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_sig, provided_sig.lower()):
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "INVALID_AUTHORIZATION_SIGNATURE: cryptographic HMAC-SHA256 verification failed",
+            status_code=403,
+        )
+
+    if str(claims.get("key_id") or "") != settings.command_auth_key_id:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "UNAUTHORIZED_SIGNING_KEY: unrecognized command authorization key_id",
+            status_code=403,
+        )
+
+    now_epoch = int(datetime.now(UTC).timestamp())
+    exp_ts = claims.get("expires_at")
+    iat_ts = claims.get("issued_at")
+    if not isinstance(exp_ts, int) or not isinstance(iat_ts, int) or exp_ts <= now_epoch:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "EXPIRED_COMMAND_AUTHORIZATION: authorization token has expired",
+            status_code=403,
+        )
+    if iat_ts > now_epoch + 30:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            "FUTURE_COMMAND_AUTHORIZATION: issued_at timestamp is in the future",
+            status_code=403,
+        )
+
+    # Verify all bound scope, target, command, and canonical request_hash fields
+    checks = (
+        ("merchant_id", claims.get("merchant_id"), principal.merchant_id),
+        ("commerce_session_id", claims.get("commerce_session_id"), principal.commerce_session_id),
+        ("world_epoch", claims.get("world_epoch"), principal.world_epoch),
+        ("command", str(claims.get("command") or "").upper(), cmd),
+        ("idempotency_key", claims.get("idempotency_key"), payload.idempotency_key),
+        ("request_hash", claims.get("request_hash"), req_hash),
+        ("target_order_id", claims.get("target_order_id"), payload.order_id),
+        ("target_payment_id", claims.get("target_payment_id"), payload.payment_id),
+        ("target_event_id", claims.get("target_event_id"), payload.event_id),
+        ("expected_version", claims.get("expected_version"), payload.expected_version),
+    )
+    for field_name, claimed_val, actual_val in checks:
+        if claimed_val != actual_val:
+            raise CommerceError(
+                ErrorCode.FORBIDDEN,
+                f"AUTHORIZATION_PAYLOAD_MISMATCH: bound '{field_name}' does not match request",
+                status_code=403,
+            )
+
+    return claims
 
 
 class RecoveryCommandRequest(BaseModel):
@@ -273,12 +383,6 @@ def execute_recovery_command(
             f"for command '{cmd}'",
             status_code=403,
         )
-    if cmd in STATE_CHANGING_COMMANDS and len(principal.authorization_digest) < 32:
-        raise CommerceError(
-            ErrorCode.FORBIDDEN,
-            "MISSING_COMMAND_AUTHORIZATION: verified PolicyEngine X-Authorization-Digest required",
-            status_code=403,
-        )
 
     now = datetime.now(UTC)
     req_hash = _compute_receiver_request_hash(principal=principal, cmd=cmd, payload=payload)
@@ -311,6 +415,16 @@ def execute_recovery_command(
             replayed["idempotent_replay"] = True
             return replayed
 
+    # Cryptographically verify HMAC-SHA256 PolicyEngine authorization BEFORE any new mutation!
+    verified_claims = _verify_signed_command_authorization(
+        token=principal.authorization_token,
+        principal=principal,
+        cmd=cmd,
+        payload=payload,
+        req_hash=req_hash,
+    )
+    verified_auth_id = str(verified_claims.get("auth_id") or "")
+
     rec = ReceivedRecoveryCommand(
         id=f"RCV-{uuid.uuid4().hex[:10].upper()}",
         merchant_id=principal.merchant_id,
@@ -323,7 +437,7 @@ def execute_recovery_command(
         target_payment_id=payload.payment_id,
         target_event_id=payload.event_id,
         expected_version=payload.expected_version,
-        authorization_digest=principal.authorization_digest or None,
+        authorization_digest=verified_auth_id or principal.authorization_digest or None,
         credential_id=principal.credential_id,
         status="EXECUTING",
         result_json={},

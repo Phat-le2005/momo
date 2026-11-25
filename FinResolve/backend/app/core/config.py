@@ -117,6 +117,11 @@ class Settings(BaseSettings):
     commerce_connector_id: str = "default_ministore"
     commerce_allowed_hosts: str = "localhost,127.0.0.1,commerce-api"
     commerce_write_key: SecretStr = SecretStr("")
+    command_auth_signing_secret: SecretStr = SecretStr(
+        "finresolve-local-only-command-auth-hmac-secret-2026-change-me"
+    )
+    command_auth_key_id: str = "finresolve-policy-hmac-v1"
+    command_auth_ttl_seconds: int = Field(default=120, ge=10, le=900)
     judge_admin_secret: SecretStr = SecretStr(
         "finresolve-judge-lab-local-only-secret-2026-change-me"
     )

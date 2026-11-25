@@ -217,6 +217,7 @@ def test_policy_engine_enforces_authoritative_evidence_and_blocks_bypasses(
     )
     assert res.executed is True
     assert len(exec_calls) == 1
+    assert "." in exec_calls[0]["headers"].get("x-command-authorization", "")
     assert len(exec_calls[0]["headers"].get("x-authorization-digest", "")) == 64
 
     cmd_row = db.scalar(select(RecoveryCommand).where(RecoveryCommand.id == res.command_id))
@@ -309,6 +310,37 @@ def test_policy_engine_rejects_missing_or_expired_human_approval(
         )
     assert exc_exp.value.status_code == 403
     assert "APPROVAL_EXPIRED" in exc_exp.value.message
+
+    # Unexpired approval WITHOUT request_hash binding MUST be rejected (403)
+    unexpired_no_hash = Approval(
+        id=f"APPR-{uuid.uuid4().hex[:8].upper()}",
+        proposal_id=prop.id,
+        approver_role="OPS_MANAGER",
+        approver_id="mgr_01",
+        policy_version="FinResolve-Policy-v1.2",
+        decision="APPROVED",
+        digest="b" * 64,
+        expiry=datetime.now(UTC) + timedelta(minutes=30),
+    )
+    db.add(unexpired_no_hash)
+    db.commit()
+
+    with pytest.raises(AppError) as exc_nohash:
+        execute_and_verify_commerce_recovery(
+            db,
+            binding=binding,
+            obs=obs,
+            command="REQUEST_ORDER_SYNC",
+            idempotency_key=f"IDEMP-NOHASH-{uuid.uuid4().hex[:6]}",
+            expected_version=1,
+            require_human_approval=True,
+            approval_id=unexpired_no_hash.id,
+            write_key="test-write-key",
+            transport=transport,
+            read_connector=reader,
+        )
+    assert exc_nohash.value.status_code == 403
+    assert "APPROVAL_MISSING_REQUEST_HASH" in exc_nohash.value.message
     assert len(exec_calls) == 0
 
 

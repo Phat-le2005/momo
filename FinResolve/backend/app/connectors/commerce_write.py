@@ -66,15 +66,19 @@ class RecoveryExecutionResult:
 def _compute_command_hash(
     *,
     command: str,
-    binding_id: str,
+    merchant_id: str,
+    commerce_session_id: str,
+    world_epoch: int,
     order_id: str | None,
     payment_id: str | None,
     event_id: str | None,
     expected_version: int | None,
 ) -> str:
     canonical = {
+        "merchant_id": merchant_id,
+        "commerce_session_id": commerce_session_id,
+        "world_epoch": world_epoch,
         "command": command.strip().upper(),
-        "binding_id": binding_id,
         "order_id": order_id,
         "payment_id": payment_id,
         "event_id": event_id,
@@ -117,6 +121,7 @@ class CommerceWriteConnector:
         *,
         command: str,
         idempotency_key: str,
+        authorization_token: str,
         authorization_digest: str,
         order_id: str | None = None,
         payment_id: str | None = None,
@@ -131,9 +136,9 @@ class CommerceWriteConnector:
                 status_code=403,
                 retryable=False,
             )
-        if not authorization_digest or len(authorization_digest.strip()) < 32:
+        if not authorization_token or "." not in authorization_token:
             raise CommerceConnectorError(
-                "MISSING_POLICY_AUTHORIZATION_DIGEST: PolicyEngine authorization required",
+                "MISSING_SIGNED_AUTHORIZATION_TOKEN: signed PolicyEngine authorization required",
                 status_code=403,
                 retryable=False,
             )
@@ -143,6 +148,7 @@ class CommerceWriteConnector:
             "X-Merchant-Id": self.merchant_id,
             "X-Commerce-Session-Id": self.commerce_session_id,
             "X-World-Epoch": str(self.world_epoch),
+            "X-Command-Authorization": authorization_token.strip(),
             "X-Authorization-Digest": authorization_digest.strip(),
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -270,7 +276,9 @@ def execute_and_verify_commerce_recovery(
 
     req_hash = _compute_command_hash(
         command=norm_cmd,
-        binding_id=binding.id,
+        merchant_id=binding.merchant_id,
+        commerce_session_id=binding.commerce_session_id,
+        world_epoch=binding.commerce_world_epoch,
         order_id=obs.affected_order_id,
         payment_id=obs.affected_payment_id,
         event_id=str(target_event_id) if target_event_id else None,
@@ -319,6 +327,7 @@ def execute_and_verify_commerce_recovery(
         obs=obs,
         command=norm_cmd,
         request_hash=req_hash,
+        idempotency_key=idempotency_key,
         expected_version=effective_expected_version,
         order_snapshot=fresh_order,
         payment_snapshot=fresh_payment,
@@ -328,7 +337,11 @@ def execute_and_verify_commerce_recovery(
     )
 
     now = datetime.now(UTC)
-    if not decision.allowed or not decision.authorization_digest:
+    if (
+        not decision.allowed
+        or not decision.authorization_token
+        or not decision.authorization_digest
+    ):
         rejected_cmd = RecoveryCommand(
             id=f"RCMD-{uuid.uuid4().hex[:10].upper()}",
             session_id=binding.session_id,
@@ -429,6 +442,7 @@ def execute_and_verify_commerce_recovery(
         http_status, resp_data = writer.execute_command(
             command=norm_cmd,
             idempotency_key=idempotency_key,
+            authorization_token=decision.authorization_token,
             authorization_digest=decision.authorization_digest,
             order_id=obs.affected_order_id,
             payment_id=obs.affected_payment_id,
