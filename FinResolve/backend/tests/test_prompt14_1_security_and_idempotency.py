@@ -367,6 +367,8 @@ def test_unknown_outcome_reconciliation_via_receiver_status_lookup(
     }
     idemp_key = f"IDEMP-TOUT-{uuid.uuid4().hex[:8]}"
 
+    captured: dict[str, Any] = {"request_hash": None}
+
     def _timeout_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path.endswith("/timeline"):
             return httpx.Response(200, json=[])
@@ -385,6 +387,9 @@ def test_unknown_outcome_reconciliation_via_receiver_status_lookup(
                 200,
                 json={
                     "idempotency_key": idemp_key,
+                    "command": "REQUEST_ORDER_SYNC",
+                    "request_hash": captured["request_hash"],
+                    "world_epoch": binding.commerce_world_epoch,
                     "status": "EXECUTED",
                     "http_status": 200,
                     "result": {"command": "REQUEST_ORDER_SYNC", "status": "SYNCED"},
@@ -417,6 +422,7 @@ def test_unknown_outcome_reconciliation_via_receiver_status_lookup(
     cmd_row = db.scalar(select(RecoveryCommand).where(RecoveryCommand.id == res1.command_id))
     assert cmd_row is not None
     assert cmd_row.state == "UNKNOWN_OUTCOME"
+    captured["request_hash"] = cmd_row.request_hash
 
     # 2. Blind retry with same idempotency_key MUST be blocked (409)
     with pytest.raises(AppError) as exc_retry:
