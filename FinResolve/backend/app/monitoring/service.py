@@ -1571,15 +1571,15 @@ def run_binding_scan(
         except CommerceConnectorError:
             coverage["open_world"] = {"telemetry_available": False}
 
-        # Step 6c (Prompt 14.2 Fix 4): Autonomous investigation of submitted payment receipt claims
+        # Step 6c (Prompt 14.2 Fix 4 + Prompt 14.3 Fix 3): Autonomous receipt claim verification
         claim_candidates: list[DetectedAnomaly] = []
         from app.observability.receipt_verifier import verify_payment_claim_against_records
 
         orders_by_id = {str(o.get("id")): o for o in orders if o.get("id")}
-        payments_by_order: dict[str, dict[str, Any]] = {}
+        payments_by_order: dict[str, list[dict[str, Any]]] = {}
         for p in payments:
             if p.get("order_id"):
-                payments_by_order[str(p["order_id"])] = p
+                payments_by_order.setdefault(str(p["order_id"]), []).append(p)
 
         for rev in remote_events:
             if str(rev.get("event_type") or "").upper() != "PAYMENT_RECEIPT_CLAIM_SUBMITTED":
@@ -1589,6 +1589,10 @@ def run_binding_scan(
             comp_id = str(ev_payload.get("complaint_id") or rev.get("event_id") or "")
             img_ext = ev_payload.get("image_extracted") or {}
             cust_in = ev_payload.get("customer_entered") or {}
+            ext_status = str(img_ext.get("extraction_status") or "").upper()
+            meta_contradiction = bool(img_ext.get("metadata_pixel_contradiction", False))
+
+            # Strictly prefer PIXEL_OCR raw text; never mark unreadable image as CLAIM_SUPPORTED
             raw_text = str(img_ext.get("raw_extracted_text") or "")
             if not raw_text:
                 parts = []
@@ -1602,49 +1606,93 @@ def run_binding_scan(
                     parts.append(str(cust_in["note"]))
                 raw_text = " ".join(parts)
 
+            # Multi-payment matching: match claimed txn_ref across ALL payment attempts for order
+            order_payments = payments_by_order.get(oid, [])
+            claimed_ref_hint = (
+                str(img_ext.get("extracted_txn_ref") or cust_in.get("claimed_txn_ref") or "")
+                .strip()
+                .upper()
+            )
+            matched_payment: dict[str, Any] | None = None
+            if claimed_ref_hint and order_payments:
+                for cand_p in order_payments:
+                    cand_refs = {
+                        str(v).strip().upper()
+                        for v in (
+                            cand_p.get("provider_txn_ref"),
+                            cand_p.get("payment_id"),
+                            cand_p.get("id"),
+                        )
+                        if v
+                    }
+                    if claimed_ref_hint in cand_refs:
+                        matched_payment = cand_p
+                        break
+            if matched_payment is None and order_payments:
+                succeeded_ps = [
+                    p for p in order_payments if str(p.get("status") or "").upper() == "SUCCEEDED"
+                ]
+                matched_payment = succeeded_ps[-1] if succeeded_ps else order_payments[-1]
+
+            ocr_unavailable = ext_status in (
+                "OCR_ENGINE_UNAVAILABLE",
+                "UNREADABLE_OR_OCR_UNAVAILABLE",
+            )
+            img_unreadable = ext_status in (
+                "UNREADABLE_IMAGE",
+                "UNREADABLE_OR_OCR_UNAVAILABLE",
+            )
             verif = verify_payment_claim_against_records(
                 raw_claim_text=raw_text,
-                authoritative_payment=payments_by_order.get(oid),
+                authoritative_payment=matched_payment,
                 authoritative_order=orders_by_id.get(oid),
                 expected_merchant_id=binding.merchant_id,
-                ocr_available=str(img_ext.get("extraction_status") or "")
-                != "UNREADABLE_OR_OCR_UNAVAILABLE",
-                image_unreadable=str(img_ext.get("extraction_status") or "")
-                == "UNREADABLE_OR_OCR_UNAVAILABLE",
+                ocr_available=not ocr_unavailable,
+                image_unreadable=img_unreadable,
             )
-            if verif.verdict != "CLAIM_SUPPORTED":
+            effective_verdict = verif.verdict
+            effective_discrepancies = list(verif.discrepancies)
+            if meta_contradiction:
+                effective_verdict = "CLAIM_CONTRADICTED"
+                effective_discrepancies.append(
+                    "METADATA_PIXEL_CONTRADICTION: image metadata contradicts visible pixel OCR"
+                )
+            if effective_verdict != "CLAIM_SUPPORTED":
                 claim_candidates.append(
                     DetectedAnomaly(
                         detector_code="CLAIM_VERIF",
                         anomaly_type="SUSPICIOUS_PAYMENT_RECEIPT_CLAIM",
                         fingerprint=f"CLAIM_VERIF:{binding.merchant_id}:{oid}:{comp_id}",
-                        severity="HIGH" if verif.verdict == "CLAIM_CONTRADICTED" else "MEDIUM",
+                        severity=(
+                            "HIGH" if effective_verdict == "CLAIM_CONTRADICTED" else "MEDIUM"
+                        ),
                         affected_order_id=oid or None,
                         affected_payment_id=(
-                            str(
-                                payments_by_order[oid].get("payment_id")
-                                or payments_by_order[oid].get("id")
-                            )
-                            if oid in payments_by_order
+                            str(matched_payment.get("payment_id") or matched_payment.get("id"))
+                            if matched_payment is not None
                             else None
                         ),
                         affected_entities={
                             "complaint_id": comp_id,
                             "order_id": oid,
-                            "claim_verdict": verif.verdict,
+                            "claim_verdict": effective_verdict,
+                            "ocr_extraction_status": ext_status,
+                            "metadata_pixel_contradiction": meta_contradiction,
                             "prompt_injection_detected": verif.prompt_injection_detected,
                         },
                         evidence_refs=[
                             {
                                 "source": "PAYMENT_RECEIPT_CLAIM_VERIFIER",
                                 "evidence_kind": "CLAIM",
-                                "verdict": verif.verdict,
+                                "verdict": effective_verdict,
                                 "extracted_claim": verif.extracted_claim,
                                 "authoritative_comparison": verif.authoritative_comparison,
-                                "discrepancies": verif.discrepancies,
+                                "discrepancies": effective_discrepancies,
                             }
                         ],
-                        rationale=f"Receipt claim {comp_id} -> {verif.verdict}: {verif.rationale}",
+                        rationale=(
+                            f"Receipt claim {comp_id} -> {effective_verdict}: {verif.rationale}"
+                        ),
                         case_type="PAYMENT_CLAIM_INVESTIGATION",
                         recommended_action_hint="REQUEST_MANUAL_REVIEW",
                     )

@@ -100,14 +100,29 @@ def test_customer_receipt_claim_upload_ownership_safety_and_deletion(client: Tes
     )
     assert r_exe.status_code == 400
 
-    # 4. Legitimate customer receipt upload with real PNG text extraction succeeds
+    # 4. Legitimate customer receipt upload with real rendered-pixel PNG succeeds
+    import io
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    img = Image.new("RGB", (900, 260), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default(size=32)
+    except TypeError:
+        font = ImageFont.load_default()
+    draw.text((30, 30), "Ref: MOCKTXN12345", fill=(0, 0, 0), font=font)
+    draw.text((30, 100), f"Order: {order_id}", fill=(0, 0, 0), font=font)
+    draw.text((30, 170), "Amount: 250,000 VND", fill=(0, 0, 0), font=font)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    rendered_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
     r_ok = client.post(
         f"/api/v1/store/orders/{order_id}/receipt-claim",
         headers={"X-Customer-Token": t1},
         json={
-            "content_base64": _make_png(
-                400, 300, receipt_text=f"[SYNTHETIC TEST] Ref: MOCKTXN12345 {order_id} 250,000 VND"
-            ),
+            "content_base64": rendered_b64,
             "content_type": "image/png",
             "claimed_txn_ref": "MOCKTXN12345",
             "claimed_amount_vnd": 250000,
@@ -117,9 +132,14 @@ def test_customer_receipt_claim_upload_ownership_safety_and_deletion(client: Tes
     assert r_ok.status_code == 201
     body = r_ok.json()
     assert body["evidence_kind"] == "CLAIM"
-    assert body["ocr_extraction_status"] == "EXTRACTED"
-    assert body["image_extracted"]["extracted_txn_ref"] == "MOCKTXN12345"
-    assert body["image_extracted"]["extracted_amount_vnd"] == 250000
+    if body["image_extracted"]["ocr_ready"]:
+        assert body["ocr_extraction_status"] == "PIXEL_OCR_EXTRACTED"
+        assert body["image_extracted"]["provenance"] == "PIXEL_OCR"
+        assert body["image_extracted"]["extracted_txn_ref"] == "MOCKTXN12345"
+        assert body["image_extracted"]["extracted_amount_vnd"] == 250000
+    else:
+        assert body["ocr_extraction_status"] == "OCR_ENGINE_UNAVAILABLE"
+        assert body["image_extracted"]["provenance"] == "NONE"
     comp_id = body["complaint_id"]
 
     # 5. Customer retention/deletion removes private receipt file

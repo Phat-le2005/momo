@@ -1184,114 +1184,16 @@ def _validate_receipt_image_bytes(raw: bytes, content_type: str) -> tuple[int, i
 
 
 def _extract_receipt_from_image_bytes(raw: bytes, content_type: str) -> dict[str, Any]:
-    """Decode image safely, verify zlib/pixel integrity, and extract receipt text.
+    """Decode image safely and run real pixel-based Tesseract OCR (Prompt 14.3 Fix 3).
 
-    Supports:
-    - Real PNG chunk decoding (IHDR + bounded zlib IDAT decompression + tEXt/iTXt text layer).
-    - Optional local `pytesseract` OCR when installed and `tesseract` binary is available.
-    - Returns `UNREADABLE_OR_OCR_UNAVAILABLE` if no text can be extracted (NEVER fabricates text!).
+    NEVER treats PNG tEXt/iTXt metadata as visible pixel OCR!
     """
-    import re
-    import struct
-    import zlib
+    from app.core.ocr import extract_receipt_with_pixel_ocr
 
-    norm = content_type.strip().lower().split(";")[0]
-    extracted_texts: list[str] = []
-    extraction_method = "NONE"
-
-    if norm == "image/png":
-        pos = 8
-        idat_chunks: list[bytes] = []
-        n = len(raw)
-        while pos + 12 <= n:
-            length = struct.unpack(">I", raw[pos : pos + 4])[0]
-            ctype = raw[pos + 4 : pos + 8]
-            data_start = pos + 8
-            data_end = data_start + length
-            if data_end + 4 > n:
-                raise CommerceError(
-                    ErrorCode.BAD_REQUEST, "MALFORMED_PNG_TRUNCATED_CHUNK", status_code=400
-                )
-            cdata = raw[data_start:data_end]
-            if ctype == b"IDAT":
-                idat_chunks.append(cdata)
-            elif ctype == b"tEXt":
-                parts = cdata.split(b"\x00", 1)
-                if len(parts) == 2:
-                    extracted_texts.append(parts[1].decode("utf-8", errors="ignore").strip())
-            elif ctype == b"iTXt":
-                parts = cdata.split(b"\x00", 5)
-                if len(parts) >= 6:
-                    extracted_texts.append(parts[-1].decode("utf-8", errors="ignore").strip())
-            elif ctype == b"IEND":
-                break
-            pos = data_end + 4
-
-        if idat_chunks:
-            try:
-                decomp = zlib.decompressobj()
-                out = decomp.decompress(b"".join(idat_chunks), _MAX_RECEIPT_PIXELS * 4)
-                if decomp.unconsumed_tail:
-                    raise CommerceError(
-                        ErrorCode.BAD_REQUEST,
-                        "DECOMPRESSION_BOMB_BLOCKED: decoded image exceeds pixel buffer limit",
-                        status_code=400,
-                    )
-                _ = len(out)
-            except zlib.error as exc:
-                raise CommerceError(
-                    ErrorCode.BAD_REQUEST, "MALFORMED_PNG_CORRUPT_IDAT", status_code=400
-                ) from exc
-        if extracted_texts:
-            extraction_method = "PNG_TEXT_LAYER_DECODER"
-
-    if not extracted_texts:
-        try:
-            import importlib
-            import io
-
-            pytesseract_mod = importlib.import_module("pytesseract")
-            pil_image_mod = importlib.import_module("PIL.Image")
-            with pil_image_mod.open(io.BytesIO(raw)) as img:
-                ocr_txt = str(pytesseract_mod.image_to_string(img, timeout=5) or "").strip()
-                if ocr_txt:
-                    extracted_texts.append(ocr_txt)
-                    extraction_method = "TESSERACT_OCR"
-        except Exception:  # noqa: BLE001
-            extraction_method = "NONE"
-
-    full_text = "\n".join(t for t in extracted_texts if t).strip()
-    if not full_text:
-        return {
-            "extraction_status": "UNREADABLE_OR_OCR_UNAVAILABLE",
-            "extraction_method": extraction_method,
-            "raw_extracted_text": "",
-            "extracted_txn_ref": None,
-            "extracted_order_id": None,
-            "extracted_amount_vnd": None,
-            "extracted_currency": None,
-        }
-
-    ref_m = re.search(
-        r"(?:ref|txn|mã giao dịch|biên lai)[:\s#]*([A-Z0-9_-]{5,40})", full_text, re.I
-    )
-    ord_m = re.search(r"(ORD-[A-Z0-9_-]{4,32})", full_text, re.I)
-    amt_m = re.search(r"(\d[\d.,]{3,12})\s*(?:vnd|đ|d\b)", full_text, re.I)
-    extracted_amt: int | None = None
-    if amt_m:
-        digits = re.sub(r"[^\d]", "", amt_m.group(1))
-        if digits.isdigit():
-            extracted_amt = int(digits)
-
-    return {
-        "extraction_status": "EXTRACTED",
-        "extraction_method": extraction_method,
-        "raw_extracted_text": full_text[:2000],
-        "extracted_txn_ref": ref_m.group(1) if ref_m else None,
-        "extracted_order_id": ord_m.group(1) if ord_m else None,
-        "extracted_amount_vnd": extracted_amt,
-        "extracted_currency": "VND" if extracted_amt is not None else None,
-    }
+    try:
+        return extract_receipt_with_pixel_ocr(raw, content_type)
+    except ValueError as exc:
+        raise CommerceError(ErrorCode.BAD_REQUEST, str(exc), status_code=400) from exc
 
 
 @router.post(

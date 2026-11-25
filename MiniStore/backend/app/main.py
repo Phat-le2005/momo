@@ -99,11 +99,26 @@ def create_app() -> FastAPI:
         return {"status": "ok", "service": settings.app_name, "source_mode": settings.source_mode}
 
     @app.get("/readyz", tags=["health"])
-    def readyz() -> dict[str, str]:
+    def readyz() -> dict[str, Any]:
+        from app.core.ocr import get_ocr_readiness
+
         engine = get_engine()
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        return {"status": "ready", "database": "connected", "source_mode": settings.source_mode}
+        ocr_info = get_ocr_readiness()
+        return {
+            "status": "ready",
+            "database": "connected",
+            "source_mode": settings.source_mode,
+            "ocr_ready": bool(ocr_info["ocr_ready"]),
+            "ocr": ocr_info,
+        }
+
+    @app.get("/api/v1/health/ocr", tags=["health"])
+    def health_ocr() -> dict[str, Any]:
+        from app.core.ocr import get_ocr_readiness
+
+        return get_ocr_readiness()
 
     app.include_router(storefront_router, prefix="/api/v1")
     app.include_router(merchant_router, prefix="/api/v1")
