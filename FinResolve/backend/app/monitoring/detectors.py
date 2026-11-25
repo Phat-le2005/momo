@@ -382,6 +382,17 @@ def detect_d05_inventory_inconsistency(snapshot: CommerceSnapshot) -> list[Detec
     return anomalies
 
 
+# Events expected to arrive via push outbox (MiniStore FINRESOLVE_SUPPORTED_EVENT_MAP)
+PUSH_EXPECTED_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "ORDER_CREATED",
+        "ORDER_UPDATED",
+        "PAYMENT_INITIATED",
+        "INVENTORY_UPDATED",
+    }
+)
+
+
 # --- D06: Missing / Delayed Event Delivery ---
 def detect_d06_missing_event_delivery(
     snapshot: CommerceSnapshot,
@@ -391,7 +402,11 @@ def detect_d06_missing_event_delivery(
     anomalies: list[DetectedAnomaly] = []
     for ev in snapshot.remote_events:
         ev_id = str(ev.get("event_id") or "")
-        if not ev_id or ev_id in snapshot.ingested_event_ids:
+        ev_type = str(ev.get("event_type") or "").strip().upper()
+        # Only flag push-expected event types; never classify pull-only events as missing push!
+        if not ev_id or ev_type not in PUSH_EXPECTED_EVENT_TYPES:
+            continue
+        if ev_id in snapshot.ingested_event_ids:
             continue
         occurred = _parse_iso(ev.get("occurred_at"))
         age_s = _age_seconds(occurred, snapshot.observed_at)
@@ -405,17 +420,18 @@ def detect_d06_missing_event_delivery(
                 severity="MEDIUM",
                 affected_order_id=str(ev.get("order_id")) if ev.get("order_id") else None,
                 affected_payment_id=str(ev.get("payment_id")) if ev.get("payment_id") else None,
-                affected_entities={"event_id": ev_id, "event_type": ev.get("event_type")},
+                affected_entities={"event_id": ev_id, "event_type": ev_type},
                 evidence_refs=[
                     {
                         "source": "MINI_STORE_COMMERCE_HTTP",
                         "endpoint": "/api/v1/service/events",
                         "event_id": ev_id,
+                        "event_type": ev_type,
                         "age_seconds": round(age_s, 1),
                     }
                 ],
                 rationale=(
-                    f"Commerce event {ev_id} ({ev.get('event_type')}) was not in FinResolve "
+                    f"Push-expected Commerce event {ev_id} ({ev_type}) was not in FinResolve "
                     f"inbox after {age_s:.0f}s; recovered via pull reconciliation."
                 ),
                 case_type="OPERATIONAL_ANOMALY",

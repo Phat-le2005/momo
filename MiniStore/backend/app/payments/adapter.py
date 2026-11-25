@@ -263,6 +263,7 @@ def apply_authoritative_payment_observation(
     force_reconciliation: bool = False,
     reconciliation_note: str | None = None,
     raw_payload: dict[str, Any] | None = None,
+    expected_querydr_claim_token: str | None = None,
 ) -> tuple[Payment, bool]:
     """Shared atomic domain service for applying an authoritative payment state observation.
 
@@ -324,6 +325,15 @@ def apply_authoritative_payment_observation(
     payment = db.scalar(select(Payment).where(Payment.id == pay_lookup.id).with_for_update())
     if payment is None:
         raise CommerceError(ErrorCode.NOT_FOUND, "Payment not found", status_code=404)
+    if (
+        expected_querydr_claim_token is not None
+        and payment.querydr_claim_token != expected_querydr_claim_token
+    ):
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            "STALE_QUERYDR_CLAIM_TOKEN: worker lost lease ownership before applying observation",
+            status_code=409,
+        )
 
     # Strictly block cross-provider mutations!
     if payment.provider != expected_provider:

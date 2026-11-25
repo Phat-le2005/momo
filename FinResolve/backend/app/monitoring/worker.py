@@ -1,7 +1,8 @@
 """Standalone Autonomous Continuous Commerce Monitor Worker (`python -m app.monitoring.worker`).
 
 Multi-worker safe via PostgreSQL lease claiming (`FOR UPDATE SKIP LOCKED`, `lease_token`,
-`locked_until`), heartbeat, graceful shutdown, and world-epoch fencing.
+`locked_until`), strict in-transaction fencing passed to every authoritative write, heartbeat,
+graceful shutdown, and non-silent world-epoch invalidation.
 """
 
 from __future__ import annotations
@@ -33,10 +34,11 @@ def run_monitor_tick(
     worker_id: str | None = None,
     lease_seconds: int | None = None,
     limit: int = 10,
+    session_id: str | None = None,
     transport: httpx.BaseTransport | None = None,
     service_key: str | None = None,
 ) -> list[ScanSummary]:
-    """Claim due `CommerceSourceBinding` leases, run scans outside locks, and release leases."""
+    """Claim due `CommerceSourceBinding` leases, run fenced scans, and release leases."""
     settings = get_settings()
     wid = worker_id or f"monitor-{socket.gethostname()}-{os.getpid()}"
     lease_s = lease_seconds or settings.monitor_lease_seconds
@@ -48,6 +50,7 @@ def run_monitor_tick(
         select(CommerceSourceBinding)
         .where(
             CommerceSourceBinding.is_enabled.is_(True),
+            CommerceSourceBinding.world_reset_required.is_(False),
             CommerceSourceBinding.base_url != "",
             or_(
                 CommerceSourceBinding.locked_until.is_(None),
@@ -58,42 +61,52 @@ def run_monitor_tick(
         .with_for_update(skip_locked=True)
         .limit(limit)
     )
+    if session_id is not None:
+        claim_stmt = claim_stmt.where(CommerceSourceBinding.session_id == session_id)
+
     claimed = list(db.scalars(claim_stmt).all())
     if not claimed:
         return []
 
-    claimed_tokens: list[tuple[str, str]] = []
+    claimed_items: list[tuple[str, str, int]] = []
     for b in claimed:
+        # World-epoch fencing: NEVER silently rebind stale Commerce data to a new FinResolve world!
+        sup_state = db.get(SupervisorState, b.session_id)
+        if sup_state is not None and b.world_epoch != sup_state.world_epoch:
+            b.world_reset_required = True
+            b.is_enabled = False
+            b.connectivity_status = "WORLD_RESET_REQUIRED"
+            b.last_error = (
+                f"FinResolve world_epoch advanced ({b.world_epoch} -> {sup_state.world_epoch}); "
+                "explicit authorized rebinding required."
+            )
+            b.updated_at = now
+            continue
+
         token = f"MLEASE-{uuid.uuid4().hex[:12].upper()}"
         b.worker_id = wid
         b.lease_token = token
         b.locked_until = lease_until
         b.last_heartbeat_at = now
         b.updated_at = now
-        claimed_tokens.append((b.id, token))
+        claimed_items.append((b.id, token, b.world_epoch))
     db.commit()
 
     summaries: list[ScanSummary] = []
 
-    # Phase 2 & 3: scan outside row lock, then release lease only if fencing token still matches
-    for binding_id, token in claimed_tokens:
+    # Phase 2 & 3: fenced scan outside row lock, then release lease only if token still matches
+    for binding_id, token, expected_epoch in claimed_items:
         binding = db.get(CommerceSourceBinding, binding_id)
         if binding is None or binding.lease_token != token:
             continue
-
-        # World-epoch fencing: sync binding.world_epoch with SupervisorState.world_epoch
-        sup_state = db.get(SupervisorState, binding.session_id)
-        if sup_state is not None and binding.world_epoch != sup_state.world_epoch:
-            binding.world_epoch = sup_state.world_epoch
-            binding.last_event_cursor = None
-            binding.last_event_occurred_at = None
-            db.commit()
 
         summary = run_binding_scan(
             db,
             binding=binding,
             transport=transport,
             service_key=service_key,
+            lease_token=token,
+            expected_world_epoch=expected_epoch,
         )
         summaries.append(summary)
 

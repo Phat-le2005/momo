@@ -49,14 +49,24 @@ class CommerceSourceBinding(Base):
     merchant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     commerce_session_id: Mapped[str] = mapped_column(String(64), nullable=False)
     commerce_world_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    connector_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="default_ministore"
+    )
     base_url: Mapped[str] = mapped_column(String(255), nullable=False)
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    world_reset_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     connectivity_status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="UNCONFIGURED"
     )
     last_event_cursor: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_event_occurred_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    events_scan_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_orders_cursor: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_payments_cursor: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_scan_coverage_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
     )
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -125,6 +135,7 @@ class AnomalyObservation(Base):
     )
     rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
     observation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     first_observed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
@@ -134,6 +145,7 @@ class AnomalyObservation(Base):
     linked_case_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     linked_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     recovery_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    verification_verdict: Mapped[str | None] = mapped_column(String(32), nullable=True)
     verified_recovered_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

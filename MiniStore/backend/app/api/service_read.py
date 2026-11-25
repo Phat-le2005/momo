@@ -40,6 +40,7 @@ router = APIRouter(prefix="/service", tags=["service-read-connectors"])
 def service_list_orders(
     status: str | None = Query(default=None, max_length=32),
     reconciliation_status: str | None = Query(default=None, max_length=32),
+    after_id: str | None = Query(default=None, max_length=64),
     limit: int = Query(default=50, ge=1, le=200),
     principal: ServicePrincipal = Depends(get_service_principal),
     db: Session = Depends(get_db),
@@ -59,7 +60,30 @@ def service_list_orders(
         stmt = stmt.where(Order.status == status.strip().upper())
     if reconciliation_status:
         stmt = stmt.where(Order.reconciliation_status == reconciliation_status.strip().upper())
-    rows = list(db.scalars(stmt.order_by(Order.created_at.desc()).limit(limit)).all())
+    if after_id:
+        anchor = db.scalar(
+            select(Order).where(
+                Order.id == after_id,
+                Order.merchant_id == principal.merchant_id,
+                Order.commerce_session_id == principal.commerce_session_id,
+                Order.world_epoch == principal.world_epoch,
+            )
+        )
+        if anchor is None:
+            raise CommerceError(
+                ErrorCode.BAD_REQUEST,
+                f"Invalid order cursor after_id '{after_id}'",
+                status_code=400,
+            )
+        stmt = stmt.where(
+            or_(
+                Order.created_at > anchor.created_at,
+                and_(Order.created_at == anchor.created_at, Order.id > anchor.id),
+            )
+        )
+    rows = list(
+        db.scalars(stmt.order_by(Order.created_at.asc(), Order.id.asc()).limit(limit)).all()
+    )
     return [_to_order_response(o).model_dump() for o in rows]
 
 
@@ -78,6 +102,7 @@ def service_get_order(
             Order.id == order_id,
             Order.merchant_id == principal.merchant_id,
             Order.commerce_session_id == principal.commerce_session_id,
+            Order.world_epoch == principal.world_epoch,
         )
     )
     if order is None:
@@ -92,13 +117,19 @@ def service_list_payments(
     status: str | None = Query(default=None, max_length=32),
     is_synced: bool | None = Query(default=None),
     reconciliation_required: bool | None = Query(default=None),
+    after_id: str | None = Query(default=None, max_length=64),
     limit: int = Query(default=50, ge=1, le=200),
     principal: ServicePrincipal = Depends(get_service_principal),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    stmt = select(Payment).where(
-        Payment.merchant_id == principal.merchant_id,
-        Payment.commerce_session_id == principal.commerce_session_id,
+    stmt = (
+        select(Payment)
+        .join(Order, Payment.order_id == Order.id)
+        .where(
+            Payment.merchant_id == principal.merchant_id,
+            Payment.commerce_session_id == principal.commerce_session_id,
+            Order.world_epoch == principal.world_epoch,
+        )
     )
     if status:
         stmt = stmt.where(Payment.status == status.strip().upper())
@@ -106,7 +137,32 @@ def service_list_payments(
         stmt = stmt.where(Payment.is_synced_to_order.is_(is_synced))
     if reconciliation_required is not None:
         stmt = stmt.where(Payment.reconciliation_required.is_(reconciliation_required))
-    rows = list(db.scalars(stmt.order_by(Payment.created_at.desc()).limit(limit)).all())
+    if after_id:
+        anchor = db.scalar(
+            select(Payment)
+            .join(Order, Payment.order_id == Order.id)
+            .where(
+                Payment.id == after_id,
+                Payment.merchant_id == principal.merchant_id,
+                Payment.commerce_session_id == principal.commerce_session_id,
+                Order.world_epoch == principal.world_epoch,
+            )
+        )
+        if anchor is None:
+            raise CommerceError(
+                ErrorCode.BAD_REQUEST,
+                f"Invalid payment cursor after_id '{after_id}'",
+                status_code=400,
+            )
+        stmt = stmt.where(
+            or_(
+                Payment.created_at > anchor.created_at,
+                and_(Payment.created_at == anchor.created_at, Payment.id > anchor.id),
+            )
+        )
+    rows = list(
+        db.scalars(stmt.order_by(Payment.created_at.asc(), Payment.id.asc()).limit(limit)).all()
+    )
     result: list[dict[str, Any]] = []
     for payment in rows:
         obs = build_payment_observation(db, payment=payment)
@@ -151,10 +207,13 @@ def service_get_payment_observation(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     payment = db.scalar(
-        select(Payment).where(
+        select(Payment)
+        .join(Order, Payment.order_id == Order.id)
+        .where(
             Payment.id == payment_id,
             Payment.merchant_id == principal.merchant_id,
             Payment.commerce_session_id == principal.commerce_session_id,
+            Order.world_epoch == principal.world_epoch,
         )
     )
     if payment is None:
@@ -200,9 +259,12 @@ def service_get_payment_query_history(
     rows = list(
         db.scalars(
             select(PaymentQueryAttempt)
+            .join(Order, PaymentQueryAttempt.order_id == Order.id)
             .where(
                 PaymentQueryAttempt.payment_id == payment_id,
                 PaymentQueryAttempt.merchant_id == principal.merchant_id,
+                Order.commerce_session_id == principal.commerce_session_id,
+                Order.world_epoch == principal.world_epoch,
             )
             .order_by(PaymentQueryAttempt.created_at.desc())
             .limit(50)
@@ -238,10 +300,12 @@ def service_get_order_reservations(
     rows = list(
         db.scalars(
             select(InventoryReservation)
+            .join(Order, InventoryReservation.order_id == Order.id)
             .where(
                 InventoryReservation.order_id == order_id,
                 InventoryReservation.merchant_id == principal.merchant_id,
                 InventoryReservation.commerce_session_id == principal.commerce_session_id,
+                Order.world_epoch == principal.world_epoch,
             )
             .order_by(InventoryReservation.variant_id.asc())
         ).all()
@@ -270,9 +334,13 @@ def service_get_refund_history(
     rows = list(
         db.scalars(
             select(RefundTransaction)
+            .join(Payment, RefundTransaction.payment_id == Payment.id)
+            .join(Order, Payment.order_id == Order.id)
             .where(
                 RefundTransaction.payment_id == payment_id,
                 RefundTransaction.merchant_id == principal.merchant_id,
+                Order.commerce_session_id == principal.commerce_session_id,
+                Order.world_epoch == principal.world_epoch,
             )
             .order_by(RefundTransaction.created_at.asc())
         ).all()
@@ -299,7 +367,16 @@ def service_list_refunds(
     principal: ServicePrincipal = Depends(get_service_principal),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    stmt = select(RefundTransaction).where(RefundTransaction.merchant_id == principal.merchant_id)
+    stmt = (
+        select(RefundTransaction)
+        .join(Payment, RefundTransaction.payment_id == Payment.id)
+        .join(Order, Payment.order_id == Order.id)
+        .where(
+            RefundTransaction.merchant_id == principal.merchant_id,
+            Order.commerce_session_id == principal.commerce_session_id,
+            Order.world_epoch == principal.world_epoch,
+        )
+    )
     if status:
         stmt = stmt.where(RefundTransaction.status == status.strip().upper())
     rows = list(db.scalars(stmt.order_by(RefundTransaction.created_at.desc()).limit(limit)).all())
@@ -374,6 +451,7 @@ def service_get_recent_events(
                 CommerceEvent.id == after_id,
                 CommerceEvent.merchant_id == principal.merchant_id,
                 CommerceEvent.commerce_session_id == principal.commerce_session_id,
+                CommerceEvent.world_epoch == principal.world_epoch,
             )
         )
         if anchor is None:
@@ -436,6 +514,7 @@ def service_get_order_timeline(
                 CommerceEvent.order_id == order_id,
                 CommerceEvent.merchant_id == principal.merchant_id,
                 CommerceEvent.commerce_session_id == principal.commerce_session_id,
+                CommerceEvent.world_epoch == principal.world_epoch,
             )
             .order_by(CommerceEvent.occurred_at.asc(), CommerceEvent.id.asc())
         ).all()

@@ -389,6 +389,7 @@ class VNPaySandboxAdapter:
         *,
         payment_id: str,
         client_ip: str = "127.0.0.1",
+        expected_claim_token: str | None = None,
     ) -> PaymentObservation:
         """Execute VNPAY 2.1.0 `querydr` API, persist durable attempt history, and reconcile."""
         tmn_code, hash_secret, version, _, _ = self._require_configured()
@@ -489,6 +490,16 @@ class VNPaySandboxAdapter:
             db.commit()
             raise CommerceError(ErrorCode.NOT_FOUND, "Payment not found", status_code=404)
         payment = locked_pay
+
+        # Section 12 QueryDr lease fencing: stale worker must NOT apply authoritative state
+        if expected_claim_token is not None and payment.querydr_claim_token != expected_claim_token:
+            attempt.error_message = "STALE_QUERYDR_CLAIM_TOKEN: worker lost lease ownership"
+            db.commit()
+            raise CommerceError(
+                ErrorCode.CONFLICT,
+                "STALE_QUERYDR_CLAIM_TOKEN: worker lost lease ownership",
+                status_code=409,
+            )
 
         # Network timeout / error -> DO NOT convert into payment failure; mark UNKNOWN if needed
         if err_msg is not None or not sig_ok:
@@ -651,8 +662,7 @@ class VNPaySandboxAdapter:
             db.commit()
             return build_payment_observation(db, payment=payment)
 
-        db.commit()
-
+        # Apply authoritative observation atomically without releasing lock gap
         updated_pay, _ = apply_authoritative_payment_observation(
             db,
             expected_provider=self.provider_name,
@@ -673,6 +683,7 @@ class VNPaySandboxAdapter:
             force_reconciliation=mapping.reconciliation_required,
             reconciliation_note=mapping.reason,
             raw_payload=_sanitize_vnpay_payload(resp_data),
+            expected_querydr_claim_token=expected_claim_token,
         )
         return build_payment_observation(db, payment=updated_pay)
 

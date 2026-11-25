@@ -1,24 +1,31 @@
-"""Continuous Commerce Monitor Core Service (Prompt 12 Sections 10, 12, 15).
+"""Continuous Commerce Monitor Core Service (Prompt 12 + Prompt 12.1 Hardening).
 
-Responsibilities:
-1. Durable checkpoint pull collector (`collect_commerce_events`) with bounded overlap +
-   `NormalizedEvent` deduplication; advances cursor ONLY after commit.
-2. Autonomous anomaly detection & deduplication (`record_or_update_anomaly`) using unique
-   `(session_id, world_epoch, fingerprint)` under PostgreSQL `IntegrityError` handling.
-3. Automatic Case + SupervisorJob scheduling bound to `source_system="COMMERCE_HTTP"` and
-   `source_binding_id=binding.id`, respecting `DemoSession.max_cases` & concurrency cap
-   (retaining anomalies in `OBSERVED` when quota is reached — never discarding!).
-4. Independent recovery verification (`verify_anomaly_recovery`) that re-reads authoritative
-   MiniStore HTTP records and marks `RECOVERED` ONLY when postconditions are verified.
+Hardened Invariants:
+- P0: Bindings use server-registered `connector_id` and approved URLs only; historical bindings
+  referenced by Cases cannot silently mutate scope or destination.
+- P1: Full multi-page event collection within bounded work budgets, unified push/pull canonical
+  event hashing (`compute_canonical_event_hash`), payload conflict detection, and continuation.
+- P1: D06 missing-event detection runs against prior inbox state BEFORE ingesting pulled events,
+  only for push-expected event types, then recovers & verifies in the same scan.
+- P1: True lease & world-epoch fencing (`_assert_binding_lease_in_txn`) inside EVERY authoritative
+  write transaction so a stale worker that lost ownership can NEVER commit checkpoints, anomalies,
+  Cases, or recovery transitions.
+- P1: Strict detector-specific recovery verification with explicit 5-state verdicts
+  (`VERIFIED_RECOVERY`, `STILL_INCONSISTENT`, `INSUFFICIENT_EVIDENCE`, `SOURCE_UNAVAILABLE`,
+  `UNKNOWN_OUTCOME`) and evidence-backed actor attribution (default `"UNKNOWN"`).
+- P2: Multi-page order/payment scanning beyond 200 records + recurrence-aware anomaly reopening
+  preserving prior recovery history.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Any
 
 import httpx
@@ -26,14 +33,25 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.connectors.commerce import CommerceConnectorError, CommerceReadConnector
+from app.connectors.commerce import (
+    CommerceConnectorError,
+    CommerceReadConnector,
+    resolve_registered_connector_url,
+    validate_approved_commerce_url,
+)
 from app.core.config import get_settings
+from app.core.errors import AppError, ErrorCode
 from app.models.cases import Case, CaseEvent, Evidence
 from app.models.enums import CaseState, EvidenceKind
 from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
 from app.models.session import DemoSession
 from app.models.supervisor import NormalizedEvent, SupervisorJob
-from app.monitoring.detectors import CommerceSnapshot, DetectedAnomaly, run_all_detectors
+from app.monitoring.detectors import (
+    CommerceSnapshot,
+    DetectedAnomaly,
+    detect_d06_missing_event_delivery,
+    run_all_detectors,
+)
 from app.supervisor.service import (
     enqueue_case_investigation_job,
     ensure_supervisor_state,
@@ -43,35 +61,128 @@ from app.supervisor.service import (
 OVERLAP_WINDOW_SECONDS = 5
 
 
+class StaleLeaseError(RuntimeError):
+    """Raised when a monitor worker attempts an authoritative write after losing its lease."""
+
+
+class RecoveryVerdict(StrEnum):
+    VERIFIED_RECOVERY = "VERIFIED_RECOVERY"
+    STILL_INCONSISTENT = "STILL_INCONSISTENT"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    SOURCE_UNAVAILABLE = "SOURCE_UNAVAILABLE"
+    UNKNOWN_OUTCOME = "UNKNOWN_OUTCOME"
+
+
 @dataclass
 class ScanSummary:
     binding_id: str
     connectivity_status: str
     events_pulled: int = 0
     events_new: int = 0
+    events_conflicts: int = 0
+    events_scan_complete: bool = True
     anomalies_detected: int = 0
     cases_created: int = 0
     recoveries_verified: int = 0
+    orders_scanned: int = 0
+    payments_scanned: int = 0
     error: str | None = None
+
+
+@dataclass
+class VerificationResult:
+    verdict: RecoveryVerdict
+    recovered: bool
+    recovery_source: str
+    detail: str
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+
+def compute_canonical_event_hash(
+    *,
+    event_id: str,
+    event_type: str,
+    merchant_id: str,
+    order_id: str | None,
+    payment_id: str | None,
+    payload: dict[str, Any] | None,
+) -> str:
+    """Unified canonical payload hash shared across push and pull ingestion channels."""
+    canonical = {
+        "event_id": event_id.strip(),
+        "event_type": event_type.strip().upper(),
+        "merchant_id": merchant_id.strip(),
+        "order_id": order_id,
+        "payment_id": payment_id,
+        "payload": payload or {},
+    }
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _assert_binding_lease_in_txn(
+    db: Session,
+    *,
+    binding_id: str,
+    lease_token: str | None,
+    expected_world_epoch: int | None,
+) -> CommerceSourceBinding:
+    """Lock `CommerceSourceBinding` and verify active lease token & world epoch inside a txn."""
+    locked = db.scalar(
+        select(CommerceSourceBinding)
+        .where(CommerceSourceBinding.id == binding_id)
+        .with_for_update()
+    )
+    if locked is None:
+        raise StaleLeaseError(f"Binding '{binding_id}' no longer exists")
+    if expected_world_epoch is not None and locked.world_epoch != expected_world_epoch:
+        raise StaleLeaseError(
+            f"World epoch mismatch on binding '{binding_id}': "
+            f"expected {expected_world_epoch}, got {locked.world_epoch}"
+        )
+    if lease_token is not None:
+        if locked.lease_token != lease_token:
+            raise StaleLeaseError(
+                f"Lease token mismatch on binding '{binding_id}': worker lost ownership"
+            )
+        now = datetime.now(UTC)
+        if locked.locked_until is not None and locked.locked_until <= now:
+            raise StaleLeaseError(f"Lease expired on binding '{binding_id}'")
+    return locked
 
 
 def ensure_commerce_binding(
     db: Session,
     *,
     session_id: str,
+    connector_id: str | None = None,
     base_url: str | None = None,
     merchant_id: str | None = None,
     commerce_session_id: str | None = None,
     commerce_world_epoch: int | None = None,
     is_enabled: bool = True,
 ) -> CommerceSourceBinding:
-    """Create or update a session's `CommerceSourceBinding`."""
+    """Create or update a session's `CommerceSourceBinding` using approved connector destinations.
+
+    Security invariants:
+    - Always validates destination via `validate_approved_commerce_url` / registered connector.
+    - Prevents silently mutating destination/scope of a binding referenced by historical Cases.
+    """
     settings = get_settings()
     sup_state = ensure_supervisor_state(db, session_id)
     world_epoch = sup_state.world_epoch
     mid = (merchant_id or settings.commerce_merchant_id).strip()
     csid = (commerce_session_id or settings.commerce_session_id).strip()
-    url = (base_url or settings.commerce_service_base_url).strip().rstrip("/")
+    cid = (connector_id or settings.commerce_connector_id).strip()
+
+    if base_url is not None and base_url.strip():
+        url = validate_approved_commerce_url(base_url)
+    elif settings.commerce_service_base_url.strip():
+        url = resolve_registered_connector_url(cid)
+    else:
+        url = ""
+
     c_epoch = commerce_world_epoch or settings.commerce_world_epoch
 
     existing = db.scalar(
@@ -83,14 +194,27 @@ def ensure_commerce_binding(
     )
     now = datetime.now(UTC)
     if existing is not None:
+        # Guard historical Cases against silent binding destination/scope mutation
+        linked_cases = int(
+            db.scalar(select(func.count(Case.id)).where(Case.source_binding_id == existing.id)) or 0
+        )
+        if linked_cases > 0 and url and existing.base_url and url != existing.base_url:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "BINDING_IMMUTABLE_WITH_HISTORICAL_CASES: cannot change destination URL "
+                "of a binding referenced by existing Cases",
+                status_code=409,
+            )
         if url:
             existing.base_url = url
+        existing.connector_id = cid
         existing.world_epoch = world_epoch
         existing.commerce_world_epoch = c_epoch
         existing.is_enabled = is_enabled
+        existing.world_reset_required = False
         if not is_enabled:
             existing.connectivity_status = "PAUSED"
-        elif existing.connectivity_status == "PAUSED":
+        elif existing.connectivity_status in ("PAUSED", "WORLD_RESET_REQUIRED"):
             existing.connectivity_status = "UNCONFIGURED" if not existing.base_url else "CONNECTED"
         existing.updated_at = now
         db.commit()
@@ -104,8 +228,10 @@ def ensure_commerce_binding(
         merchant_id=mid,
         commerce_session_id=csid,
         commerce_world_epoch=c_epoch,
+        connector_id=cid,
         base_url=url,
         is_enabled=is_enabled,
+        world_reset_required=False,
         connectivity_status="PAUSED"
         if not is_enabled
         else ("CONNECTED" if url else "UNCONFIGURED"),
@@ -139,17 +265,185 @@ def build_connector_for_binding(
     )
 
 
-def _hash_remote_event(item: dict[str, Any]) -> str:
-    canonical = {
-        "event_id": item.get("event_id"),
-        "event_type": item.get("event_type"),
-        "order_id": item.get("order_id"),
-        "payment_id": item.get("payment_id"),
-        "payload": item.get("payload") or {},
-    }
-    return hashlib.sha256(
-        json.dumps(canonical, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
+def _fetch_remote_events_paginated(
+    binding: CommerceSourceBinding,
+    connector: CommerceReadConnector,
+    *,
+    batch_size: int,
+    max_pages: int,
+) -> tuple[list[dict[str, Any]], bool, str | None, datetime | None, bool]:
+    """Fetch multiple pages of remote Commerce events within bounded work budget.
+
+    Returns `(events, scan_complete, next_cursor, latest_occurred, cursor_was_reset)`.
+    """
+    collected: list[dict[str, Any]] = []
+    seen_row_ids: set[str] = set()
+    cursor: str | None = binding.last_event_cursor
+    latest_occurred: datetime | None = binding.last_event_occurred_at
+    cursor_was_reset = False
+
+    # First page uses bounded overlap window when we have a prior timestamp (catches late commits),
+    # then subsequent pages strictly advance via `after_id` cursor so we NEVER stall on page 1!
+    use_since = latest_occurred is not None and binding.events_scan_complete
+    scan_complete = True
+
+    for page_idx in range(max_pages):
+        try:
+            if page_idx == 0 and use_since and latest_occurred is not None:
+                since_dt = latest_occurred - timedelta(seconds=OVERLAP_WINDOW_SECONDS)
+                page, _ = connector.get_events(since=since_dt, limit=batch_size)
+            else:
+                page, _ = connector.get_events(after_id=cursor, limit=batch_size)
+        except CommerceConnectorError as exc:
+            if exc.status_code == 400 and cursor is not None:
+                cursor = None
+                latest_occurred = None
+                cursor_was_reset = True
+                page, _ = connector.get_events(limit=batch_size)
+            else:
+                raise
+
+        if not page.items:
+            scan_complete = True
+            break
+
+        for ev in page.items:
+            if ev.id not in seen_row_ids:
+                seen_row_ids.add(ev.id)
+                collected.append(ev.model_dump())
+            ev_dt = datetime.fromisoformat(ev.occurred_at.replace("Z", "+00:00"))
+            if ev_dt.tzinfo is None:
+                ev_dt = ev_dt.replace(tzinfo=UTC)
+            if latest_occurred is None or ev_dt > latest_occurred:
+                latest_occurred = ev_dt
+            cursor = ev.id
+
+        if not page.has_more:
+            scan_complete = True
+            break
+        if page.next_cursor:
+            cursor = page.next_cursor
+        if page_idx == max_pages - 1:
+            scan_complete = False
+
+    return collected, scan_complete, cursor, latest_occurred, cursor_was_reset
+
+
+def _persist_pulled_events_fenced(
+    db: Session,
+    *,
+    binding_id: str,
+    lease_token: str | None,
+    expected_world_epoch: int | None,
+    pulled_events: list[dict[str, Any]],
+    scan_complete: bool,
+    latest_cursor: str | None,
+    latest_occurred: datetime | None,
+    cursor_was_reset: bool,
+) -> tuple[int, int]:
+    """Durably persist pulled events with unified hashing & lease fencing.
+
+    Returns `(newly_persisted_count, payload_conflict_count)`.
+    """
+    locked = _assert_binding_lease_in_txn(
+        db,
+        binding_id=binding_id,
+        lease_token=lease_token,
+        expected_world_epoch=expected_world_epoch,
+    )
+    new_count = 0
+    conflict_count = 0
+    now = datetime.now(UTC)
+
+    for ev in pulled_events:
+        ev_id = str(ev["event_id"])
+        ev_type = str(ev["event_type"]).strip().upper()
+        ev_occurred = datetime.fromisoformat(str(ev["occurred_at"]).replace("Z", "+00:00"))
+        if ev_occurred.tzinfo is None:
+            ev_occurred = ev_occurred.replace(tzinfo=UTC)
+
+        p_hash = compute_canonical_event_hash(
+            event_id=ev_id,
+            event_type=ev_type,
+            merchant_id=locked.merchant_id,
+            order_id=ev.get("order_id"),
+            payment_id=ev.get("payment_id"),
+            payload=ev.get("payload") or {},
+        )
+
+        existing = db.scalar(
+            select(NormalizedEvent).where(
+                NormalizedEvent.session_id == locked.session_id,
+                NormalizedEvent.world_epoch == locked.world_epoch,
+                NormalizedEvent.merchant_id == locked.merchant_id,
+                NormalizedEvent.event_id == ev_id,
+            )
+        )
+        if existing is not None:
+            if existing.payload_hash != p_hash:
+                conflict_count += 1
+                record_activity(
+                    db,
+                    session_id=locked.session_id,
+                    world_epoch=locked.world_epoch,
+                    kind="EVENT_PAYLOAD_CONFLICT",
+                    title_vi=f"Xung đột payload sự kiện {ev_id}",
+                    detail_vi=(
+                        f"Sự kiện {ev_id} ({ev_type}) có payload_hash khác giữa push và pull; "
+                        "không ghi đè bản ghi gốc."
+                    ),
+                    metadata_json={
+                        "event_id": ev_id,
+                        "existing_hash": existing.payload_hash,
+                        "pulled_hash": p_hash,
+                    },
+                )
+            continue
+
+        row = NormalizedEvent(
+            id=f"NEVT-{uuid.uuid4().hex[:12].upper()}",
+            event_id=ev_id,
+            session_id=locked.session_id,
+            world_epoch=locked.world_epoch,
+            merchant_id=locked.merchant_id,
+            verified_source="MINI_STORE_PULL_CONNECTOR",
+            claimed_source=str(ev.get("source") or "MINI_STORE_COMMERCE"),
+            source_mode=str(ev.get("source_mode") or "MOCK"),
+            schema_version="1.0",
+            event_type=ev_type,
+            order_id=ev.get("order_id"),
+            payment_id=ev.get("payment_id"),
+            correlation_id=ev.get("correlation_id"),
+            payload_hash=p_hash,
+            payload_json={
+                "event_payload": ev.get("payload") or {},
+                "commerce_row_id": ev.get("id"),
+            },
+            provenance_json={
+                "collection_mode": "PULL_RECONCILE",
+                "source_binding_id": locked.id,
+                "source_mode": str(ev.get("source_mode") or "MOCK"),
+            },
+            triggered_investigation=False,
+            occurred_at=ev_occurred,
+            received_at=now,
+        )
+        try:
+            with db.begin_nested():
+                db.add(row)
+                db.flush()
+            new_count += 1
+        except IntegrityError:
+            pass
+
+    if pulled_events or cursor_was_reset:
+        locked.last_event_cursor = latest_cursor
+        locked.last_event_occurred_at = latest_occurred
+        locked.events_observed_count += new_count
+    locked.events_scan_complete = scan_complete
+    locked.updated_at = now
+    db.commit()
+    return new_count, conflict_count
 
 
 def collect_commerce_events(
@@ -158,99 +452,29 @@ def collect_commerce_events(
     binding: CommerceSourceBinding,
     connector: CommerceReadConnector,
     batch_size: int = 50,
+    max_pages: int | None = None,
+    lease_token: str | None = None,
+    expected_world_epoch: int | None = None,
 ) -> tuple[int, int, list[dict[str, Any]]]:
-    """Pull Commerce events using bounded overlap + durable `NormalizedEvent` deduplication.
-
-    Advances `last_event_cursor` and `last_event_occurred_at` ONLY after commit.
-    Handles invalid/stale cursor gracefully by resetting to timestamp overlap or full pull.
-    Returns `(pulled_count, newly_persisted_count, pulled_event_dicts)`.
-    """
-    since_dt: datetime | None = None
-    if binding.last_event_occurred_at is not None:
-        since_dt = binding.last_event_occurred_at - timedelta(seconds=OVERLAP_WINDOW_SECONDS)
-
-    try:
-        page, _ = connector.get_events(
-            after_id=None if since_dt is not None else binding.last_event_cursor,
-            since=since_dt,
-            limit=batch_size,
-        )
-    except CommerceConnectorError as exc:
-        if exc.status_code == 400 and binding.last_event_cursor is not None:
-            # Stale/reset cursor after commerce world reset -> recover cleanly from start
-            binding.last_event_cursor = None
-            binding.last_event_occurred_at = None
-            db.flush()
-            page, _ = connector.get_events(limit=batch_size)
-        else:
-            raise
-
-    pulled_dicts: list[dict[str, Any]] = []
-    new_count = 0
-    latest_cursor = binding.last_event_cursor
-    latest_occurred = binding.last_event_occurred_at
-
-    for ev in page.items:
-        ev_dict = ev.model_dump()
-        pulled_dicts.append(ev_dict)
-        ev_occurred = datetime.fromisoformat(ev.occurred_at.replace("Z", "+00:00"))
-        if ev_occurred.tzinfo is None:
-            ev_occurred = ev_occurred.replace(tzinfo=UTC)
-
-        existing = db.scalar(
-            select(NormalizedEvent).where(
-                NormalizedEvent.session_id == binding.session_id,
-                NormalizedEvent.world_epoch == binding.world_epoch,
-                NormalizedEvent.merchant_id == binding.merchant_id,
-                NormalizedEvent.event_id == ev.event_id,
-            )
-        )
-        if existing is None:
-            row = NormalizedEvent(
-                id=f"NEVT-{uuid.uuid4().hex[:12].upper()}",
-                event_id=ev.event_id,
-                session_id=binding.session_id,
-                world_epoch=binding.world_epoch,
-                merchant_id=binding.merchant_id,
-                verified_source="MINI_STORE_PULL_CONNECTOR",
-                claimed_source=ev.source,
-                source_mode=ev.source_mode or "MOCK",
-                schema_version="1.0",
-                event_type=ev.event_type,
-                order_id=ev.order_id,
-                payment_id=ev.payment_id,
-                correlation_id=ev.correlation_id,
-                payload_hash=_hash_remote_event(ev_dict),
-                payload_json={"event_payload": ev.payload, "commerce_row_id": ev.id},
-                provenance_json={
-                    "collection_mode": "PULL_RECONCILE",
-                    "source_binding_id": binding.id,
-                    "source_mode": ev.source_mode or "MOCK",
-                },
-                triggered_investigation=False,
-                occurred_at=ev_occurred,
-                received_at=datetime.now(UTC),
-            )
-            try:
-                with db.begin_nested():
-                    db.add(row)
-                    db.flush()
-                new_count += 1
-            except IntegrityError:
-                pass
-
-        latest_cursor = ev.id
-        if latest_occurred is None or ev_occurred > latest_occurred:
-            latest_occurred = ev_occurred
-
-    # Advance checkpoint ONLY after durable persistence succeeds
-    if page.items:
-        binding.last_event_cursor = latest_cursor
-        binding.last_event_occurred_at = latest_occurred
-        binding.events_observed_count += new_count
-    binding.updated_at = datetime.now(UTC)
-    db.commit()
-    return len(page.items), new_count, pulled_dicts
+    """Pull paginated Commerce events with bounded work budget, unified hashing, and fencing."""
+    settings = get_settings()
+    pages_budget = max_pages or settings.monitor_max_pages_per_tick
+    pulled, scan_complete, cursor, latest_dt, was_reset = _fetch_remote_events_paginated(
+        binding, connector, batch_size=batch_size, max_pages=pages_budget
+    )
+    new_count, _ = _persist_pulled_events_fenced(
+        db,
+        binding_id=binding.id,
+        lease_token=lease_token,
+        expected_world_epoch=expected_world_epoch,
+        pulled_events=pulled,
+        scan_complete=scan_complete,
+        latest_cursor=cursor,
+        latest_occurred=latest_dt,
+        cursor_was_reset=was_reset,
+    )
+    db.refresh(binding)
+    return len(pulled), new_count, pulled
 
 
 def _create_commerce_case_and_job(
@@ -268,14 +492,12 @@ def _create_commerce_case_and_job(
     if sess is None:
         return None, None
 
-    # Respect DemoSession.max_cases quota — retain anomaly in OBSERVED (never discard!)
     current_cases = int(
         db.scalar(select(func.count(Case.id)).where(Case.session_id == sess.id)) or 0
     )
     if current_cases >= sess.max_cases:
         return None, None
 
-    # Respect monitor_max_concurrent_investigations cap
     active_investigations = int(
         db.scalar(
             select(func.count(AnomalyObservation.id)).where(
@@ -294,6 +516,7 @@ def _create_commerce_case_and_job(
         f"[Autonomous Monitor {candidate.detector_code}] Investigate {candidate.anomaly_type}: "
         f"{candidate.rationale[:360]}"
     )
+    idemp_key = f"MON:{binding.world_epoch}:{obs.occurrence_count}:{candidate.fingerprint}"[:128]
     case = Case(
         id=case_id,
         session_id=sess.id,
@@ -303,7 +526,7 @@ def _create_commerce_case_and_job(
         owner="autonomous-monitor",
         source_system="COMMERCE_HTTP",
         source_binding_id=binding.id,
-        idempotency_key=f"MON:{binding.world_epoch}:{candidate.fingerprint}"[:128],
+        idempotency_key=idemp_key,
         created_at=now,
         updated_at=now,
     )
@@ -321,6 +544,7 @@ def _create_commerce_case_and_job(
             "detector_code": candidate.detector_code,
             "anomaly_type": candidate.anomaly_type,
             "fingerprint": candidate.fingerprint,
+            "occurrence_count": obs.occurrence_count,
             "merchant_id": binding.merchant_id,
             "commerce_session_id": binding.commerce_session_id,
             "affected_order_id": candidate.affected_order_id,
@@ -343,6 +567,7 @@ def _create_commerce_case_and_job(
                 "anomaly_observation_id": obs.id,
                 "detector_code": candidate.detector_code,
                 "anomaly_type": candidate.anomaly_type,
+                "occurrence_count": obs.occurrence_count,
                 "source_system": "COMMERCE_HTTP",
                 "source_binding_id": binding.id,
             },
@@ -372,6 +597,7 @@ def _create_commerce_case_and_job(
             "detector_code": candidate.detector_code,
             "severity": candidate.severity,
             "source_binding_id": binding.id,
+            "occurrence_count": obs.occurrence_count,
         },
     )
     return case.id, job.id
@@ -383,18 +609,25 @@ def record_or_update_anomaly(
     binding: CommerceSourceBinding,
     candidate: DetectedAnomaly,
     auto_create_case: bool = True,
+    lease_token: str | None = None,
+    expected_world_epoch: int | None = None,
 ) -> tuple[AnomalyObservation, bool]:
-    """Durably upsert an `AnomalyObservation` by `(session_id, world_epoch, fingerprint)`.
-
-    Returns `(observation, created_case_flag)`.
-    """
+    """Durably upsert `AnomalyObservation` with lease fencing, row locking, and recurrence."""
+    locked_binding = _assert_binding_lease_in_txn(
+        db,
+        binding_id=binding.id,
+        lease_token=lease_token,
+        expected_world_epoch=expected_world_epoch,
+    )
     now = datetime.now(UTC)
     existing = db.scalar(
-        select(AnomalyObservation).where(
-            AnomalyObservation.session_id == binding.session_id,
-            AnomalyObservation.world_epoch == binding.world_epoch,
+        select(AnomalyObservation)
+        .where(
+            AnomalyObservation.session_id == locked_binding.session_id,
+            AnomalyObservation.world_epoch == locked_binding.world_epoch,
             AnomalyObservation.fingerprint == candidate.fingerprint,
         )
+        .with_for_update()
     )
     if existing is not None:
         existing.observation_count += 1
@@ -403,13 +636,41 @@ def record_or_update_anomaly(
         existing.rationale = candidate.rationale
         existing.updated_at = now
         created_case = False
+
+        # P2 Recurrence: if previously RECOVERED anomaly recurs, preserve history & reopen cleanly!
+        if existing.lifecycle_state == "RECOVERED":
+            verif_hist = dict(existing.verification_json or {})
+            priors = list(verif_hist.get("prior_recoveries") or [])
+            priors.append(
+                {
+                    "occurrence": existing.occurrence_count,
+                    "recovered_at": (
+                        existing.verified_recovered_at.isoformat()
+                        if existing.verified_recovered_at
+                        else None
+                    ),
+                    "recovery_source": existing.recovery_source,
+                    "verdict": existing.verification_verdict,
+                    "prior_case_id": existing.linked_case_id,
+                }
+            )
+            verif_hist["prior_recoveries"] = priors
+            existing.verification_json = verif_hist
+            existing.occurrence_count += 1
+            existing.lifecycle_state = "OBSERVED"
+            existing.linked_case_id = None
+            existing.linked_job_id = None
+            existing.recovery_source = None
+            existing.verification_verdict = None
+            existing.verified_recovered_at = None
+
         if (
             auto_create_case
             and existing.linked_case_id is None
             and existing.lifecycle_state == "OBSERVED"
         ):
             cid, jid = _create_commerce_case_and_job(
-                db, binding=binding, obs=existing, candidate=candidate
+                db, binding=locked_binding, obs=existing, candidate=candidate
             )
             if cid is not None:
                 existing.linked_case_id = cid
@@ -423,10 +684,10 @@ def record_or_update_anomaly(
     obs = AnomalyObservation(
         id=f"ANOM-{uuid.uuid4().hex[:10].upper()}",
         fingerprint=candidate.fingerprint,
-        session_id=binding.session_id,
-        world_epoch=binding.world_epoch,
-        source_binding_id=binding.id,
-        merchant_id=binding.merchant_id,
+        session_id=locked_binding.session_id,
+        world_epoch=locked_binding.world_epoch,
+        source_binding_id=locked_binding.id,
+        merchant_id=locked_binding.merchant_id,
         detector_code=candidate.detector_code,
         anomaly_type=candidate.anomaly_type,
         severity=candidate.severity,
@@ -437,6 +698,7 @@ def record_or_update_anomaly(
         evidence_refs_json=candidate.evidence_refs,
         rationale=candidate.rationale,
         observation_count=1,
+        occurrence_count=1,
         first_observed_at=now,
         last_observed_at=now,
         created_at=now,
@@ -447,13 +709,14 @@ def record_or_update_anomaly(
             db.add(obs)
             db.flush()
     except IntegrityError:
-        # Concurrent worker inserted the same fingerprint simultaneously -> update existing row
         existing2 = db.scalar(
-            select(AnomalyObservation).where(
-                AnomalyObservation.session_id == binding.session_id,
-                AnomalyObservation.world_epoch == binding.world_epoch,
+            select(AnomalyObservation)
+            .where(
+                AnomalyObservation.session_id == locked_binding.session_id,
+                AnomalyObservation.world_epoch == locked_binding.world_epoch,
                 AnomalyObservation.fingerprint == candidate.fingerprint,
             )
+            .with_for_update()
         )
         assert existing2 is not None  # noqa: S101
         existing2.observation_count += 1
@@ -465,7 +728,9 @@ def record_or_update_anomaly(
 
     created_case = False
     if auto_create_case:
-        cid, jid = _create_commerce_case_and_job(db, binding=binding, obs=obs, candidate=candidate)
+        cid, jid = _create_commerce_case_and_job(
+            db, binding=locked_binding, obs=obs, candidate=candidate
+        )
         if cid is not None:
             obs.linked_case_id = cid
             obs.linked_job_id = jid
@@ -477,144 +742,316 @@ def record_or_update_anomaly(
     return obs, created_case
 
 
-def verify_anomaly_recovery(
+def evaluate_recovery_postconditions(
     db: Session,
     *,
     obs: AnomalyObservation,
     connector: CommerceReadConnector,
-) -> tuple[bool, str]:
-    """Independently verify recovery by re-reading authoritative MiniStore HTTP state.
+) -> VerificationResult:
+    """Strictly evaluate detector-specific recovery postconditions against authoritative HTTP state.
 
-    NEVER marks recovered on timeout, HTTP error, or unverified claims!
+    Never assumes actor attribution without authoritative audit evidence (defaults to `UNKNOWN`).
     """
     now = datetime.now(UTC)
-    if obs.lifecycle_state == "RECOVERED":
-        return True, "Already verified recovered"
+    code = obs.detector_code.upper()
+    evidence: dict[str, Any] = {"checked_at": now.isoformat(), "detector_code": code}
 
     try:
-        code = obs.detector_code.upper()
-        verified = False
-        recovery_source = "UNKNOWN"
-        evidence: dict[str, Any] = {"checked_at": now.isoformat(), "detector_code": code}
-
-        if code == "D01" and obs.affected_order_id and obs.affected_payment_id:
-            ord_env = connector.get_order(obs.affected_order_id)
-            pay_env = connector.get_payment(obs.affected_payment_id)
-            ord_data = ord_env["data"]
-            pay_data = pay_env["data"]
-            evidence["order_status"] = ord_data.get("status")
-            evidence["payment_is_synced"] = pay_data.get("is_synced_to_order")
-            if str(ord_data.get("status") or "").upper() in (
-                "CONFIRMED",
-                "PROCESSING",
-                "SHIPPED",
-                "DELIVERED",
-            ) and bool(pay_data.get("is_synced_to_order", False)):
-                verified = True
-                recovery_source = "COMMERCE_WORKER"
-
-        elif code == "D02" and obs.affected_order_id and obs.affected_payment_id:
+        if code == "D01":
+            if not obs.affected_order_id or not obs.affected_payment_id:
+                return VerificationResult(
+                    RecoveryVerdict.INSUFFICIENT_EVIDENCE,
+                    False,
+                    "UNKNOWN",
+                    "Missing affected order/payment identity for D01 verification",
+                    evidence,
+                )
             ord_data = connector.get_order(obs.affected_order_id)["data"]
             pay_data = connector.get_payment(obs.affected_payment_id)["data"]
             evidence["order_status"] = ord_data.get("status")
+            evidence["order_reconciliation"] = ord_data.get("reconciliation_status")
             evidence["payment_status"] = pay_data.get("status")
-            evidence["reconciliation_status"] = ord_data.get("reconciliation_status")
-            if (
-                str(pay_data.get("status") or "").upper() == "REFUNDED"
-                or str(ord_data.get("reconciliation_status") or "").upper() == "RESOLVED"
-            ):
-                verified = True
-                recovery_source = "MERCHANT"
+            evidence["payment_is_synced"] = pay_data.get("is_synced_to_order")
+            evidence["payment_amount_vnd"] = pay_data.get("amount_vnd")
+            evidence["order_total_vnd"] = ord_data.get("total_vnd")
 
-        elif code == "D03" and obs.affected_order_id:
+            amount_ok = ord_data.get("total_vnd") is None or int(
+                pay_data.get("amount_vnd") or 0
+            ) == int(ord_data.get("total_vnd") or 0)
+            no_conflict = (
+                not bool(pay_data.get("reconciliation_required", False))
+                and str(ord_data.get("reconciliation_status") or "CLEAR").upper()
+                != "RECONCILIATION_REQUIRED"
+            )
+            if (
+                str(pay_data.get("status") or "").upper() == "SUCCEEDED"
+                and bool(pay_data.get("is_synced_to_order", False))
+                and str(ord_data.get("status") or "").upper()
+                in ("CONFIRMED", "PROCESSING", "SHIPPED", "DELIVERED")
+                and amount_ok
+                and no_conflict
+            ):
+                # Attribute actor ONLY if supported by authoritative order timeline audit event
+                actor = "UNKNOWN"
+                try:
+                    tl = connector.get_order_timeline(obs.affected_order_id)["data"]
+                    for ev in reversed(tl):
+                        payload = ev.get("payload") or {}
+                        src = str(payload.get("sync_source") or "")
+                        if src == "COMMERCE_ORDER_SYNC_WORKER":
+                            actor = "COMMERCE_WORKER"
+                            break
+                        if src == "FINRESOLVE_RECOVERY_COMMAND":
+                            actor = "AI_APPROVED_ACTION"
+                            break
+                except CommerceConnectorError:
+                    pass
+                return VerificationResult(
+                    RecoveryVerdict.VERIFIED_RECOVERY,
+                    True,
+                    actor,
+                    f"D01 verified: payment synced, order {ord_data.get('status')}, no conflict",
+                    evidence,
+                )
+            return VerificationResult(
+                RecoveryVerdict.STILL_INCONSISTENT,
+                False,
+                "UNKNOWN",
+                "D01 postconditions not satisfied (order not confirmed/synced or conflict active)",
+                evidence,
+            )
+
+        if code == "D02":
+            if not obs.affected_order_id or not obs.affected_payment_id:
+                return VerificationResult(
+                    RecoveryVerdict.INSUFFICIENT_EVIDENCE,
+                    False,
+                    "UNKNOWN",
+                    "Missing order/payment identity for D02 verification",
+                    evidence,
+                )
+            ord_data = connector.get_order(obs.affected_order_id)["data"]
+            pay_data = connector.get_payment(obs.affected_payment_id)["data"]
+            ord_status = str(ord_data.get("status") or "").upper()
+            pay_status = str(pay_data.get("status") or "").upper()
+            evidence["order_status"] = ord_status
+            evidence["payment_status"] = pay_status
+            evidence["refunded_amount_vnd"] = pay_data.get("refunded_amount_vnd")
+            evidence["amount_vnd"] = pay_data.get("amount_vnd")
+
+            # Cancelled order MUST NOT be resurrected; RESOLVED label alone is insufficient!
+            if ord_status != "CANCELLED":
+                return VerificationResult(
+                    RecoveryVerdict.STILL_INCONSISTENT,
+                    False,
+                    "UNKNOWN",
+                    f"D02 violation: cancelled order changed to '{ord_status}'",
+                    evidence,
+                )
+            full_refunded = (
+                pay_status == "REFUNDED"
+                and int(pay_data.get("refunded_amount_vnd") or 0)
+                >= int(pay_data.get("amount_vnd") or 0)
+                and not bool(pay_data.get("reconciliation_required", False))
+            )
+            if full_refunded:
+                return VerificationResult(
+                    RecoveryVerdict.VERIFIED_RECOVERY,
+                    True,
+                    "UNKNOWN",
+                    "D02 verified: order stayed CANCELLED and payment fully REFUNDED",
+                    evidence,
+                )
+            return VerificationResult(
+                RecoveryVerdict.STILL_INCONSISTENT,
+                False,
+                "UNKNOWN",
+                "D02 unresolved: payment not fully refunded (RESOLVED label alone insufficient)",
+                evidence,
+            )
+
+        if code == "D03" and obs.affected_order_id:
             ord_data = connector.get_order(obs.affected_order_id)["data"]
             st = str(ord_data.get("status") or "").upper()
             evidence["order_status"] = st
             if st in ("SHIPPED", "DELIVERED", "CANCELLED"):
-                verified = True
-                recovery_source = "MERCHANT"
+                return VerificationResult(
+                    RecoveryVerdict.VERIFIED_RECOVERY,
+                    True,
+                    "UNKNOWN",
+                    f"D03 verified: order progressed to {st}",
+                    evidence,
+                )
+            return VerificationResult(
+                RecoveryVerdict.STILL_INCONSISTENT,
+                False,
+                "UNKNOWN",
+                f"D03 still stalled in {st}",
+                evidence,
+            )
 
-        elif code == "D04" and obs.affected_payment_id:
+        if code == "D04" and obs.affected_payment_id:
             pay_data = connector.get_payment(obs.affected_payment_id)["data"]
             amt = int(pay_data.get("amount_vnd") or 0)
-            committed = (
-                int(pay_data.get("refunded_amount_vnd") or 0)
-                + int(pay_data.get("pending_refund_amount_vnd") or 0)
-                + int(pay_data.get("unknown_refund_amount_vnd") or 0)
+            refunded = int(pay_data.get("refunded_amount_vnd") or 0)
+            pending = int(pay_data.get("pending_refund_amount_vnd") or 0)
+            unknown = int(pay_data.get("unknown_refund_amount_vnd") or 0)
+            committed = refunded + pending + unknown
+            evidence.update(
+                {
+                    "amount_vnd": amt,
+                    "refunded_amount_vnd": refunded,
+                    "pending_refund_amount_vnd": pending,
+                    "unknown_refund_amount_vnd": unknown,
+                    "committed_refund_vnd": committed,
+                    "reconciliation_required": pay_data.get("reconciliation_required"),
+                }
             )
-            unknown_amt = int(pay_data.get("unknown_refund_amount_vnd") or 0)
-            evidence["committed_refund_vnd"] = committed
-            evidence["unknown_refund_vnd"] = unknown_amt
             if (
-                committed <= amt
-                and unknown_amt == 0
-                and not bool(pay_data.get("reconciliation_required"))
+                amt > 0
+                and committed <= amt
+                and unknown == 0
+                and not bool(pay_data.get("reconciliation_required", False))
             ):
-                verified = True
-                recovery_source = "MERCHANT"
-
-        elif code == "D05":
-            inv_list, _ = connector.get_inventory()
-            variant_id = (obs.affected_entities_json or {}).get("variant_id")
-            if variant_id:
-                matching = [i for i in inv_list if i.get("variant_id") == variant_id]
-                if matching:
-                    on_hand = int(matching[0].get("on_hand_qty") or 0)
-                    reserved = int(matching[0].get("reserved_qty") or 0)
-                    evidence["on_hand_qty"] = on_hand
-                    evidence["reserved_qty"] = reserved
-                    if on_hand >= 0 and reserved >= 0 and reserved <= on_hand:
-                        verified = True
-                        recovery_source = "MERCHANT"
-            else:
-                broken = [
-                    i
-                    for i in inv_list
-                    if int(i.get("on_hand_qty") or 0) < 0
-                    or int(i.get("reserved_qty") or 0) > int(i.get("on_hand_qty") or 0)
-                ]
-                evidence["broken_variant_count"] = len(broken)
-                if not broken:
-                    verified = True
-                    recovery_source = "MERCHANT"
-
-        elif code == "D06":
-            ev_id = (obs.affected_entities_json or {}).get("event_id")
-            if ev_id:
-                exists = db.scalar(
-                    select(NormalizedEvent.id).where(
-                        NormalizedEvent.session_id == obs.session_id,
-                        NormalizedEvent.world_epoch == obs.world_epoch,
-                        NormalizedEvent.event_id == str(ev_id),
-                    )
+                return VerificationResult(
+                    RecoveryVerdict.VERIFIED_RECOVERY,
+                    True,
+                    "UNKNOWN",
+                    "D04 verified: refund accounting balanced with 0 unknown/excessive amounts",
+                    evidence,
                 )
-                evidence["event_present_in_inbox"] = exists is not None
-                if exists is not None:
-                    verified = True
-                    recovery_source = "COMMERCE_WORKER"
+            return VerificationResult(
+                RecoveryVerdict.STILL_INCONSISTENT,
+                False,
+                "UNKNOWN",
+                "D04 unresolved: excessive or unknown refund balance remains",
+                evidence,
+            )
 
-        elif code == "D07":
+        if code == "D05":
+            variant_id = (obs.affected_entities_json or {}).get("variant_id")
+            inv_list, _ = connector.get_inventory(
+                variant_id=str(variant_id) if variant_id else None
+            )
+            if not inv_list:
+                # NEVER infer recovery from an empty inventory response!
+                return VerificationResult(
+                    RecoveryVerdict.INSUFFICIENT_EVIDENCE,
+                    False,
+                    "UNKNOWN",
+                    "D05 cannot verify: inventory query returned empty list",
+                    evidence,
+                )
+            broken = [
+                i
+                for i in inv_list
+                if int(i.get("on_hand_qty") or 0) < 0
+                or int(i.get("reserved_qty") or 0) < 0
+                or int(i.get("reserved_qty") or 0) > int(i.get("on_hand_qty") or 0)
+            ]
+            evidence["checked_variants"] = len(inv_list)
+            evidence["broken_variants"] = len(broken)
+            if not broken:
+                return VerificationResult(
+                    RecoveryVerdict.VERIFIED_RECOVERY,
+                    True,
+                    "UNKNOWN",
+                    "D05 verified: affected variant inventory invariants satisfied",
+                    evidence,
+                )
+            return VerificationResult(
+                RecoveryVerdict.STILL_INCONSISTENT,
+                False,
+                "UNKNOWN",
+                f"D05 still inconsistent across {len(broken)} variant(s)",
+                evidence,
+            )
+
+        if code == "D06":
+            ev_id = (obs.affected_entities_json or {}).get("event_id")
+            if not ev_id:
+                return VerificationResult(
+                    RecoveryVerdict.INSUFFICIENT_EVIDENCE,
+                    False,
+                    "UNKNOWN",
+                    "Missing event_id for D06 verification",
+                    evidence,
+                )
+            exists = db.scalar(
+                select(NormalizedEvent.id).where(
+                    NormalizedEvent.session_id == obs.session_id,
+                    NormalizedEvent.world_epoch == obs.world_epoch,
+                    NormalizedEvent.event_id == str(ev_id),
+                )
+            )
+            evidence["event_present_in_inbox"] = exists is not None
+            if exists is not None:
+                return VerificationResult(
+                    RecoveryVerdict.VERIFIED_RECOVERY,
+                    True,
+                    "COMMERCE_PULL_RECONCILE",
+                    f"D06 verified: event {ev_id} recovered into durable inbox",
+                    evidence,
+                )
+            return VerificationResult(
+                RecoveryVerdict.STILL_INCONSISTENT,
+                False,
+                "UNKNOWN",
+                f"D06 unresolved: event {ev_id} still missing from inbox",
+                evidence,
+            )
+
+        if code == "D07":
             if obs.affected_payment_id:
                 pay_data = connector.get_payment(obs.affected_payment_id)["data"]
-                evidence["payment_status"] = pay_data.get("status")
-                evidence["reconciliation_required"] = pay_data.get("reconciliation_required")
+                p_status = str(pay_data.get("status") or "").upper()
+                recon_req = bool(pay_data.get("reconciliation_required", False))
+                evidence["payment_status"] = p_status
+                evidence["reconciliation_required"] = recon_req
+                # Must have conclusive non-UNKNOWN status AND cleared reconciliation
                 if (
-                    not bool(pay_data.get("reconciliation_required"))
-                    and str(pay_data.get("status") or "").upper() != "UNKNOWN"
+                    p_status in ("SUCCEEDED", "FAILED", "REFUNDED", "PARTIALLY_REFUNDED")
+                    and not recon_req
                 ):
-                    verified = True
-                    recovery_source = "MERCHANT"
-            elif obs.affected_order_id:
-                ord_data = connector.get_order(obs.affected_order_id)["data"]
-                evidence["reconciliation_status"] = ord_data.get("reconciliation_status")
-                if str(ord_data.get("reconciliation_status") or "").upper() in (
-                    "CLEAR",
-                    "RESOLVED",
-                ):
-                    verified = True
-                    recovery_source = "MERCHANT"
+                    if obs.affected_order_id:
+                        ord_data = connector.get_order(obs.affected_order_id)["data"]
+                        evidence["order_reconciliation_status"] = ord_data.get(
+                            "reconciliation_status"
+                        )
+                        if (
+                            str(ord_data.get("reconciliation_status") or "").upper()
+                            == "RECONCILIATION_REQUIRED"
+                        ):
+                            return VerificationResult(
+                                RecoveryVerdict.STILL_INCONSISTENT,
+                                False,
+                                "UNKNOWN",
+                                "D07 unresolved: order still marked RECONCILIATION_REQUIRED",
+                                evidence,
+                            )
+                    return VerificationResult(
+                        RecoveryVerdict.VERIFIED_RECOVERY,
+                        True,
+                        "UNKNOWN",
+                        f"D07 verified: conclusive payment status {p_status} and conflict cleared",
+                        evidence,
+                    )
+                return VerificationResult(
+                    RecoveryVerdict.STILL_INCONSISTENT,
+                    False,
+                    "UNKNOWN",
+                    f"D07 unresolved: status={p_status}, reconciliation_required={recon_req}",
+                    evidence,
+                )
+            return VerificationResult(
+                RecoveryVerdict.INSUFFICIENT_EVIDENCE,
+                False,
+                "UNKNOWN",
+                "D07 missing affected payment reference",
+                evidence,
+            )
 
-        elif code == "D08":
+        if code == "D08":
             settings = get_settings()
             metrics, _ = connector.get_metrics()
             evidence["outbox_lag_count"] = metrics.outbox_lag_count
@@ -623,43 +1060,159 @@ def verify_anomaly_recovery(
                 metrics.outbox_lag_count < settings.monitor_outbox_lag_threshold
                 and metrics.unsynced_payments < settings.monitor_unsynced_backlog_threshold
             ):
-                verified = True
-                recovery_source = "COMMERCE_WORKER"
-
-        obs.verification_json = evidence
-        obs.updated_at = now
-        if verified:
-            obs.lifecycle_state = "RECOVERED"
-            obs.recovery_source = recovery_source
-            obs.verified_recovered_at = now
-            record_activity(
-                db,
-                session_id=obs.session_id,
-                world_epoch=obs.world_epoch,
-                kind="MONITOR_RECOVERY_VERIFIED",
-                title_vi=f"[{obs.detector_code}] Recovery verified ({recovery_source})",
-                detail_vi=(
-                    f"Anomaly {obs.id} ({obs.anomaly_type}) verified recovered "
-                    "against MiniStore HTTP state."
-                ),
-                case_id=obs.linked_case_id,
-                metadata_json=evidence,
+                return VerificationResult(
+                    RecoveryVerdict.VERIFIED_RECOVERY,
+                    True,
+                    "UNKNOWN",
+                    "D08 verified: operational backlog back below threshold",
+                    evidence,
+                )
+            return VerificationResult(
+                RecoveryVerdict.STILL_INCONSISTENT,
+                False,
+                "UNKNOWN",
+                "D08 unresolved: operational backlog still above threshold",
+                evidence,
             )
-            db.commit()
-            return True, f"Verified recovered via {recovery_source}"
 
-        db.commit()
-        return False, "Postcondition not yet satisfied in authoritative MiniStore state"
+        return VerificationResult(
+            RecoveryVerdict.INSUFFICIENT_EVIDENCE,
+            False,
+            "UNKNOWN",
+            f"Unsupported detector code '{code}' for verification",
+            evidence,
+        )
     except CommerceConnectorError as exc:
-        # NEVER mark recovered when Commerce is unreachable or times out!
-        obs.verification_json = {
-            "checked_at": now.isoformat(),
-            "error": str(exc),
-            "verified": False,
-        }
-        obs.updated_at = now
+        evidence["error"] = str(exc)
+        return VerificationResult(
+            RecoveryVerdict.SOURCE_UNAVAILABLE,
+            False,
+            "UNKNOWN",
+            f"Verification blocked (Commerce unavailable): {exc}",
+            evidence,
+        )
+
+
+def verify_anomaly_recovery(
+    db: Session,
+    *,
+    obs: AnomalyObservation,
+    connector: CommerceReadConnector,
+    lease_token: str | None = None,
+    expected_world_epoch: int | None = None,
+) -> tuple[bool, str]:
+    """Independently verify recovery with lease fencing and structured verdict persistence."""
+    now = datetime.now(UTC)
+    if obs.lifecycle_state == "RECOVERED":
+        return True, "Already verified recovered"
+
+    result = evaluate_recovery_postconditions(db, obs=obs, connector=connector)
+
+    # Re-verify lease & world epoch inside transaction before persisting outcome!
+    _assert_binding_lease_in_txn(
+        db,
+        binding_id=obs.source_binding_id,
+        lease_token=lease_token,
+        expected_world_epoch=expected_world_epoch,
+    )
+    locked_obs = db.scalar(
+        select(AnomalyObservation).where(AnomalyObservation.id == obs.id).with_for_update()
+    )
+    if locked_obs is None:
+        return False, "Anomaly observation not found"
+
+    merged_verif = dict(locked_obs.verification_json or {})
+    merged_verif.update(result.evidence)
+    merged_verif["verdict"] = result.verdict.value
+    locked_obs.verification_json = merged_verif
+    locked_obs.verification_verdict = result.verdict.value
+    locked_obs.updated_at = now
+
+    if result.recovered and result.verdict == RecoveryVerdict.VERIFIED_RECOVERY:
+        locked_obs.lifecycle_state = "RECOVERED"
+        locked_obs.recovery_source = result.recovery_source
+        locked_obs.verified_recovered_at = now
+        record_activity(
+            db,
+            session_id=locked_obs.session_id,
+            world_epoch=locked_obs.world_epoch,
+            kind="MONITOR_RECOVERY_VERIFIED",
+            title_vi=f"[{locked_obs.detector_code}] Recovery verified ({result.recovery_source})",
+            detail_vi=(
+                f"Anomaly {locked_obs.id} ({locked_obs.anomaly_type}) verified recovered "
+                "against MiniStore HTTP state."
+            ),
+            case_id=locked_obs.linked_case_id,
+            metadata_json=result.evidence,
+        )
         db.commit()
-        return False, f"Verification blocked (Commerce unavailable): {exc}"
+        db.refresh(obs)
+        return True, result.detail
+
+    db.commit()
+    db.refresh(obs)
+    return False, result.detail
+
+
+def _fetch_paginated_business_records(
+    binding: CommerceSourceBinding,
+    connector: CommerceReadConnector,
+    *,
+    max_pages: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], datetime, dict[str, Any]]:
+    """Fetch prioritized pending/reconciliation + paginated orders & payments beyond 200 records."""
+    orders_map: dict[str, dict[str, Any]] = {}
+    payments_map: dict[str, dict[str, Any]] = {}
+    obs_at = datetime.now(UTC)
+
+    # 1. Priority scan: unsynced & reconciliation-required records first (never missed!)
+    p_unsynced, obs_at = connector.list_payments(is_synced=False, limit=200)
+    for p in p_unsynced:
+        if p.get("payment_id"):
+            payments_map[str(p["payment_id"])] = p
+    p_recon, _ = connector.list_payments(reconciliation_required=True, limit=200)
+    for p in p_recon:
+        if p.get("payment_id"):
+            payments_map[str(p["payment_id"])] = p
+
+    o_recon, _ = connector.list_orders(reconciliation_status="RECONCILIATION_REQUIRED", limit=200)
+    for o in o_recon:
+        if o.get("id"):
+            orders_map[str(o["id"])] = o
+
+    # 2. Paginated full scan within bounded page budget
+    o_cursor: str | None = None
+    o_pages = 0
+    for _ in range(max_pages):
+        batch, obs_at = connector.list_orders(after_id=o_cursor, limit=200)
+        o_pages += 1
+        for o in batch:
+            if o.get("id"):
+                orders_map[str(o["id"])] = o
+        if len(batch) < 200:
+            break
+        o_cursor = str(batch[-1]["id"])
+
+    p_cursor: str | None = None
+    p_pages = 0
+    for _ in range(max_pages):
+        batch, _ = connector.list_payments(after_id=p_cursor, limit=200)
+        p_pages += 1
+        for p in batch:
+            if p.get("payment_id"):
+                payments_map[str(p["payment_id"])] = p
+        if len(batch) < 200:
+            break
+        p_cursor = str(batch[-1]["payment_id"])
+
+    coverage = {
+        "orders_scanned": len(orders_map),
+        "orders_pages": o_pages,
+        "payments_scanned": len(payments_map),
+        "payments_pages": p_pages,
+        "scanned_at": obs_at.isoformat(),
+    }
+    return list(orders_map.values()), list(payments_map.values()), obs_at, coverage
 
 
 def run_binding_scan(
@@ -670,14 +1223,19 @@ def run_binding_scan(
     transport: httpx.BaseTransport | None = None,
     service_key: str | None = None,
     auto_create_cases: bool = True,
+    lease_token: str | None = None,
+    expected_world_epoch: int | None = None,
 ) -> ScanSummary:
-    """Run one complete autonomous monitoring scan for a single `CommerceSourceBinding`."""
+    """Run one hardened autonomous monitoring scan with fencing, D06 ordering, and pagination."""
     settings = get_settings()
     summary = ScanSummary(binding_id=binding.id, connectivity_status=binding.connectivity_status)
+    start_monotonic = time.monotonic()
     now = datetime.now(UTC)
 
-    if not binding.is_enabled:
-        summary.connectivity_status = "PAUSED"
+    if not binding.is_enabled or binding.world_reset_required:
+        summary.connectivity_status = (
+            "WORLD_RESET_REQUIRED" if binding.world_reset_required else "PAUSED"
+        )
         return summary
     if not binding.base_url:
         binding.connectivity_status = "UNCONFIGURED"
@@ -691,21 +1249,8 @@ def run_binding_scan(
     )
 
     try:
-        # 1. Pull events with bounded overlap & durable checkpointing
-        pulled, new_ev, remote_events = collect_commerce_events(
-            db, binding=binding, connector=conn, batch_size=settings.monitor_batch_size
-        )
-        summary.events_pulled = pulled
-        summary.events_new = new_ev
-
-        # 2. Fetch authoritative Commerce state via authenticated HTTP read endpoints
-        orders, obs_at = conn.list_orders(limit=200)
-        payments, _ = conn.list_payments(limit=200)
-        refunds, _ = conn.list_refunds(limit=200)
-        inventory, _ = conn.get_inventory()
-        metrics, _ = conn.get_metrics()
-
-        ingested_ids = set(
+        # Step 1 (D06 Fix): Snapshot prior inbox event IDs BEFORE ingesting pulled events!
+        prior_ingested_ids = set(
             db.scalars(
                 select(NormalizedEvent.event_id).where(
                     NormalizedEvent.session_id == binding.session_id,
@@ -714,6 +1259,70 @@ def run_binding_scan(
                 )
             ).all()
         )
+
+        # Step 2: Fetch remote events across pages within work budget (without persisting yet)
+        remote_events, ev_complete, next_ev_cursor, latest_ev_dt, ev_reset = (
+            _fetch_remote_events_paginated(
+                binding,
+                conn,
+                batch_size=settings.monitor_batch_size,
+                max_pages=settings.monitor_max_pages_per_tick,
+            )
+        )
+        summary.events_pulled = len(remote_events)
+        summary.events_scan_complete = ev_complete
+
+        # Step 3 (D06 Fix): Evaluate D06 against PRIOR inbox state (push-expected events only!)
+        d06_snapshot = CommerceSnapshot(
+            merchant_id=binding.merchant_id,
+            commerce_session_id=binding.commerce_session_id,
+            observed_at=datetime.now(UTC),
+            ingested_event_ids=prior_ingested_ids,
+            remote_events=remote_events,
+        )
+        d06_candidates = detect_d06_missing_event_delivery(
+            d06_snapshot, grace_seconds=settings.monitor_payment_sync_grace_seconds
+        )
+        for cand in d06_candidates:
+            _, created_case = record_or_update_anomaly(
+                db,
+                binding=binding,
+                candidate=cand,
+                auto_create_case=auto_create_cases,
+                lease_token=lease_token,
+                expected_world_epoch=expected_world_epoch,
+            )
+            if created_case:
+                summary.cases_created += 1
+
+        # Step 4: Durably persist pulled events (recovers missing events) under lease fence
+        new_ev, conflicts = _persist_pulled_events_fenced(
+            db,
+            binding_id=binding.id,
+            lease_token=lease_token,
+            expected_world_epoch=expected_world_epoch,
+            pulled_events=remote_events,
+            scan_complete=ev_complete,
+            latest_cursor=next_ev_cursor,
+            latest_occurred=latest_ev_dt,
+            cursor_was_reset=ev_reset,
+        )
+        summary.events_new = new_ev
+        summary.events_conflicts = conflicts
+
+        if time.monotonic() - start_monotonic > settings.monitor_max_scan_seconds:
+            summary.connectivity_status = "CONNECTED"
+            return summary
+
+        # Step 5: Fetch prioritized & paginated authoritative Commerce records (beyond 200!)
+        orders, payments, obs_at, coverage = _fetch_paginated_business_records(
+            binding, conn, max_pages=settings.monitor_max_pages_per_tick
+        )
+        summary.orders_scanned = len(orders)
+        summary.payments_scanned = len(payments)
+        refunds, _ = conn.list_refunds(limit=200)
+        inventory, _ = conn.get_inventory()
+        metrics, _ = conn.get_metrics()
 
         snapshot = CommerceSnapshot(
             merchant_id=binding.merchant_id,
@@ -724,28 +1333,34 @@ def run_binding_scan(
             refunds=refunds,
             inventory=inventory,
             metrics=metrics,
-            ingested_event_ids=ingested_ids,
+            ingested_event_ids=prior_ingested_ids,
             remote_events=remote_events,
         )
 
-        # 3. Run all deterministic detectors D01..D08
+        # Step 6: Run deterministic detectors D01..D05, D07, D08 (D06 already evaluated above)
         candidates = run_all_detectors(
             snapshot,
             payment_sync_grace_seconds=settings.monitor_payment_sync_grace_seconds,
             order_stall_seconds=settings.monitor_order_stall_seconds,
             outbox_lag_threshold=settings.monitor_outbox_lag_threshold,
             unsynced_backlog_threshold=settings.monitor_unsynced_backlog_threshold,
+            include_missing_events=False,
         )
-        summary.anomalies_detected = len(candidates)
+        summary.anomalies_detected = len(candidates) + len(d06_candidates)
 
         for cand in candidates:
             _, created_case = record_or_update_anomaly(
-                db, binding=binding, candidate=cand, auto_create_case=auto_create_cases
+                db,
+                binding=binding,
+                candidate=cand,
+                auto_create_case=auto_create_cases,
+                lease_token=lease_token,
+                expected_world_epoch=expected_world_epoch,
             )
             if created_case:
                 summary.cases_created += 1
 
-        # 4. Independently verify recovery for any open anomalies on this binding
+        # Step 7: Independently verify recovery for open anomalies (including same-scan D06!)
         open_anomalies = list(
             db.scalars(
                 select(AnomalyObservation).where(
@@ -757,25 +1372,55 @@ def run_binding_scan(
             ).all()
         )
         for obs in open_anomalies:
-            recovered, _ = verify_anomaly_recovery(db, obs=obs, connector=conn)
+            recovered, _ = verify_anomaly_recovery(
+                db,
+                obs=obs,
+                connector=conn,
+                lease_token=lease_token,
+                expected_world_epoch=expected_world_epoch,
+            )
             if recovered:
                 summary.recoveries_verified += 1
 
-        binding.connectivity_status = "CONNECTED"
-        binding.last_successful_scan_at = datetime.now(UTC)
-        binding.last_heartbeat_at = datetime.now(UTC)
-        binding.last_error = None
-        binding.updated_at = datetime.now(UTC)
+        # Step 8: Fenced telemetry & connectivity update
+        locked = _assert_binding_lease_in_txn(
+            db,
+            binding_id=binding.id,
+            lease_token=lease_token,
+            expected_world_epoch=expected_world_epoch,
+        )
+        locked.connectivity_status = "CONNECTED"
+        locked.last_successful_scan_at = datetime.now(UTC)
+        locked.last_heartbeat_at = datetime.now(UTC)
+        locked.last_error = None
+        locked.last_scan_coverage_json = coverage
+        locked.updated_at = datetime.now(UTC)
         db.commit()
+        db.refresh(binding)
         summary.connectivity_status = "CONNECTED"
         return summary
 
+    except StaleLeaseError as exc:
+        db.rollback()
+        summary.connectivity_status = "LEASE_LOST"
+        summary.error = str(exc)
+        return summary
+
     except CommerceConnectorError as exc:
-        binding.connectivity_status = "DISCONNECTED"
-        binding.last_error = str(exc)[:500]
-        binding.last_heartbeat_at = datetime.now(UTC)
-        binding.updated_at = datetime.now(UTC)
-        db.commit()
+        try:
+            locked = _assert_binding_lease_in_txn(
+                db,
+                binding_id=binding.id,
+                lease_token=lease_token,
+                expected_world_epoch=expected_world_epoch,
+            )
+            locked.connectivity_status = "DISCONNECTED"
+            locked.last_error = str(exc)[:500]
+            locked.last_heartbeat_at = datetime.now(UTC)
+            locked.updated_at = datetime.now(UTC)
+            db.commit()
+        except StaleLeaseError:
+            db.rollback()
         summary.connectivity_status = "DISCONNECTED"
         summary.error = str(exc)
         return summary

@@ -1,14 +1,14 @@
-"""Authenticated Read-Only HTTP Connector for MiniStore Commerce (Prompt 12).
+"""Authenticated Read-Only HTTP Connector for MiniStore Commerce (Prompt 12 + 12.1 P0 Hardening).
 
 Security & Boundary Invariants:
 - FinResolve NEVER connects directly to MiniStore's PostgreSQL database.
-- All reads go exclusively through MiniStore's authenticated `/api/v1/service/*` endpoints
-  using server-side credentials (`X-Commerce-Service-Key`, `X-Merchant-Id`,
-  `X-Commerce-Session-Id`, `X-World-Epoch`).
-- URLs are strictly built from the server-configured `CommerceSourceBinding.base_url`;
-  LLMs can NEVER supply arbitrary URLs or override host/headers.
-- Strict timeouts, bounded retries, Pydantic response validation, explicit provenance &
-  `observed_at` freshness timestamps, and ZERO silent fallback to the local Simulator!
+- Destination URLs come ONLY from server-registered connectors (`resolve_registered_connector_url`)
+  and are strictly validated against approved hosts, schemes, ports, and path allowlist.
+- Rejects URL userinfo, query/fragment on base URLs, arbitrary hosts (SSRF protection),
+  and HTTP 3xx redirects (`follow_redirects=False`).
+- Never leaks `X-Commerce-Service-Key` in exceptions or logs.
+- Strict timeouts, bounded retries, Pydantic validation, explicit `observed_at` provenance,
+  and ZERO silent fallback to the local Simulator!
 """
 
 from __future__ import annotations
@@ -19,6 +19,11 @@ from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, Field
+
+from app.core.config import get_settings
+
+APPROVED_PORTS: frozenset[int | None] = frozenset({None, 80, 443, 8000, 8100, 8101, 3100})
+TEST_ONLY_HOSTS: frozenset[str] = frozenset({"commerce-mock.local", "testserver"})
 
 
 class CommerceConnectorError(RuntimeError):
@@ -61,14 +66,68 @@ class CommerceMetricsSnapshot(BaseModel):
     outbox_lag_count: int = 0
 
 
-def _validate_base_url(base_url: str) -> str:
+def validate_approved_commerce_url(base_url: str) -> str:
+    """Strictly validate Commerce connector destination URL against SSRF & credential-leak rules."""
     cleaned = base_url.strip().rstrip("/")
+    if not cleaned:
+        raise CommerceConnectorError("Commerce service base_url is empty", retryable=False)
     parsed = urlparse(cleaned)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    if parsed.scheme not in ("http", "https"):
         raise CommerceConnectorError(
-            f"Invalid commerce service base_url: {base_url!r}", retryable=False
+            f"Unsupported Commerce connector scheme: {parsed.scheme!r}", retryable=False
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise CommerceConnectorError(
+            "URL userinfo (credentials in URL) is strictly forbidden", retryable=False
+        )
+    if parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+        raise CommerceConnectorError(
+            "Commerce base_url must be a clean origin (scheme://host[:port]) without path/query",
+            retryable=False,
+        )
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise CommerceConnectorError("Commerce base_url missing hostname", retryable=False)
+
+    settings = get_settings()
+    allowed_hosts = {
+        h.strip().lower() for h in settings.commerce_allowed_hosts.split(",") if h.strip()
+    }
+    if settings.app_env.strip().lower() == "test":
+        allowed_hosts |= TEST_ONLY_HOSTS
+
+    if host not in allowed_hosts:
+        raise CommerceConnectorError(
+            f"CONNECTOR_HOST_FORBIDDEN: host '{host}' is not in approved server allowlist",
+            status_code=403,
+            retryable=False,
+        )
+    if parsed.port not in APPROVED_PORTS:
+        raise CommerceConnectorError(
+            f"CONNECTOR_PORT_FORBIDDEN: port {parsed.port} is not in approved port allowlist",
+            status_code=403,
+            retryable=False,
         )
     return cleaned
+
+
+def resolve_registered_connector_url(connector_id: str) -> str:
+    """Resolve a server-registered connector ID to its approved destination URL."""
+    settings = get_settings()
+    norm_id = connector_id.strip()
+    if norm_id != settings.commerce_connector_id:
+        raise CommerceConnectorError(
+            f"UNKNOWN_CONNECTOR_ID: '{norm_id}' is not a registered server connector",
+            status_code=400,
+            retryable=False,
+        )
+    if not settings.commerce_service_base_url.strip():
+        raise CommerceConnectorError(
+            "CONNECTOR_UNCONFIGURED: COMMERCE_SERVICE_BASE_URL is not configured on server",
+            status_code=400,
+            retryable=False,
+        )
+    return validate_approved_commerce_url(settings.commerce_service_base_url)
 
 
 class CommerceReadConnector:
@@ -86,7 +145,7 @@ class CommerceReadConnector:
         max_retries: int = 1,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        self.base_url = _validate_base_url(base_url)
+        self.base_url = validate_approved_commerce_url(base_url)
         self._service_key = service_key
         self.merchant_id = merchant_id
         self.commerce_session_id = commerce_session_id
@@ -94,6 +153,11 @@ class CommerceReadConnector:
         self.timeout_seconds = timeout_seconds
         self.max_retries = max(0, min(max_retries, 3))
         self._transport = transport
+
+    def _scrub(self, text: str) -> str:
+        if self._service_key and self._service_key in text:
+            return text.replace(self._service_key, "[REDACTED]")
+        return text
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -107,7 +171,7 @@ class CommerceReadConnector:
     def _request_json(
         self, path: str, *, params: dict[str, Any] | None = None
     ) -> tuple[Any, datetime]:
-        if not path.startswith("/api/v1/service/"):
+        if not path.startswith("/api/v1/service/") or ".." in path or "@" in path:
             raise CommerceConnectorError(
                 f"Blocked non-service connector path: {path}", retryable=False
             )
@@ -124,9 +188,19 @@ class CommerceReadConnector:
                 observed_at = datetime.now(UTC)
                 if resp.status_code == 200:
                     return resp.json(), observed_at
+                if 300 <= resp.status_code < 400:
+                    raise CommerceConnectorError(
+                        f"CONNECTOR_REDIRECT_BLOCKED: Commerce API {path} returned HTTP "
+                        f"{resp.status_code}; redirects are strictly forbidden",
+                        status_code=resp.status_code,
+                        retryable=False,
+                    )
                 if resp.status_code in (400, 401, 403, 404, 409, 422):
                     raise CommerceConnectorError(
-                        f"Commerce API {path} returned HTTP {resp.status_code}: {resp.text[:240]}",
+                        self._scrub(
+                            f"Commerce API {path} returned HTTP {resp.status_code}: "
+                            f"{resp.text[:200]}"
+                        ),
                         status_code=resp.status_code,
                         retryable=False,
                     )
@@ -139,12 +213,14 @@ class CommerceReadConnector:
                 raise
             except httpx.TimeoutException as exc:
                 last_err = CommerceConnectorError(
-                    f"Commerce API {path} timed out after {self.timeout_seconds}s: {exc}",
+                    self._scrub(
+                        f"Commerce API {path} timed out after {self.timeout_seconds}s: {exc}"
+                    ),
                     retryable=True,
                 )
             except Exception as exc:  # noqa: BLE001
                 last_err = CommerceConnectorError(
-                    f"Commerce API {path} transport error: {str(exc)[:240]}",
+                    self._scrub(f"Commerce API {path} transport error: {str(exc)[:200]}"),
                     retryable=True,
                 )
             if attempt >= self.max_retries:
@@ -187,6 +263,7 @@ class CommerceReadConnector:
         *,
         status: str | None = None,
         reconciliation_status: str | None = None,
+        after_id: str | None = None,
         limit: int = 100,
     ) -> tuple[list[dict[str, Any]], datetime]:
         params: dict[str, Any] = {"limit": max(1, min(limit, 200))}
@@ -194,6 +271,8 @@ class CommerceReadConnector:
             params["status"] = status
         if reconciliation_status:
             params["reconciliation_status"] = reconciliation_status
+        if after_id:
+            params["after_id"] = after_id
         raw, observed_at = self._request_json("/api/v1/service/orders", params=params)
         if not isinstance(raw, list):
             raise CommerceConnectorError("Invalid /service/orders response type", retryable=False)
@@ -209,6 +288,7 @@ class CommerceReadConnector:
         status: str | None = None,
         is_synced: bool | None = None,
         reconciliation_required: bool | None = None,
+        after_id: str | None = None,
         limit: int = 100,
     ) -> tuple[list[dict[str, Any]], datetime]:
         params: dict[str, Any] = {"limit": max(1, min(limit, 200))}
@@ -218,6 +298,8 @@ class CommerceReadConnector:
             params["is_synced"] = str(is_synced).lower()
         if reconciliation_required is not None:
             params["reconciliation_required"] = str(reconciliation_required).lower()
+        if after_id:
+            params["after_id"] = after_id
         raw, observed_at = self._request_json("/api/v1/service/payments", params=params)
         if not isinstance(raw, list):
             raise CommerceConnectorError("Invalid /service/payments response type", retryable=False)

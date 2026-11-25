@@ -437,7 +437,7 @@ def reconcile_pending_vnpay_payments(
     # Phase 2 & 3: QueryDr outside DB locks, then release lease & update schedule under fence
     for pay_id, token in claimed_pairs:
         try:
-            adapter.query_payment_status(db, payment_id=pay_id)
+            adapter.query_payment_status(db, payment_id=pay_id, expected_claim_token=token)
             queried += 1
         except Exception:  # noqa: BLE001
             db.rollback()

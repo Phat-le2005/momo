@@ -455,6 +455,17 @@ def test_end_to_end_scan_dedup_quota_and_independent_recovery_verification(
         mock.fail_with_timeout = False
         mock.orders[0]["status"] = "CONFIRMED"
         mock.payments[0]["is_synced_to_order"] = True
+        mock.events.append(
+            {
+                "id": "EV-SYNC-01",
+                "event_id": "CEVT-SYNC-01",
+                "event_type": "ORDER_UPDATED",
+                "order_id": "ORD-SYNC-01",
+                "payment_id": "PAY-SYNC-01",
+                "occurred_at": datetime.now(UTC).isoformat(),
+                "payload": {"sync_source": "COMMERCE_ORDER_SYNC_WORKER"},
+            }
+        )
         s3 = run_binding_scan(
             db, binding=binding, transport=mock.transport(), service_key=SERVICE_KEY
         )

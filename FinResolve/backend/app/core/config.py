@@ -114,6 +114,14 @@ class Settings(BaseSettings):
     monitor_outbox_lag_threshold: int = Field(default=10, ge=1, le=10000)
     monitor_unsynced_backlog_threshold: int = Field(default=5, ge=1, le=10000)
     commerce_connector_timeout_seconds: float = Field(default=5.0, gt=0.1, le=60.0)
+    commerce_connector_id: str = "default_ministore"
+    commerce_allowed_hosts: str = "localhost,127.0.0.1,commerce-api"
+    commerce_write_key: SecretStr = SecretStr("")
+    judge_admin_secret: SecretStr = SecretStr(
+        "finresolve-judge-lab-local-only-secret-2026-change-me"
+    )
+    monitor_max_pages_per_tick: int = Field(default=10, ge=1, le=100)
+    monitor_max_scan_seconds: float = Field(default=25.0, ge=1.0, le=300.0)
 
     @field_validator("web_origin")
     @classmethod
