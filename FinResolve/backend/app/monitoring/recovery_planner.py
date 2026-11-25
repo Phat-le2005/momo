@@ -14,9 +14,11 @@ current authoritative business state before proposing or executing any capabilit
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.connectors.commerce import CommerceConnectorError, CommerceReadConnector
@@ -24,13 +26,52 @@ from app.connectors.commerce_write import (
     RecoveryExecutionResult,
     execute_and_verify_commerce_recovery,
 )
+from app.core.errors import AppError, ErrorCode
 from app.knowledge.experience_memory import (
     record_verified_experience,
     retrieve_similar_experiences,
 )
 from app.knowledge.policy_rag import retrieve_applicable_policies
+from app.models.cases import Evidence
+from app.models.enums import EvidenceKind
 from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
 from app.monitoring.service import build_connector_for_binding
+
+PROPOSABLE_RECOVERY_COMMANDS: frozenset[str] = frozenset(
+    {
+        "REQUEST_ORDER_SYNC",
+        "REQUEST_EVENT_REDELIVERY",
+        "REQUEST_PAYMENT_RECONCILIATION",
+        "REQUEST_MANUAL_REVIEW",
+        "WAIT_FOR_OBSERVATION",
+        "COLLECT_MORE_EVIDENCE",
+    }
+)
+
+
+class StructuredAgentRecoveryProposal(BaseModel):
+    """Machine-readable structured recovery proposal produced by the Agent (Prompt 14.2 Fix 3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    case_id: str = Field(..., min_length=3, max_length=64)
+    run_id: str = Field(..., min_length=3, max_length=64)
+    affected_entities: dict[str, Any] = Field(default_factory=dict)
+    observed_symptoms: list[str] = Field(default_factory=list)
+    candidate_causes: list[str] = Field(default_factory=list)
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
+    contradicting_evidence_ids: list[str] = Field(default_factory=list)
+    missing_information: list[str] = Field(default_factory=list)
+    proposed_command: str = Field(..., min_length=3, max_length=64)
+    action_params: dict[str, Any] = Field(default_factory=dict)
+    expected_preconditions: list[str] = Field(default_factory=list)
+    expected_postconditions: list[str] = Field(default_factory=list)
+    policy_references: list[str] = Field(default_factory=list)
+    uncertainty_summary: str = Field(default="", max_length=1000)
+    alternative_safe_outcomes: list[str] = Field(default_factory=list)
+    proposal_source: Literal["AGENT_STRUCTURED_PROPOSAL", "DETERMINISTIC_FALLBACK"] = (
+        "AGENT_STRUCTURED_PROPOSAL"
+    )
 
 
 @dataclass
@@ -278,3 +319,106 @@ def execute_autonomous_recovery_plan(
             ),
         )
     return plan, exec_res
+
+
+def validate_and_execute_agent_proposal(
+    db: Session,
+    *,
+    proposal: StructuredAgentRecoveryProposal,
+    binding: CommerceSourceBinding,
+    obs: AnomalyObservation,
+    write_key: str | None = None,
+    read_key: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+    approval_id: str | None = None,
+    require_human_approval: bool = False,
+) -> tuple[StructuredAgentRecoveryProposal, RecoveryExecutionResult | None]:
+    """Validate an Agent's structured recovery proposal against DB evidence and PolicyEngine.
+
+    Hard Invariants (Prompt 14.2 Fix 3):
+    - NEVER silently replaces the Agent's proposed command with a predefined rule action!
+    - If the Agent recommends `REQUEST_MANUAL_REVIEW`, `WAIT_FOR_OBSERVATION`, or
+      `COLLECT_MORE_EVIDENCE`, respects that decision and executes ZERO state-changing commands.
+    - Rejects any state-changing proposal whose `supporting_evidence_ids` are missing, belong to
+      another Case/session, or are not authoritative `OBSERVED_FACT` rows.
+    - Passes the Agent's exact proposed command through deterministic `PolicyEngine` -> HMAC-SHA256
+      signed authorization -> MiniStore atomic execution -> independent Verifier.
+    """
+    norm_cmd = proposal.proposed_command.strip().upper()
+    if norm_cmd not in PROPOSABLE_RECOVERY_COMMANDS:
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            f"UNSUPPORTED_AGENT_PROPOSAL_COMMAND: '{norm_cmd}' is not an allowed capability",
+            status_code=403,
+        )
+
+    # Non-mutating Agent recommendations are respected directly (NO hidden auto-recovery!)
+    if norm_cmd in ("REQUEST_MANUAL_REVIEW", "WAIT_FOR_OBSERVATION", "COLLECT_MORE_EVIDENCE"):
+        return proposal, None
+
+    # Validate supporting_evidence_ids belong to this exact Case + session and are OBSERVED_FACT
+    if not proposal.supporting_evidence_ids:
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            "MISSING_SUPPORTING_EVIDENCE_IDS: state-changing Agent proposal requires evidence IDs",
+            status_code=403,
+        )
+    ev_rows = list(
+        db.scalars(
+            select(Evidence).where(
+                Evidence.id.in_(proposal.supporting_evidence_ids),
+                Evidence.case_id == proposal.case_id,
+                Evidence.session_id == binding.session_id,
+            )
+        ).all()
+    )
+    valid_obs_ids = {e.id for e in ev_rows if e.kind == EvidenceKind.OBSERVED_FACT.value}
+    missing_or_invalid = set(proposal.supporting_evidence_ids) - valid_obs_ids
+    if missing_or_invalid:
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            f"INVALID_OR_UNRELATED_EVIDENCE_REFS: evidence IDs {sorted(missing_or_invalid)} "
+            f"are missing, belong to another Case/session, or are not OBSERVED_FACT",
+            status_code=403,
+        )
+
+    reader = build_connector_for_binding(binding, service_key=read_key, transport=transport)
+    expected_ver_raw = proposal.action_params.get("expected_version")
+    expected_version = int(expected_ver_raw) if isinstance(expected_ver_raw, int) else None
+
+    idemp_key = f"AGT-{proposal.run_id[:16]}-{obs.id[:16]}-{norm_cmd}"[:128]
+    exec_res = execute_and_verify_commerce_recovery(
+        db,
+        binding=binding,
+        obs=obs,
+        command=norm_cmd,
+        idempotency_key=idemp_key,
+        expected_version=expected_version,
+        approval_id=approval_id,
+        require_human_approval=require_human_approval,
+        write_key=write_key,
+        read_key=read_key,
+        transport=transport,
+        read_connector=reader,
+    )
+
+    if exec_res.verified_recovery:
+        cause = proposal.candidate_causes[0] if proposal.candidate_causes else obs.anomaly_type
+        record_verified_experience(
+            db,
+            session_id=obs.session_id,
+            merchant_id=obs.merchant_id,
+            case_id=proposal.case_id,
+            symptom_summary="; ".join(proposal.observed_symptoms) or obs.rationale,
+            symptom_tags=[obs.detector_code, obs.anomaly_type, norm_cmd, proposal.proposal_source],
+            validated_root_cause=str(cause),
+            evidence_refs=list(proposal.supporting_evidence_ids),
+            actions_attempted=[norm_cmd],
+            verified_recovery_steps=[f"{norm_cmd} -> VERIFIED_RECOVERY"],
+            policy_version=(
+                proposal.policy_references[0]
+                if proposal.policy_references
+                else "FinResolve-Policy-v1.2"
+            ),
+        )
+    return proposal, exec_res

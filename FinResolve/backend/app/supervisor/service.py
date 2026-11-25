@@ -1969,11 +1969,13 @@ def process_next_supervisor_job(
                 step_traces = list(inv_res.step_traces)
                 decision_summary = inv_res.decision_summary
 
-                # Prompt 14.1 Phase 4: Integrated Policy-Gated Autonomous Recovery for COMMERCE_HTTP
+                # Prompt 14.2 Fix 3: Consume structured Agent proposal -> PolicyEngine -> Commerce
                 recovery_note = _run_commerce_post_investigation_recovery(
                     exec_db,
                     case_id=claimed_case_id,
                     session_id=claimed_session_id,
+                    run_id=run_id,
+                    is_fallback_mode=is_fallback or (model_mode_val == "DEMO_RULES"),
                     anomaly_id=(
                         str(claimed_payload.get("anomaly_id"))
                         if claimed_payload.get("anomaly_id")
@@ -2217,15 +2219,22 @@ def _run_commerce_post_investigation_recovery(
     *,
     case_id: str,
     session_id: str,
+    run_id: str = "RUN-SUP",
+    is_fallback_mode: bool = False,
     anomaly_id: str | None = None,
     commerce_transport: Any = None,
 ) -> str | None:
-    """Integrate evidence-driven recovery planning, PolicyEngine authorization, durable
-    Commerce execution, and independent verification into the actual Supervisor runtime.
+    """Consume the Agent's structured recovery proposal (or explicitly labeled fallback),
+    validate evidence provenance, authorize via PolicyEngine, execute atomically, and verify.
     """
     from app.models.cases import CaseEvent, Evidence
     from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
-    from app.monitoring.recovery_planner import execute_autonomous_recovery_plan
+    from app.monitoring.recovery_planner import (
+        StructuredAgentRecoveryProposal,
+        build_evidence_driven_recovery_plan,
+        validate_and_execute_agent_proposal,
+    )
+    from app.monitoring.service import build_connector_for_binding
 
     case_obj = db.scalar(select(Case).where(Case.id == case_id, Case.session_id == session_id))
     if (
@@ -2235,19 +2244,18 @@ def _run_commerce_post_investigation_recovery(
     ):
         return None
 
-    # Require authoritative OBSERVED_FACT evidence gathered on this Case before any action!
-    has_obs_evidence = (
-        db.scalar(
-            select(func.count(Evidence.id)).where(
+    obs_ev_rows = list(
+        db.scalars(
+            select(Evidence).where(
                 Evidence.case_id == case_obj.id,
                 Evidence.session_id == session_id,
                 Evidence.kind == EvidenceKind.OBSERVED_FACT.value,
             )
-        )
-        or 0
+        ).all()
     )
-    if has_obs_evidence == 0:
+    if not obs_ev_rows:
         return None
+    obs_ev_ids = [e.id for e in obs_ev_rows]
 
     binding = db.scalar(
         select(CommerceSourceBinding).where(
@@ -2280,13 +2288,73 @@ def _run_commerce_post_investigation_recovery(
     if obs is None or obs.lifecycle_state == "RECOVERED":
         return None
 
-    now = datetime.now(UTC)
-    plan, exec_res = execute_autonomous_recovery_plan(
-        db,
-        binding=binding,
-        obs=obs,
-        transport=commerce_transport,
+    agent_action_prop = db.scalar(
+        select(ActionProposal)
+        .where(
+            ActionProposal.case_id == case_obj.id,
+            ActionProposal.session_id == session_id,
+        )
+        .order_by(ActionProposal.created_at.desc())
+        .limit(1)
     )
+    reader = build_connector_for_binding(binding, transport=commerce_transport)
+    safety_plan = build_evidence_driven_recovery_plan(
+        db, binding=binding, obs=obs, connector=reader
+    )
+
+    if agent_action_prop is not None:
+        act_map = {
+            "ORDER_SYNC": "REQUEST_ORDER_SYNC",
+            "REQUEST_ORDER_SYNC": "REQUEST_ORDER_SYNC",
+            "REQUEST_EVENT_REDELIVERY": "REQUEST_EVENT_REDELIVERY",
+            "REQUEST_PAYMENT_RECONCILIATION": "REQUEST_PAYMENT_RECONCILIATION",
+        }
+        proposed_cmd = act_map.get(agent_action_prop.action_type.upper(), "REQUEST_MANUAL_REVIEW")
+        proposal_source: Any = (
+            "DETERMINISTIC_FALLBACK" if is_fallback_mode else "AGENT_STRUCTURED_PROPOSAL"
+        )
+        action_params = dict(agent_action_prop.params_json or {})
+        if "expected_version" not in action_params and safety_plan.expected_version is not None:
+            action_params["expected_version"] = safety_plan.expected_version
+    elif not is_fallback_mode:
+        proposed_cmd = "REQUEST_MANUAL_REVIEW"
+        proposal_source = "AGENT_STRUCTURED_PROPOSAL"
+        action_params = {}
+    else:
+        proposed_cmd = (
+            safety_plan.proposed_command
+            if (not safety_plan.requires_human_approval and safety_plan.preconditions_met)
+            else "REQUEST_MANUAL_REVIEW"
+        )
+        proposal_source = "DETERMINISTIC_FALLBACK"
+        action_params = (
+            {"expected_version": safety_plan.expected_version}
+            if safety_plan.expected_version is not None
+            else {}
+        )
+
+    structured_prop = StructuredAgentRecoveryProposal(
+        case_id=case_obj.id,
+        run_id=run_id,
+        affected_entities=dict(obs.affected_entities_json or {}),
+        observed_symptoms=[obs.rationale],
+        candidate_causes=[h.get("cause", obs.anomaly_type) for h in safety_plan.hypotheses],
+        supporting_evidence_ids=obs_ev_ids,
+        missing_information=list(safety_plan.missing_evidence),
+        proposed_command=proposed_cmd,
+        action_params=action_params,
+        expected_preconditions=[
+            "PolicyEngine deterministic authorization",
+            "Authoritative state match",
+        ],
+        expected_postconditions=list(safety_plan.expected_postconditions),
+        policy_references=list(safety_plan.policy_ids),
+        uncertainty_summary=safety_plan.uncertainty_note,
+        alternative_safe_outcomes=["REQUEST_MANUAL_REVIEW", "WAIT_FOR_OBSERVATION"],
+        proposal_source=proposal_source,
+    )
+
+    now = datetime.now(UTC)
     db.add(
         CaseEvent(
             id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
@@ -2295,16 +2363,23 @@ def _run_commerce_post_investigation_recovery(
             type="AUTONOMOUS_RECOVERY_PLANNED",
             payload_json={
                 "anomaly_id": obs.id,
-                "proposed_command": plan.proposed_command,
-                "policy_ids": plan.policy_ids,
-                "planning_mode": plan.planning_mode,
-                "requires_human_approval": plan.requires_human_approval,
-                "preconditions_met": plan.preconditions_met,
-                "evidence_refs": plan.evidence_refs,
-                "similar_experience_count": len(plan.similar_experiences),
+                "proposed_command": structured_prop.proposed_command,
+                "proposal_source": structured_prop.proposal_source,
+                "policy_ids": structured_prop.policy_references,
+                "supporting_evidence_ids": structured_prop.supporting_evidence_ids,
+                "uncertainty_summary": structured_prop.uncertainty_summary,
             },
             created_at=now,
         )
+    )
+    db.flush()
+
+    _, exec_res = validate_and_execute_agent_proposal(
+        db,
+        proposal=structured_prop,
+        binding=binding,
+        obs=obs,
+        transport=commerce_transport,
     )
 
     if exec_res is None:
@@ -2316,15 +2391,18 @@ def _run_commerce_post_investigation_recovery(
                 type="AUTONOMOUS_RECOVERY_ESCALATED",
                 payload_json={
                     "anomaly_id": obs.id,
-                    "proposed_command": plan.proposed_command,
-                    "rationale": plan.rationale,
-                    "uncertainty_note": plan.uncertainty_note,
+                    "proposed_command": structured_prop.proposed_command,
+                    "proposal_source": structured_prop.proposal_source,
+                    "uncertainty_summary": structured_prop.uncertainty_summary,
                 },
                 created_at=datetime.now(UTC),
             )
         )
         db.commit()
-        return f"Escalated safely ({plan.proposed_command}): {plan.rationale[:180]}"
+        return (
+            f"Escalated safely ({structured_prop.proposed_command}, "
+            f"source={structured_prop.proposal_source})"
+        )
 
     if exec_res.verified_recovery:
         db.add(
@@ -2336,6 +2414,7 @@ def _run_commerce_post_investigation_recovery(
                 payload_json={
                     "command_id": exec_res.command_id,
                     "command": exec_res.command,
+                    "proposal_source": structured_prop.proposal_source,
                     "verdict": exec_res.verdict,
                     "recovery_source": exec_res.recovery_source,
                     "detail": exec_res.detail,
@@ -2346,7 +2425,10 @@ def _run_commerce_post_investigation_recovery(
         case_obj.state = CaseState.RESOLVED.value
         case_obj.updated_at = datetime.now(UTC)
         db.commit()
-        return f"Autonomous recovery verified ({exec_res.command} -> {exec_res.verdict})"
+        return (
+            f"Autonomous recovery verified ({exec_res.command} -> {exec_res.verdict}, "
+            f"source={structured_prop.proposal_source})"
+        )
 
     db.commit()
     return f"Recovery attempted ({exec_res.command} -> {exec_res.verdict})"
