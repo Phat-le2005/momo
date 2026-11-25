@@ -135,9 +135,9 @@ def _require_write_principal(
     ]
     if not allowed_cmds:
         raise CommerceError(
-            ErrorCode.FORBIDDEN,
+            ErrorCode.UNAUTHORIZED,
             "READ_CREDENTIAL_FORBIDDEN_FOR_WRITES: credential lacks recovery write capabilities",
-            status_code=403,
+            status_code=401,
         )
 
     # Server-side scope isolation: caller headers MUST NOT expand or cross credential scope

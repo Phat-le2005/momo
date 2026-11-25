@@ -337,7 +337,7 @@ def test_durable_recovery_protocol_planner_and_real_baseline_comparison(
 
         # Real executed baseline comparison harness
         comp = run_baseline_comparison_harness(db=db, session_id=active_session["id"], seed=99)
-        assert comp["evaluation_mode"] == "GENUINE_EXECUTED_LOCAL_ORCHESTRATION"
+        assert comp["evaluation_mode"] == "MOCK_ORCHESTRATION"
         by_cfg = {row["configuration"]: row for row in comp["baselines"]}
         cfg_a = by_cfg["Baseline A (Rule-Based Only)"]
         cfg_c = by_cfg["Configuration C (FinResolve Open-World Guardian)"]

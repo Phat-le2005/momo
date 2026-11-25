@@ -30,6 +30,7 @@ def _headers() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
         "X-Merchant-Id": "MERCHANT_FINSHOP_01",
         "X-Commerce-Session-Id": "CSESS_FINSHOP_DEFAULT_01",
         "X-World-Epoch": "1",
+        "X-Authorization-Digest": "a" * 64,
     }
     return chaos_h, read_h, write_h
 

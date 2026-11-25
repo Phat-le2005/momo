@@ -42,7 +42,7 @@ def test_write_credential_scope_isolation_and_capability_enforcement(client: Tes
                 "idempotency_key": f"IDEMP-READ-{uuid.uuid4().hex[:8]}",
             },
         )
-        assert r_read.status_code == 403
+        assert r_read.status_code == 401
 
         # 2. Cross-merchant header override MUST be rejected
         r_merch = client.post(
