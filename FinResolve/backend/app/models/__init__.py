@@ -33,6 +33,7 @@ from app.models.enums import (
     VerificationVerdict,
 )
 from app.models.incidents import AgentTask, Incident, IncidentCase
+from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
 from app.models.risk import RiskSignal
 from app.models.scenario_runs import SimScenarioRun
 from app.models.session import DemoSession
@@ -66,6 +67,7 @@ __all__ = [
     "ActionType",
     "AgentTask",
     "AgentTaskState",
+    "AnomalyObservation",
     "Approval",
     "ApprovalDecision",
     "Case",
@@ -74,6 +76,7 @@ __all__ = [
     "ChallengeRun",
     "ChallengeStatus",
     "ChallengeType",
+    "CommerceSourceBinding",
     "DemoSession",
     "Evidence",
     "EvidenceKind",

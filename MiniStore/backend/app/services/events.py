@@ -87,13 +87,46 @@ def record_commerce_event(
         if csess is not None:
             finresolve_session_id = csess.finresolve_session_id
 
+    # Derive truthful source_mode provenance (never mislabel VNPAY_SANDBOX/TEST_FIXTURE as MOCK)
+    derived_source_mode = (
+        str(
+            (provenance or {}).get("source_mode")
+            or (payload or {}).get("provenance")
+            or (payload or {}).get("provider_environment")
+            or ""
+        )
+        .strip()
+        .upper()
+    )
+    if derived_source_mode not in (
+        "MOCK",
+        "SANDBOX",
+        "TEST_FIXTURE",
+        "VNPAY_SANDBOX",
+        "PRODUCTION",
+    ):
+        if payment_id:
+            from app.models.entities import Payment
+
+            pay_row = db.get(Payment, payment_id)
+            if pay_row is not None and pay_row.provider_environment:
+                derived_source_mode = pay_row.provider_environment.strip().upper()
+    if derived_source_mode not in (
+        "MOCK",
+        "SANDBOX",
+        "TEST_FIXTURE",
+        "VNPAY_SANDBOX",
+        "PRODUCTION",
+    ):
+        derived_source_mode = get_settings().source_mode.strip().upper() or "MOCK"
+
     ev = CommerceEvent(
         id=f"EV-{uuid.uuid4().hex[:12].upper()}",
         event_id=stable_event_id,
         event_type=norm_type,
         source="MINI_STORE_COMMERCE",
         schema_version="1.0",
-        source_mode="MOCK",
+        source_mode=derived_source_mode,
         merchant_id=merchant_id,
         commerce_session_id=commerce_session_id,
         finresolve_session_id=finresolve_session_id,

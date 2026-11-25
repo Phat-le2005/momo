@@ -97,6 +97,24 @@ class Settings(BaseSettings):
     supervisor_job_lease_seconds: int = Field(default=30, ge=3, le=600)
     supervisor_heartbeat_interval_seconds: float = Field(default=5.0, gt=0.1, le=120.0)
 
+    # Prompt 12 — Autonomous Continuous Commerce Monitor
+    continuous_monitor_enabled: bool = False
+    commerce_service_base_url: str = ""
+    commerce_service_key: SecretStr = SecretStr("")
+    commerce_merchant_id: str = "MERCHANT_FINSHOP_01"
+    commerce_session_id: str = "CSESS_FINSHOP_DEFAULT_01"
+    commerce_world_epoch: int = Field(default=1, ge=1)
+    monitor_poll_interval_seconds: float = Field(default=5.0, ge=0.5, le=300.0)
+    monitor_reconcile_interval_seconds: float = Field(default=15.0, ge=1.0, le=600.0)
+    monitor_batch_size: int = Field(default=50, ge=1, le=200)
+    monitor_lease_seconds: int = Field(default=30, ge=5, le=300)
+    monitor_payment_sync_grace_seconds: int = Field(default=30, ge=0, le=3600)
+    monitor_order_stall_seconds: int = Field(default=1800, ge=5, le=86400 * 7)
+    monitor_max_concurrent_investigations: int = Field(default=5, ge=1, le=50)
+    monitor_outbox_lag_threshold: int = Field(default=10, ge=1, le=10000)
+    monitor_unsynced_backlog_threshold: int = Field(default=5, ge=1, le=10000)
+    commerce_connector_timeout_seconds: float = Field(default=5.0, gt=0.1, le=60.0)
+
     @field_validator("web_origin")
     @classmethod
     def _no_wildcard_origin(cls, value: str) -> str:

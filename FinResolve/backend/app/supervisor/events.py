@@ -55,6 +55,22 @@ NORMAL_OBSERVATION_EVENT_TYPES: frozenset[str] = frozenset(
         "ORDER_UPDATED",
         "PAYMENT_INITIATED",
         "INVENTORY_UPDATED",
+        # Prompt 12: extended MiniStore Commerce domain observation events (0 false Cases)
+        "PAYMENT_SUCCEEDED",
+        "PAYMENT_FAILED",
+        "PAYMENT_STATUS_UNKNOWN",
+        "PAYMENT_QUERY_COMPLETED",
+        "INVENTORY_RESERVED",
+        "INVENTORY_RELEASED",
+        "REFUND_REQUESTED",
+        "REFUND_PENDING",
+        "REFUND_COMPLETED",
+        "REFUND_STATUS_UNKNOWN",
+        "COMPLAINT_SUBMITTED",
+        "PAYMENT_RECONCILIATION_REQUIRED",
+        "INVENTORY_INCONSISTENCY_DETECTED",
+        "LIVE_SESSION_STARTED",
+        "FLASH_SALE_STARTED",
     }
 )
 ANOMALY_INVESTIGATION_EVENT_TYPES: frozenset[str] = frozenset(

@@ -40,6 +40,10 @@ class Case(Base):
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     owner: Mapped[str] = mapped_column(String(64), nullable=False, default="guest")
+    source_system: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="SIMULATOR", index=True
+    )
+    source_binding_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     idempotency_payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -566,7 +566,12 @@ class BoundedAgentRuntime:
         self._maybe_commit()
 
         context_builder = ContextBuilder(self._db, session_id)
-        tool_registry = ReadToolRegistry(self._db, session_id)
+        tool_registry = ReadToolRegistry(
+            self._db,
+            session_id,
+            source_system=case.source_system,
+            source_binding_id=case.source_binding_id,
+        )
 
         tool_observations: list[ToolObservationRecord] = []
         step_traces: list[InvestigationStepTrace] = []
