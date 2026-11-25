@@ -33,6 +33,11 @@ class CommerceSettings(BaseSettings):
     service_api_key: SecretStr = SecretStr(
         "finshop-local-only-service-connector-key-2026-change-me"
     )
+    service_write_api_key: SecretStr = SecretStr(
+        "finshop-local-only-service-write-key-2026-change-me"
+    )
+    chaos_enabled: bool = False
+    chaos_admin_key: SecretStr = SecretStr("finshop-local-only-chaos-admin-key-2026-change-me")
     mock_provider_secret: SecretStr = SecretStr(
         "finshop-local-only-mock-provider-secret-2026-change-me"
     )

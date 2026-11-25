@@ -36,6 +36,7 @@ BLOCKED_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^/merchant(/.*)?$"),
     re.compile(r"^/api/v1/merchant(/.*)?$"),
     re.compile(r"^/api/v1/service(/.*)?$"),
+    re.compile(r"^/api/v1/chaos(/.*)?$"),
     re.compile(r"^/api/v1/test-payments(/.*)?$"),
     re.compile(r"^/api/v1/store/orders/[^/]+/mock-pay$"),
     re.compile(r"^/api/v1/(judge|supervisor|cases|actions)(/.*)?$"),

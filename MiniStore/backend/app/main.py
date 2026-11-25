@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from app.api.chaos import router as chaos_router
 from app.api.merchant import router as merchant_router
 from app.api.service_read import router as service_read_router
 from app.api.storefront import router as storefront_router
@@ -92,6 +93,7 @@ def create_app() -> FastAPI:
     app.include_router(storefront_router, prefix="/api/v1")
     app.include_router(merchant_router, prefix="/api/v1")
     app.include_router(service_read_router, prefix="/api/v1")
+    app.include_router(chaos_router, prefix="/api/v1")
     return app
 
 
