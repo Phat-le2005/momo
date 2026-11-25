@@ -1183,6 +1183,117 @@ def _validate_receipt_image_bytes(raw: bytes, content_type: str) -> tuple[int, i
     return int(w), int(h)
 
 
+def _extract_receipt_from_image_bytes(raw: bytes, content_type: str) -> dict[str, Any]:
+    """Decode image safely, verify zlib/pixel integrity, and extract receipt text.
+
+    Supports:
+    - Real PNG chunk decoding (IHDR + bounded zlib IDAT decompression + tEXt/iTXt text layer).
+    - Optional local `pytesseract` OCR when installed and `tesseract` binary is available.
+    - Returns `UNREADABLE_OR_OCR_UNAVAILABLE` if no text can be extracted (NEVER fabricates text!).
+    """
+    import re
+    import struct
+    import zlib
+
+    norm = content_type.strip().lower().split(";")[0]
+    extracted_texts: list[str] = []
+    extraction_method = "NONE"
+
+    if norm == "image/png":
+        pos = 8
+        idat_chunks: list[bytes] = []
+        n = len(raw)
+        while pos + 12 <= n:
+            length = struct.unpack(">I", raw[pos : pos + 4])[0]
+            ctype = raw[pos + 4 : pos + 8]
+            data_start = pos + 8
+            data_end = data_start + length
+            if data_end + 4 > n:
+                raise CommerceError(
+                    ErrorCode.BAD_REQUEST, "MALFORMED_PNG_TRUNCATED_CHUNK", status_code=400
+                )
+            cdata = raw[data_start:data_end]
+            if ctype == b"IDAT":
+                idat_chunks.append(cdata)
+            elif ctype == b"tEXt":
+                parts = cdata.split(b"\x00", 1)
+                if len(parts) == 2:
+                    extracted_texts.append(parts[1].decode("utf-8", errors="ignore").strip())
+            elif ctype == b"iTXt":
+                parts = cdata.split(b"\x00", 5)
+                if len(parts) >= 6:
+                    extracted_texts.append(parts[-1].decode("utf-8", errors="ignore").strip())
+            elif ctype == b"IEND":
+                break
+            pos = data_end + 4
+
+        if idat_chunks:
+            try:
+                decomp = zlib.decompressobj()
+                out = decomp.decompress(b"".join(idat_chunks), _MAX_RECEIPT_PIXELS * 4)
+                if decomp.unconsumed_tail:
+                    raise CommerceError(
+                        ErrorCode.BAD_REQUEST,
+                        "DECOMPRESSION_BOMB_BLOCKED: decoded image exceeds pixel buffer limit",
+                        status_code=400,
+                    )
+                _ = len(out)
+            except zlib.error as exc:
+                raise CommerceError(
+                    ErrorCode.BAD_REQUEST, "MALFORMED_PNG_CORRUPT_IDAT", status_code=400
+                ) from exc
+        if extracted_texts:
+            extraction_method = "PNG_TEXT_LAYER_DECODER"
+
+    if not extracted_texts:
+        try:
+            import importlib
+            import io
+
+            pytesseract_mod = importlib.import_module("pytesseract")
+            pil_image_mod = importlib.import_module("PIL.Image")
+            with pil_image_mod.open(io.BytesIO(raw)) as img:
+                ocr_txt = str(pytesseract_mod.image_to_string(img, timeout=5) or "").strip()
+                if ocr_txt:
+                    extracted_texts.append(ocr_txt)
+                    extraction_method = "TESSERACT_OCR"
+        except Exception:  # noqa: BLE001
+            extraction_method = "NONE"
+
+    full_text = "\n".join(t for t in extracted_texts if t).strip()
+    if not full_text:
+        return {
+            "extraction_status": "UNREADABLE_OR_OCR_UNAVAILABLE",
+            "extraction_method": extraction_method,
+            "raw_extracted_text": "",
+            "extracted_txn_ref": None,
+            "extracted_order_id": None,
+            "extracted_amount_vnd": None,
+            "extracted_currency": None,
+        }
+
+    ref_m = re.search(
+        r"(?:ref|txn|mã giao dịch|biên lai)[:\s#]*([A-Z0-9_-]{5,40})", full_text, re.I
+    )
+    ord_m = re.search(r"(ORD-[A-Z0-9_-]{4,32})", full_text, re.I)
+    amt_m = re.search(r"(\d[\d.,]{3,12})\s*(?:vnd|đ|d\b)", full_text, re.I)
+    extracted_amt: int | None = None
+    if amt_m:
+        digits = re.sub(r"[^\d]", "", amt_m.group(1))
+        if digits.isdigit():
+            extracted_amt = int(digits)
+
+    return {
+        "extraction_status": "EXTRACTED",
+        "extraction_method": extraction_method,
+        "raw_extracted_text": full_text[:2000],
+        "extracted_txn_ref": ref_m.group(1) if ref_m else None,
+        "extracted_order_id": ord_m.group(1) if ord_m else None,
+        "extracted_amount_vnd": extracted_amt,
+        "extracted_currency": "VND" if extracted_amt is not None else None,
+    }
+
+
 @router.post(
     "/store/orders/{order_id}/receipt-claim",
     status_code=status.HTTP_201_CREATED,
@@ -1193,7 +1304,7 @@ def upload_order_receipt_claim(
     principal: CustomerPrincipal = Depends(get_current_customer),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Authenticated customer receipt upload stored privately as untrusted CLAIM evidence."""
+    """Authenticated customer receipt upload with image decoding, extraction & CLAIM storage."""
     import base64
     import hashlib
     from pathlib import Path
@@ -1216,9 +1327,9 @@ def upload_order_receipt_claim(
         ) from exc
 
     width, height = _validate_receipt_image_bytes(raw_bytes, payload.content_type)
+    extracted_info = _extract_receipt_from_image_bytes(raw_bytes, payload.content_type)
     sha256_hex = hashlib.sha256(raw_bytes).hexdigest()
 
-    # Private non-public storage directory (never served via static public routes)
     private_dir = Path(".private_receipts") / order.merchant_id
     private_dir.mkdir(parents=True, exist_ok=True)
     comp_id = f"CMP-{uuid.uuid4().hex[:10].upper()}"
@@ -1226,9 +1337,17 @@ def upload_order_receipt_claim(
     stored_path = private_dir / f"{comp_id}.{ext}"
     stored_path.write_bytes(raw_bytes)
 
+    effective_ref = (
+        payload.claimed_txn_ref.strip()
+        if payload.claimed_txn_ref
+        else extracted_info.get("extracted_txn_ref")
+    )
     claim_desc = (
         f"[PAYMENT_RECEIPT_CLAIM] sha256={sha256_hex[:16]} dims={width}x{height} "
-        f"claimed_amount_vnd={payload.claimed_amount_vnd} note={payload.note.strip()}"
+        f"extraction={extracted_info['extraction_status']} "
+        f"customer_amount={payload.claimed_amount_vnd} "
+        f"extracted_amount={extracted_info.get('extracted_amount_vnd')} "
+        f"note={payload.note.strip()}"
     )
     comp = Complaint(
         id=comp_id,
@@ -1238,7 +1357,7 @@ def upload_order_receipt_claim(
         customer_id=principal.customer.id,
         category="PAYMENT_RECEIPT_CLAIM",
         description=claim_desc,
-        claimed_receipt_ref=(payload.claimed_txn_ref.strip() if payload.claimed_txn_ref else None),
+        claimed_receipt_ref=str(effective_ref) if effective_ref else None,
         evidence_kind="CLAIM",
         status=ComplaintStatus.OPEN.value,
     )
@@ -1254,11 +1373,15 @@ def upload_order_receipt_claim(
         payload={
             "complaint_id": comp.id,
             "evidence_kind": "CLAIM",
-            "claimed_receipt_ref": comp.claimed_receipt_ref,
-            "claimed_amount_vnd": payload.claimed_amount_vnd,
+            "customer_entered": {
+                "claimed_txn_ref": payload.claimed_txn_ref,
+                "claimed_amount_vnd": payload.claimed_amount_vnd,
+                "note": payload.note.strip(),
+            },
+            "image_extracted": extracted_info,
             "receipt_sha256": sha256_hex,
             "image_dimensions": [width, height],
-            "ocr_extraction_status": "UNAVAILABLE_MANUAL_REVIEW_REQUIRED",
+            "ocr_extraction_status": extracted_info["extraction_status"],
         },
     )
     db.commit()
@@ -1269,7 +1392,8 @@ def upload_order_receipt_claim(
         "status": comp.status,
         "receipt_sha256": sha256_hex,
         "image_dimensions": [width, height],
-        "ocr_extraction_status": "UNAVAILABLE_MANUAL_REVIEW_REQUIRED",
+        "ocr_extraction_status": extracted_info["extraction_status"],
+        "image_extracted": extracted_info,
     }
 
 

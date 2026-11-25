@@ -259,6 +259,16 @@ def verify_payment_claim_against_records(
         if v
     }
 
+    # Missing authoritative identifiers MUST NEVER silently bypass validation!
+    if not auth_refs:
+        missing_fields.append("Authoritative payment record is missing transaction reference")
+    if auth_amt <= 0:
+        missing_fields.append("Authoritative payment record is missing valid amount")
+    if not auth_order_id:
+        missing_fields.append("Authoritative payment record is missing order association")
+    if expected_merchant_id and not auth_merchant_id:
+        missing_fields.append("Authoritative payment record is missing merchant identity")
+
     if auth_status != "SUCCEEDED":
         discrepancies.append(f"Authoritative payment status is '{auth_status}', not SUCCEEDED")
     if claimed_amt is not None and auth_amt > 0 and int(claimed_amt) != auth_amt:

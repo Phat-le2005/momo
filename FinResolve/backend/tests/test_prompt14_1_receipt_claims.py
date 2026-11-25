@@ -122,3 +122,111 @@ def test_strict_claim_verification_all_eight_synthetic_fixtures() -> None:
         authoritative_order=auth_order,
     )
     assert r8.verdict == "INSUFFICIENT_EVIDENCE"
+
+
+def test_missing_authoritative_identifiers_never_return_claim_supported() -> None:
+    """Missing authoritative txn ref or merchant MUST return INSUFFICIENT_EVIDENCE."""
+    res = verify_payment_claim_against_records(
+        raw_claim_text="[SYNTHETIC TEST] Ref: MOCKTXN998877 ORD-SYNTH-01 250,000 VND",
+        authoritative_payment={"status": "SUCCEEDED", "amount_vnd": 250000},
+        authoritative_order={"id": "ORD-SYNTH-01", "status": "PENDING_PAYMENT"},
+        expected_merchant_id="MERCHANT_FINSHOP_01",
+    )
+    assert res.verdict == "INSUFFICIENT_EVIDENCE"
+
+
+def test_submitted_suspicious_receipt_claim_reaches_monitor_and_creates_case(
+    clean_database: None, active_session: dict[str, str]
+) -> None:
+    """Suspicious PAYMENT_RECEIPT_CLAIM_SUBMITTED event automatically creates Case + Job."""
+    import uuid
+
+    import httpx
+    from sqlalchemy import select
+
+    from app.db.session import get_sessionmaker
+    from app.models.cases import Case
+    from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
+    from app.monitoring.service import run_binding_scan
+
+    sid = active_session["id"]
+    with get_sessionmaker()() as db:
+        binding = CommerceSourceBinding(
+            id=f"BIND-CLM-{uuid.uuid4().hex[:8].upper()}",
+            session_id=sid,
+            world_epoch=1,
+            base_url="http://127.0.0.1:8100",
+            merchant_id="MERCHANT_FINSHOP_01",
+            commerce_session_id="CSESS_FINSHOP_DEFAULT_01",
+            commerce_world_epoch=1,
+            is_enabled=True,
+        )
+        db.add(binding)
+        db.commit()
+
+        claim_event = {
+            "id": "CEV-CLM-01",
+            "event_id": f"EVT-CLM-{uuid.uuid4().hex[:8]}",
+            "event_type": "PAYMENT_RECEIPT_CLAIM_SUBMITTED",
+            "order_id": "ORD-CLM-99",
+            "occurred_at": "2026-11-25T10:00:00+00:00",
+            "payload": {
+                "complaint_id": "CMP-SUSP-99",
+                "evidence_kind": "CLAIM",
+                "image_extracted": {
+                    "extraction_status": "EXTRACTED",
+                    "raw_extracted_text": "[SYNTHETIC] Ref: FAKE99999 ORD-CLM-99 999,000 VND",
+                },
+            },
+        }
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            p = request.url.path
+            if p == "/api/v1/service/events":
+                return httpx.Response(
+                    200, json={"items": [claim_event], "next_cursor": None, "has_more": False}
+                )
+            if p == "/api/v1/service/orders":
+                return httpx.Response(
+                    200,
+                    json=[{"id": "ORD-CLM-99", "status": "PENDING_PAYMENT", "total_vnd": 250000}],
+                )
+            if p == "/api/v1/service/payments":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "payment_id": "PAY-CLM-99",
+                            "provider_txn_ref": "REALTXN111",
+                            "order_id": "ORD-CLM-99",
+                            "merchant_id": "MERCHANT_FINSHOP_01",
+                            "status": "PENDING",
+                            "amount_vnd": 250000,
+                        }
+                    ],
+                )
+            if p == "/api/v1/service/metrics":
+                return httpx.Response(200, json={"outbox_lag_count": 0, "unsynced_payments": 0})
+            if p == "/api/v1/service/telemetry":
+                return httpx.Response(404)
+            return httpx.Response(200, json=[])
+
+        summary = run_binding_scan(
+            db,
+            binding=binding,
+            transport=httpx.MockTransport(_handler),
+            service_key="rk",
+            auto_create_cases=True,
+        )
+        assert summary.cases_created >= 1
+        obs = db.scalar(
+            select(AnomalyObservation).where(
+                AnomalyObservation.session_id == sid,
+                AnomalyObservation.detector_code == "CLAIM_VERIF",
+            )
+        )
+        assert obs is not None
+        assert obs.linked_case_id is not None
+        case_obj = db.get(Case, obs.linked_case_id)
+        assert case_obj is not None
+        assert case_obj.type == "PAYMENT_CLAIM_INVESTIGATION"

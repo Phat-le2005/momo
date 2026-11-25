@@ -1499,7 +1499,86 @@ def run_binding_scan(
         except CommerceConnectorError:
             coverage["open_world"] = {"telemetry_available": False}
 
-        all_candidates = [*candidates, *open_world_candidates]
+        # Step 6c (Prompt 14.2 Fix 4): Autonomous investigation of submitted payment receipt claims
+        claim_candidates: list[DetectedAnomaly] = []
+        from app.observability.receipt_verifier import verify_payment_claim_against_records
+
+        orders_by_id = {str(o.get("id")): o for o in orders if o.get("id")}
+        payments_by_order: dict[str, dict[str, Any]] = {}
+        for p in payments:
+            if p.get("order_id"):
+                payments_by_order[str(p["order_id"])] = p
+
+        for rev in remote_events:
+            if str(rev.get("event_type") or "").upper() != "PAYMENT_RECEIPT_CLAIM_SUBMITTED":
+                continue
+            ev_payload = rev.get("payload") or {}
+            oid = str(rev.get("order_id") or "")
+            comp_id = str(ev_payload.get("complaint_id") or rev.get("event_id") or "")
+            img_ext = ev_payload.get("image_extracted") or {}
+            cust_in = ev_payload.get("customer_entered") or {}
+            raw_text = str(img_ext.get("raw_extracted_text") or "")
+            if not raw_text:
+                parts = []
+                if cust_in.get("claimed_txn_ref"):
+                    parts.append(f"Ref: {cust_in['claimed_txn_ref']}")
+                if oid:
+                    parts.append(oid)
+                if cust_in.get("claimed_amount_vnd"):
+                    parts.append(f"{cust_in['claimed_amount_vnd']} VND")
+                if cust_in.get("note"):
+                    parts.append(str(cust_in["note"]))
+                raw_text = " ".join(parts)
+
+            verif = verify_payment_claim_against_records(
+                raw_claim_text=raw_text,
+                authoritative_payment=payments_by_order.get(oid),
+                authoritative_order=orders_by_id.get(oid),
+                expected_merchant_id=binding.merchant_id,
+                ocr_available=str(img_ext.get("extraction_status") or "")
+                != "UNREADABLE_OR_OCR_UNAVAILABLE",
+                image_unreadable=str(img_ext.get("extraction_status") or "")
+                == "UNREADABLE_OR_OCR_UNAVAILABLE",
+            )
+            if verif.verdict != "CLAIM_SUPPORTED":
+                claim_candidates.append(
+                    DetectedAnomaly(
+                        detector_code="CLAIM_VERIF",
+                        anomaly_type="SUSPICIOUS_PAYMENT_RECEIPT_CLAIM",
+                        fingerprint=f"CLAIM_VERIF:{binding.merchant_id}:{oid}:{comp_id}",
+                        severity="HIGH" if verif.verdict == "CLAIM_CONTRADICTED" else "MEDIUM",
+                        affected_order_id=oid or None,
+                        affected_payment_id=(
+                            str(
+                                payments_by_order[oid].get("payment_id")
+                                or payments_by_order[oid].get("id")
+                            )
+                            if oid in payments_by_order
+                            else None
+                        ),
+                        affected_entities={
+                            "complaint_id": comp_id,
+                            "order_id": oid,
+                            "claim_verdict": verif.verdict,
+                            "prompt_injection_detected": verif.prompt_injection_detected,
+                        },
+                        evidence_refs=[
+                            {
+                                "source": "PAYMENT_RECEIPT_CLAIM_VERIFIER",
+                                "evidence_kind": "CLAIM",
+                                "verdict": verif.verdict,
+                                "extracted_claim": verif.extracted_claim,
+                                "authoritative_comparison": verif.authoritative_comparison,
+                                "discrepancies": verif.discrepancies,
+                            }
+                        ],
+                        rationale=f"Receipt claim {comp_id} -> {verif.verdict}: {verif.rationale}",
+                        case_type="PAYMENT_CLAIM_INVESTIGATION",
+                        recommended_action_hint="REQUEST_MANUAL_REVIEW",
+                    )
+                )
+
+        all_candidates = [*candidates, *open_world_candidates, *claim_candidates]
         summary.anomalies_detected = len(all_candidates) + len(d06_candidates)
 
         for cand in all_candidates:
