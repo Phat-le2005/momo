@@ -662,3 +662,23 @@ def service_get_operational_metrics(
         "unsynced_payments": unsynced_payments,
         "outbox_lag_count": outbox_lag_count,
     }
+
+
+@router.get("/telemetry")
+def service_get_operational_telemetry(
+    principal: ServicePrincipal = Depends(get_service_principal),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Authenticated rolling-window HTTP & queue telemetry measured from real requests."""
+    from app.core.telemetry import get_telemetry_collector
+
+    metrics = service_get_operational_metrics(principal=principal, db=db)
+    tel = get_telemetry_collector().snapshot_all()
+    return {
+        "merchant_id": principal.merchant_id,
+        "commerce_session_id": principal.commerce_session_id,
+        "world_epoch": principal.world_epoch,
+        "measured_from_real_requests": True,
+        "windows": tel["windows"],
+        "queue_metrics": metrics,
+    }

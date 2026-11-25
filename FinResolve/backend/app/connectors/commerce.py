@@ -258,6 +258,14 @@ class CommerceReadConnector:
         raw, observed_at = self._request_json("/api/v1/service/metrics")
         return CommerceMetricsSnapshot.model_validate(raw), observed_at
 
+    def get_telemetry(self) -> tuple[dict[str, Any], datetime]:
+        raw, observed_at = self._request_json("/api/v1/service/telemetry")
+        if not isinstance(raw, dict):
+            raise CommerceConnectorError(
+                "Invalid /service/telemetry response type", retryable=False
+            )
+        return raw, observed_at
+
     def list_orders(
         self,
         *,

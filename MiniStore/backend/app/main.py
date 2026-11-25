@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -19,6 +20,7 @@ from app.api.service_write import router as service_write_router
 from app.api.storefront import router as storefront_router
 from app.core.config import get_settings
 from app.core.errors import CommerceError
+from app.core.telemetry import get_telemetry_collector
 from app.db.session import get_engine, get_sessionmaker
 from app.services.seed import seed_commerce_data
 
@@ -66,6 +68,18 @@ def create_app() -> FastAPI:
                 },
             )
         return await call_next(request)
+
+    @app.middleware("http")
+    async def _measure_operational_telemetry(request: Request, call_next: Any) -> Any:
+        t0 = time.perf_counter()
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        get_telemetry_collector().record_http_request(
+            path=request.url.path,
+            status_code=response.status_code,
+            duration_ms=elapsed_ms,
+        )
+        return response
 
     @app.exception_handler(CommerceError)
     async def _handle_commerce_error(_request: Request, exc: CommerceError) -> JSONResponse:
