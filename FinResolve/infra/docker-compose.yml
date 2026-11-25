@@ -13,7 +13,7 @@ services:
       # Local-only sample password. Override via infra/.env for anything shared.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-local-only}
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
     volumes:
       - finresolve_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -39,11 +39,17 @@ services:
       MODEL_TIMEOUT_SECONDS: ${MODEL_TIMEOUT_SECONDS:-20}
       MODEL_BUDGET_TOKENS: ${MODEL_BUDGET_TOKENS:-20000}
       ENABLE_EMBEDDED_SUPERVISOR_WORKER: "false"
+      AUTONOMOUS_RECOVERY_ENABLED: "false"
+      COMMERCE_SERVICE_BASE_URL: ${COMMERCE_SERVICE_BASE_URL:-http://commerce-api:8100}
+      COMMERCE_SERVICE_KEY: ${COMMERCE_SERVICE_API_KEY:?COMMERCE_SERVICE_API_KEY must be set to a strong >=32-char secret}
+      COMMERCE_MERCHANT_ID: ${COMMERCE_MERCHANT_ID:-MERCHANT_FINSHOP_01}
+      COMMERCE_SESSION_ID: ${COMMERCE_SESSION_ID:-CSESS_FINSHOP_DEFAULT_01}
+      COMMERCE_WORLD_EPOCH: ${COMMERCE_WORLD_EPOCH:-1}
       WORKER_HEARTBEAT_TTL_SECONDS: ${WORKER_HEARTBEAT_TTL_SECONDS:-25}
       SUPERVISOR_JOB_LEASE_SECONDS: ${SUPERVISOR_JOB_LEASE_SECONDS:-30}
       SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS: ${SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS:-5}
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -76,11 +82,21 @@ services:
       MODEL_TIMEOUT_SECONDS: ${MODEL_TIMEOUT_SECONDS:-20}
       MODEL_BUDGET_TOKENS: ${MODEL_BUDGET_TOKENS:-20000}
       ENABLE_EMBEDDED_SUPERVISOR_WORKER: "false"
+      AUTONOMOUS_RECOVERY_ENABLED: "true"
+      COMMERCE_SERVICE_BASE_URL: ${COMMERCE_SERVICE_BASE_URL:-http://commerce-api:8100}
+      COMMERCE_SERVICE_KEY: ${COMMERCE_SERVICE_API_KEY:?COMMERCE_SERVICE_API_KEY must be set to a strong >=32-char secret}
+      COMMERCE_WRITE_KEY: ${COMMERCE_WRITE_KEY:?COMMERCE_WRITE_KEY must be set to a strong >=32-char secret}
+      COMMAND_AUTH_SIGNING_SECRET: ${COMMAND_AUTH_SIGNING_SECRET:?COMMAND_AUTH_SIGNING_SECRET must be set to a strong >=32-char secret}
+      COMMERCE_MERCHANT_ID: ${COMMERCE_MERCHANT_ID:-MERCHANT_FINSHOP_01}
+      COMMERCE_SESSION_ID: ${COMMERCE_SESSION_ID:-CSESS_FINSHOP_DEFAULT_01}
+      COMMERCE_WORLD_EPOCH: ${COMMERCE_WORLD_EPOCH:-1}
       WORKER_HEARTBEAT_TTL_SECONDS: ${WORKER_HEARTBEAT_TTL_SECONDS:-25}
       SUPERVISOR_JOB_LEASE_SECONDS: ${SUPERVISOR_JOB_LEASE_SECONDS:-30}
       SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS: ${SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS:-5}
     depends_on:
       api:
+        condition: service_healthy
+      commerce-api:
         condition: service_healthy
     healthcheck:
       test:
@@ -106,11 +122,11 @@ services:
       SOURCE_MODE: MOCK
       DEMO_APPROVAL_SECRET: ${DEMO_APPROVAL_SECRET:?DEMO_APPROVAL_SECRET must be set to a strong random >=32-char secret via environment or infra/.env}
       ENABLE_EMBEDDED_SUPERVISOR_WORKER: "false"
+      AUTONOMOUS_RECOVERY_ENABLED: "false"
       CONTINUOUS_MONITOR_ENABLED: ${CONTINUOUS_MONITOR_ENABLED:-true}
       COMMERCE_SERVICE_BASE_URL: ${COMMERCE_SERVICE_BASE_URL:-http://commerce-api:8100}
-      COMMERCE_SERVICE_KEY: ${COMMERCE_SERVICE_KEY:-}
+      COMMERCE_SERVICE_KEY: ${COMMERCE_SERVICE_API_KEY:?COMMERCE_SERVICE_API_KEY must be set to a strong >=32-char secret}
       COMMERCE_WRITE_KEY: ${COMMERCE_WRITE_KEY:?COMMERCE_WRITE_KEY must be set to a strong >=32-char secret}
-      COMMAND_AUTH_SIGNING_SECRET: ${COMMAND_AUTH_SIGNING_SECRET:?COMMAND_AUTH_SIGNING_SECRET must be set to a strong >=32-char secret}
       COMMERCE_MERCHANT_ID: ${COMMERCE_MERCHANT_ID:-MERCHANT_FINSHOP_01}
       COMMERCE_SESSION_ID: ${COMMERCE_SESSION_ID:-CSESS_FINSHOP_DEFAULT_01}
       COMMERCE_WORLD_EPOCH: ${COMMERCE_WORLD_EPOCH:-1}
@@ -120,6 +136,8 @@ services:
       MONITOR_LEASE_SECONDS: ${MONITOR_LEASE_SECONDS:-30}
     depends_on:
       api:
+        condition: service_healthy
+      commerce-api:
         condition: service_healthy
 
   web:
@@ -151,7 +169,7 @@ services:
       POSTGRES_USER: ${COMMERCE_POSTGRES_USER:-finshop}
       POSTGRES_PASSWORD: ${COMMERCE_POSTGRES_PASSWORD:-change-me-commerce-local}
     ports:
-      - "${COMMERCE_POSTGRES_PORT:-5434}:5432"
+      - "127.0.0.1:${COMMERCE_POSTGRES_PORT:-5434}:5432"
     volumes:
       - finshop_commerce_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -172,8 +190,10 @@ services:
       COMMERCE_SOURCE_MODE: MOCK
       COMMERCE_AUTH_SECRET: ${COMMERCE_AUTH_SECRET:?COMMERCE_AUTH_SECRET must be set to a strong random >=32-char secret}
       COMMERCE_SERVICE_API_KEY: ${COMMERCE_SERVICE_API_KEY:?COMMERCE_SERVICE_API_KEY must be set to a strong random >=32-char secret}
+      COMMERCE_RECOVERY_WRITE_ENABLED: "true"
       COMMERCE_SERVICE_WRITE_API_KEY: ${COMMERCE_WRITE_KEY:?COMMERCE_WRITE_KEY must be set to a strong >=32-char secret}
       COMMERCE_COMMAND_AUTH_SIGNING_SECRET: ${COMMAND_AUTH_SIGNING_SECRET:?COMMAND_AUTH_SIGNING_SECRET must be set to a strong >=32-char secret}
+      COMMERCE_RECEIPT_STORAGE_DIR: /var/lib/finshop/private_receipts
       COMMERCE_MOCK_PROVIDER_SECRET: ${COMMERCE_MOCK_PROVIDER_SECRET:?COMMERCE_MOCK_PROVIDER_SECRET must be set to a strong random >=32-char secret}
       COMMERCE_TEST_MERCHANT_USERNAME: ${COMMERCE_TEST_MERCHANT_USERNAME:-merchant_owner}
       COMMERCE_TEST_MERCHANT_PASSWORD: ${COMMERCE_TEST_MERCHANT_PASSWORD:?COMMERCE_TEST_MERCHANT_PASSWORD must be set to a strong >=12-char password}
@@ -184,7 +204,9 @@ services:
       COMMERCE_VNPAY_IPN_PUBLIC_URL: ${COMMERCE_VNPAY_IPN_PUBLIC_URL:-}
       COMMERCE_VNPAY_REFUND_ENABLED: ${COMMERCE_VNPAY_REFUND_ENABLED:-false}
     ports:
-      - "${COMMERCE_API_PORT:-8100}:8100"
+      - "127.0.0.1:${COMMERCE_API_PORT:-8100}:8100"
+    volumes:
+      - finshop_private_receipts:/var/lib/finshop/private_receipts
     depends_on:
       commerce-db:
         condition: service_healthy
@@ -212,8 +234,7 @@ services:
       COMMERCE_SOURCE_MODE: MOCK
       COMMERCE_AUTH_SECRET: ${COMMERCE_AUTH_SECRET:?COMMERCE_AUTH_SECRET must be set to a strong random >=32-char secret}
       COMMERCE_SERVICE_API_KEY: ${COMMERCE_SERVICE_API_KEY:?COMMERCE_SERVICE_API_KEY must be set to a strong random >=32-char secret}
-      COMMERCE_SERVICE_WRITE_API_KEY: ${COMMERCE_WRITE_KEY:?COMMERCE_WRITE_KEY must be set to a strong >=32-char secret}
-      COMMERCE_COMMAND_AUTH_SIGNING_SECRET: ${COMMAND_AUTH_SIGNING_SECRET:?COMMAND_AUTH_SIGNING_SECRET must be set to a strong >=32-char secret}
+      COMMERCE_RECOVERY_WRITE_ENABLED: "false"
       COMMERCE_MOCK_PROVIDER_SECRET: ${COMMERCE_MOCK_PROVIDER_SECRET:?COMMERCE_MOCK_PROVIDER_SECRET must be set to a strong random >=32-char secret}
       COMMERCE_TEST_MERCHANT_USERNAME: ${COMMERCE_TEST_MERCHANT_USERNAME:-merchant_owner}
       COMMERCE_TEST_MERCHANT_PASSWORD: ${COMMERCE_TEST_MERCHANT_PASSWORD:?COMMERCE_TEST_MERCHANT_PASSWORD must be set to a strong >=12-char password}
@@ -249,3 +270,4 @@ services:
 volumes:
   finresolve_pgdata:
   finshop_commerce_pgdata:
+  finshop_private_receipts:
