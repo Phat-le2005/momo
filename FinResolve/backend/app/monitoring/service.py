@@ -1075,6 +1075,66 @@ def evaluate_recovery_postconditions(
                 evidence,
             )
 
+        if code in ("OPEN_STAT", "OPEN_MV"):
+            telem_payload, _ = connector.get_telemetry()
+            metrics, _ = connector.get_metrics()
+            w60 = (telem_payload.get("windows") or {}).get("60s") or {}
+            lat_p95 = float((w60.get("latency_ms") or {}).get("p95") or 0.0)
+            err_rate = float(w60.get("error_rate") or 0.0)
+            outbox_lag = float(metrics.outbox_lag_count)
+            evidence["current_p95_latency_ms"] = lat_p95
+            evidence["current_error_rate"] = err_rate
+            evidence["current_outbox_lag"] = outbox_lag
+
+            # Compare against baseline recorded during detection (never mark recovered merely
+            # because deterministic D01..D08 detectors do not fire!)
+            prior_verif = dict(obs.verification_json or {})
+            healthy_streak = int(prior_verif.get("consecutive_healthy_windows") or 0)
+            # Determine baseline upper bounds from persisted evidence_refs
+            lat_limit = 250.0
+            err_limit = 0.05
+            lag_limit = 5.0
+            for ref in obs.evidence_refs_json or []:
+                for m in ref.get("metrics") or []:
+                    mname = str(m.get("metric") or "")
+                    bmed = float(m.get("baseline_median") or 0.0)
+                    if mname == "p95_latency_ms" and bmed > 0:
+                        lat_limit = max(bmed * 2.0, bmed + 50.0)
+                    elif mname == "error_rate":
+                        err_limit = max(bmed + 0.05, 0.05)
+                    elif mname == "outbox_lag":
+                        lag_limit = max(bmed + 3.0, 5.0)
+
+            is_healthy_now = (
+                lat_p95 <= lat_limit and err_rate <= err_limit and outbox_lag <= lag_limit
+            )
+            if is_healthy_now:
+                healthy_streak += 1
+                evidence["consecutive_healthy_windows"] = healthy_streak
+                if healthy_streak >= 2:
+                    return VerificationResult(
+                        RecoveryVerdict.VERIFIED_RECOVERY,
+                        True,
+                        "OBSERVED_BASELINE_RETURN",
+                        f"{code} verified sustained recovery across {healthy_streak} fresh windows",
+                        evidence,
+                    )
+                return VerificationResult(
+                    RecoveryVerdict.STILL_INCONSISTENT,
+                    False,
+                    "UNKNOWN",
+                    f"{code} healthy window ({healthy_streak}/2); awaiting sustained recovery",
+                    evidence,
+                )
+            evidence["consecutive_healthy_windows"] = 0
+            return VerificationResult(
+                RecoveryVerdict.STILL_INCONSISTENT,
+                False,
+                "UNKNOWN",
+                f"{code} still anomalous (p95={lat_p95}ms, err_rate={err_rate}, lag={outbox_lag})",
+                evidence,
+            )
+
         return VerificationResult(
             RecoveryVerdict.INSUFFICIENT_EVIDENCE,
             False,
@@ -1346,9 +1406,103 @@ def run_binding_scan(
             unsynced_backlog_threshold=settings.monitor_unsynced_backlog_threshold,
             include_missing_events=False,
         )
-        summary.anomalies_detected = len(candidates) + len(d06_candidates)
 
-        for cand in candidates:
+        # Step 6b (Prompt 14.1 Part B): Real telemetry + Open-World Hybrid Detection (Layer 2 & 3)
+        open_world_candidates: list[DetectedAnomaly] = []
+        try:
+            from app.models.open_world import BusinessObservation
+            from app.observability.open_world_detector import (
+                TelemetrySignalVector,
+                run_open_world_hybrid_detection,
+            )
+
+            telem_data, telem_obs_at = conn.get_telemetry()
+            w60 = (telem_data.get("windows") or {}).get("60s") or {}
+            w10 = (telem_data.get("windows") or {}).get("10s") or {}
+            active_win = w10 if int(w10.get("request_count") or 0) > 0 else w60
+            has_samples = bool(
+                active_win.get("has_samples", int(active_win.get("request_count") or 0) > 0)
+            )
+            sig_vec = TelemetrySignalVector(
+                rps=float(active_win.get("rps") or 0.0),
+                p95_latency_ms=float((active_win.get("latency_ms") or {}).get("p95") or 0.0),
+                error_rate=float(active_win.get("error_rate") or 0.0),
+                outbox_lag=float(metrics.outbox_lag_count),
+                unsynced_payments=float(metrics.unsynced_payments),
+                order_throughput=float(len(orders)),
+                refund_count=float(len(refunds)),
+            )
+            db.add(
+                BusinessObservation(
+                    id=f"OBS-{uuid.uuid4().hex[:10].upper()}",
+                    session_id=binding.session_id,
+                    world_epoch=binding.world_epoch,
+                    merchant_id=binding.merchant_id,
+                    commerce_session_id=binding.commerce_session_id,
+                    source_system="MINI_STORE_TELEMETRY",
+                    category="OPERATIONAL",
+                    observation_type="TELEMETRY_WINDOW_SNAPSHOT",
+                    evidence_kind="OBSERVED_FACT",
+                    entity_refs_json={"binding_id": binding.id},
+                    attributes_json={
+                        "has_samples": has_samples,
+                        "truncated": bool(active_win.get("truncated", False)),
+                        "last_sample_age_ms": active_win.get("last_sample_age_ms"),
+                        "rps": sig_vec.rps,
+                        "p95_latency_ms": sig_vec.p95_latency_ms,
+                        "error_rate": sig_vec.error_rate,
+                        "outbox_lag": sig_vec.outbox_lag,
+                        "unsynced_payments": sig_vec.unsynced_payments,
+                        "order_throughput": sig_vec.order_throughput,
+                        "refund_count": sig_vec.refund_count,
+                    },
+                    provenance_json={
+                        "endpoint": "/api/v1/service/telemetry",
+                        "measured_from_real_requests": bool(
+                            telem_data.get("measured_from_real_requests", True)
+                        ),
+                    },
+                    verification_status="VERIFIED",
+                    freshness_ms=int(active_win.get("last_sample_age_ms") or 0),
+                    observed_at=telem_obs_at,
+                )
+            )
+            open_world_candidates, baseline_evals = run_open_world_hybrid_detection(
+                db,
+                session_id=binding.session_id,
+                merchant_id=binding.merchant_id,
+                service_name="ministore-commerce",
+                signals=sig_vec,
+                regime="NORMAL",
+            )
+            coverage["open_world"] = {
+                "telemetry_available": True,
+                "has_samples": has_samples,
+                "signals": {
+                    "rps": sig_vec.rps,
+                    "p95_latency_ms": sig_vec.p95_latency_ms,
+                    "error_rate": sig_vec.error_rate,
+                    "outbox_lag": sig_vec.outbox_lag,
+                    "unsynced_payments": sig_vec.unsynced_payments,
+                },
+                "baselines": {
+                    k: {
+                        "warm_up_complete": v.warm_up_complete,
+                        "median": v.baseline_median,
+                        "robust_z": v.robust_z_score,
+                        "is_anomalous": v.is_anomalous,
+                    }
+                    for k, v in baseline_evals.items()
+                },
+                "unknown_anomalies_detected": len(open_world_candidates),
+            }
+        except CommerceConnectorError:
+            coverage["open_world"] = {"telemetry_available": False}
+
+        all_candidates = [*candidates, *open_world_candidates]
+        summary.anomalies_detected = len(all_candidates) + len(d06_candidates)
+
+        for cand in all_candidates:
             _, created_case = record_or_update_anomaly(
                 db,
                 binding=binding,

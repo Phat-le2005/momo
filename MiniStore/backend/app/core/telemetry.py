@@ -59,6 +59,13 @@ class OperationalTelemetryCollector:
         self._samples: deque[_RequestSample] = deque(maxlen=MAX_SAMPLES)
 
     def record_http_request(self, *, path: str, status_code: int, duration_ms: float) -> None:
+        # Exclude monitoring/health-check traffic from business operational telemetry
+        if (
+            path in ("/health", "/api/v1/health", "/metrics")
+            or path.startswith("/api/v1/service/")
+            or path.startswith("/api/v1/chaos/")
+        ):
+            return
         sample = _RequestSample(
             ts=time.monotonic(),
             route_group=_normalize_route_group(path),
@@ -69,14 +76,19 @@ class OperationalTelemetryCollector:
             self._samples.append(sample)
 
     def snapshot_window(self, window_seconds: int) -> dict[str, Any]:
-        cutoff = time.monotonic() - float(window_seconds)
+        now_mono = time.monotonic()
+        cutoff = now_mono - float(window_seconds)
         with self._lock:
+            total_buffered = len(self._samples)
             rows = [s for s in self._samples if s.ts >= cutoff]
 
         total = len(rows)
         if total == 0:
             return {
                 "window_seconds": window_seconds,
+                "has_samples": False,
+                "truncated": total_buffered >= MAX_SAMPLES,
+                "last_sample_age_ms": None,
                 "request_count": 0,
                 "rps": 0.0,
                 "error_count": 0,
@@ -88,6 +100,7 @@ class OperationalTelemetryCollector:
 
         durations = sorted(s.duration_ms for s in rows)
         errors = sum(1 for s in rows if s.status_code >= 500 or s.status_code == 429)
+        last_age_ms = round(max(0.0, (now_mono - rows[-1].ts) * 1000.0), 1)
         status_dist: dict[str, int] = {}
         route_counts: dict[str, int] = {}
         for s in rows:
@@ -97,6 +110,9 @@ class OperationalTelemetryCollector:
 
         return {
             "window_seconds": window_seconds,
+            "has_samples": True,
+            "truncated": total_buffered >= MAX_SAMPLES,
+            "last_sample_age_ms": last_age_ms,
             "request_count": total,
             "rps": round(total / max(1.0, float(window_seconds)), 3),
             "error_count": errors,
