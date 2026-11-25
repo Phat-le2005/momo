@@ -7,9 +7,10 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import get_settings
@@ -367,11 +368,14 @@ def reconcile_pending_vnpay_payments(
     *,
     limit: int = 10,
     http_client: object | None = None,
+    worker_id: str = "querydr-worker",
+    lease_seconds: int = 30,
 ) -> int:
-    """Bounded background QueryDr reconciliation for pending/unknown VNPAY_SANDBOX payments.
+    """Bounded background QueryDr reconciliation with 3-phase durable lease claiming.
 
-    Skips silently when VNPAY is not configured; never queries terminal payments; enforces
-    `vnpay_querydr_max_attempts` and exponential backoff between attempts.
+    P2.1: Multi-worker safe via `FOR UPDATE SKIP LOCKED` + durable claim token/lease.
+    P2.2: Exhausted & backoff-ineligible payments are filtered in SQL BEFORE `.limit(limit)`
+          so they can never starve newer eligible payments.
     """
     settings = get_settings()
     if not settings.is_vnpay_configured:
@@ -380,27 +384,48 @@ def reconcile_pending_vnpay_payments(
     now = datetime.now(UTC)
     cutoff = now - timedelta(seconds=settings.vnpay_querydr_min_age_seconds)
     max_attempts = settings.vnpay_querydr_max_attempts
+    lease_until = now + timedelta(seconds=max(5, lease_seconds))
 
-    candidates = list(
-        db.scalars(
-            select(Payment)
-            .where(
-                Payment.provider == PaymentProvider.VNPAY_SANDBOX.value,
-                Payment.status.in_(
-                    [
-                        PaymentStatus.INITIATED.value,
-                        PaymentStatus.PENDING.value,
-                        PaymentStatus.UNKNOWN.value,
-                    ]
-                ),
-                Payment.created_at <= cutoff,
-            )
-            .order_by(Payment.created_at.asc())
-            .limit(limit)
-        ).all()
+    # Phase 1 (short transaction): claim eligible payments with FOR UPDATE SKIP LOCKED
+    claim_stmt = (
+        select(Payment)
+        .where(
+            Payment.provider == PaymentProvider.VNPAY_SANDBOX.value,
+            Payment.status.in_(
+                [
+                    PaymentStatus.INITIATED.value,
+                    PaymentStatus.PENDING.value,
+                    PaymentStatus.UNKNOWN.value,
+                ]
+            ),
+            Payment.created_at <= cutoff,
+            Payment.querydr_exhausted.is_(False),
+            or_(
+                Payment.querydr_next_attempt_at.is_(None),
+                Payment.querydr_next_attempt_at <= now,
+            ),
+            or_(
+                Payment.querydr_locked_until.is_(None),
+                Payment.querydr_locked_until <= now,
+            ),
+        )
+        .order_by(Payment.querydr_next_attempt_at.asc().nullsfirst(), Payment.created_at.asc())
+        .with_for_update(skip_locked=True)
+        .limit(limit)
     )
-    if not candidates:
+    claimed_rows = list(db.scalars(claim_stmt).all())
+    if not claimed_rows:
         return 0
+
+    claimed_pairs: list[tuple[str, str]] = []
+    for pay in claimed_rows:
+        token = f"QCLAIM-{uuid.uuid4().hex[:12].upper()}"
+        pay.querydr_claim_token = token
+        pay.querydr_claimed_by = worker_id
+        pay.querydr_locked_until = lease_until
+        pay.updated_at = now
+        claimed_pairs.append((pay.id, token))
+    db.commit()
 
     from app.payments.vnpay.adapter import VNPaySandboxAdapter
     from app.payments.vnpay.client import VNPayHttpClient
@@ -409,30 +434,78 @@ def reconcile_pending_vnpay_payments(
     adapter = VNPaySandboxAdapter(http_client=client_obj)
     queried = 0
 
-    for pay in candidates:
+    # Phase 2 & 3: QueryDr outside DB locks, then release lease & update schedule under fence
+    for pay_id, token in claimed_pairs:
+        try:
+            adapter.query_payment_status(db, payment_id=pay_id)
+            queried += 1
+        except Exception:  # noqa: BLE001
+            db.rollback()
+
+        now2 = datetime.now(UTC)
+        pay_ref = db.get(Payment, pay_id)
+        if pay_ref is None:
+            continue
+        order_row = db.scalar(select(Order).where(Order.id == pay_ref.order_id).with_for_update())
+        locked_pay = db.scalar(select(Payment).where(Payment.id == pay_id).with_for_update())
+        if locked_pay is None:
+            db.commit()
+            continue
+
+        # Fencing check: only the current claim holder may update schedule / release lease
+        if locked_pay.querydr_claim_token != token:
+            db.commit()
+            continue
+
         attempt_count = int(
             db.scalar(
                 select(func.count(PaymentQueryAttempt.id)).where(
-                    PaymentQueryAttempt.payment_id == pay.id
+                    PaymentQueryAttempt.payment_id == locked_pay.id
                 )
             )
             or 0
         )
-        if attempt_count >= max_attempts:
-            continue
 
-        last_attempt = db.scalar(
-            select(PaymentQueryAttempt)
-            .where(PaymentQueryAttempt.payment_id == pay.id)
-            .order_by(PaymentQueryAttempt.created_at.desc())
-            .limit(1)
+        locked_pay.querydr_claim_token = None
+        locked_pay.querydr_claimed_by = None
+        locked_pay.querydr_locked_until = None
+        locked_pay.updated_at = now2
+
+        is_still_pending = locked_pay.status in (
+            PaymentStatus.INITIATED.value,
+            PaymentStatus.PENDING.value,
+            PaymentStatus.UNKNOWN.value,
         )
-        if last_attempt is not None:
-            min_backoff_s = min(300, 15 * (2 ** min(attempt_count, 4)))
-            if (now - last_attempt.created_at).total_seconds() < min_backoff_s:
-                continue
+        if is_still_pending and attempt_count >= max_attempts:
+            reason = (
+                f"VNPAY QueryDr exhausted after {attempt_count} attempt(s) with payment still "
+                f"in status '{locked_pay.status}'; manual reconciliation required."
+            )
+            locked_pay.querydr_exhausted = True
+            locked_pay.querydr_next_attempt_at = None
+            locked_pay.reconciliation_required = True
+            locked_pay.reconciliation_note = reason
+            if order_row is not None:
+                order_row.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
+                order_row.reconciliation_reason = reason
+                order_row.updated_at = now2
+            record_commerce_event(
+                db,
+                merchant_id=locked_pay.merchant_id,
+                commerce_session_id=locked_pay.commerce_session_id,
+                world_epoch=order_row.world_epoch if order_row else 1,
+                event_type="PAYMENT_RECONCILIATION_REQUIRED",
+                order_id=locked_pay.order_id,
+                payment_id=locked_pay.id,
+                correlation_id=locked_pay.correlation_id,
+                payload={"reason": reason, "attempt_count": attempt_count},
+            )
+        elif is_still_pending:
+            backoff_s = min(300, 15 * (2 ** min(attempt_count, 4)))
+            locked_pay.querydr_next_attempt_at = now2 + timedelta(seconds=backoff_s)
+        else:
+            locked_pay.querydr_next_attempt_at = None
 
-        adapter.query_payment_status(db, payment_id=pay.id)
-        queried += 1
+        db.commit()
 
     return queried

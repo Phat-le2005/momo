@@ -201,6 +201,8 @@ class VNPaySandboxAdapter:
             provider_ref=txn_ref,
             provider_txn_no=None,
             provider_txn_date=create_date,
+            provider_create_date=create_date,
+            provider_pay_date=None,
             observation_source="INTERNAL_LEDGER",
             signature_verified=False,
             last_observed_at=now,
@@ -323,7 +325,7 @@ class VNPaySandboxAdapter:
         response_code = params.get("vnp_ResponseCode", "").strip()
         txn_status = params.get("vnp_TransactionStatus", "").strip()
         txn_no = params.get("vnp_TransactionNo", "").strip() or None
-        pay_date = params.get("vnp_PayDate", "").strip() or payment.provider_txn_date
+        pay_date = params.get("vnp_PayDate", "").strip() or None
         mapping = map_vnpay_ipn_status(response_code=response_code, transaction_status=txn_status)
 
         # Deterministic notification identity bound to provider txn & status
@@ -336,12 +338,6 @@ class VNPaySandboxAdapter:
             PaymentStatus.PARTIALLY_REFUNDED.value,
             PaymentStatus.REFUNDED.value,
         ):
-            if mapping.payment_status == PaymentStatus.SUCCEEDED:
-                return {
-                    "RspCode": IPN_RSP_ALREADY_CONFIRMED[0],
-                    "Message": IPN_RSP_ALREADY_CONFIRMED[1],
-                }
-            # Out-of-order failure arriving after SUCCEEDED -> do NOT regress; return 02
             return {
                 "RspCode": IPN_RSP_ALREADY_CONFIRMED[0],
                 "Message": IPN_RSP_ALREADY_CONFIRMED[1],
@@ -361,7 +357,8 @@ class VNPaySandboxAdapter:
                 signature_verified=True,
                 provider_environment=prov_env,
                 provider_txn_no=txn_no,
-                provider_txn_date=pay_date,
+                provider_txn_date=payment.provider_create_date or payment.provider_txn_date,
+                provider_pay_date=pay_date,
                 provider_response_code=response_code,
                 provider_transaction_status=txn_status or None,
                 force_reconciliation=mapping.reconciliation_required,
@@ -408,8 +405,21 @@ class VNPaySandboxAdapter:
         now = datetime.now(UTC)
         req_id = f"QDR{now.strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
         create_date = format_vnpay_timestamp(now)
-        txn_date = payment.provider_txn_date or format_vnpay_timestamp(payment.created_at)
-        order_info = f"Truy van giao dich {payment.provider_ref}"
+        # P1.4: Always use immutable original creation timestamp for VNPAY QueryDr
+        txn_date = (
+            payment.provider_create_date
+            or payment.provider_txn_date
+            or format_vnpay_timestamp(payment.created_at)
+        )
+        # Snapshot immutable payment attributes before releasing DB context for external HTTP
+        snap_payment_id = payment.id
+        snap_order_id = payment.order_id
+        snap_merchant_id = payment.merchant_id
+        snap_session_id = payment.commerce_session_id
+        snap_provider_ref = payment.provider_ref
+        snap_amount_vnd = payment.amount_vnd
+        snap_correlation_id = payment.correlation_id
+        order_info = f"Truy van giao dich {snap_provider_ref}"
         safe_ip = (client_ip or "127.0.0.1").split(",")[0].strip()[:45] or "127.0.0.1"
 
         req_payload: dict[str, Any] = {
@@ -417,7 +427,7 @@ class VNPaySandboxAdapter:
             "vnp_Version": version,
             "vnp_Command": "querydr",
             "vnp_TmnCode": tmn_code,
-            "vnp_TxnRef": payment.provider_ref,
+            "vnp_TxnRef": snap_provider_ref,
             "vnp_OrderInfo": order_info,
             "vnp_TransactionDate": txn_date,
             "vnp_CreateDate": create_date,
@@ -432,6 +442,7 @@ class VNPaySandboxAdapter:
         sig_ok = False
         mapped_status_str: str | None = None
 
+        # External HTTP call executes outside DB row locks
         try:
             http_status, resp_data = self._get_client().post_transaction(req_payload)
         except httpx.TimeoutException as exc:
@@ -450,9 +461,9 @@ class VNPaySandboxAdapter:
         # Always persist durable PaymentQueryAttempt history!
         attempt = PaymentQueryAttempt(
             id=f"QATT-{uuid.uuid4().hex[:10].upper()}",
-            payment_id=payment.id,
-            order_id=payment.order_id,
-            merchant_id=payment.merchant_id,
+            payment_id=snap_payment_id,
+            order_id=snap_order_id,
+            merchant_id=snap_merchant_id,
             provider=self.provider_name,
             request_id=req_id,
             command="querydr",
@@ -469,25 +480,34 @@ class VNPaySandboxAdapter:
         db.add(attempt)
         db.flush()
 
+        # P1.1: Re-read & lock Order -> Payment atomically after external HTTP call
+        ord_row = db.scalar(select(Order).where(Order.id == snap_order_id).with_for_update())
+        locked_pay = db.scalar(
+            select(Payment).where(Payment.id == snap_payment_id).with_for_update()
+        )
+        if locked_pay is None:
+            db.commit()
+            raise CommerceError(ErrorCode.NOT_FOUND, "Payment not found", status_code=404)
+        payment = locked_pay
+
         # Network timeout / error -> DO NOT convert into payment failure; mark UNKNOWN if needed
         if err_msg is not None or not sig_ok:
             if payment.status in (PaymentStatus.INITIATED.value, PaymentStatus.PENDING.value):
                 payment.status = PaymentStatus.UNKNOWN.value
                 payment.last_observed_at = now
                 payment.updated_at = now
-                ord_row = db.get(Order, payment.order_id)
                 if ord_row is not None:
                     ord_row.payment_status = PaymentStatus.UNKNOWN.value
                     ord_row.updated_at = now
                 record_commerce_event(
                     db,
-                    merchant_id=payment.merchant_id,
-                    commerce_session_id=payment.commerce_session_id,
+                    merchant_id=snap_merchant_id,
+                    commerce_session_id=snap_session_id,
                     world_epoch=ord_row.world_epoch if ord_row else 1,
                     event_type="PAYMENT_STATUS_UNKNOWN",
-                    order_id=payment.order_id,
-                    payment_id=payment.id,
-                    correlation_id=payment.correlation_id,
+                    order_id=snap_order_id,
+                    payment_id=snap_payment_id,
+                    correlation_id=snap_correlation_id,
                     payload={"querydr_request_id": req_id, "error": err_msg},
                 )
             db.commit()
@@ -496,7 +516,7 @@ class VNPaySandboxAdapter:
         # Validate TmnCode, TxnRef, and Amount (when returned)
         if (
             str(resp_data.get("vnp_TmnCode", "")).strip() != tmn_code
-            or str(resp_data.get("vnp_TxnRef", "")).strip() != payment.provider_ref
+            or str(resp_data.get("vnp_TxnRef", "")).strip() != snap_provider_ref
         ):
             attempt.error_message = "VNPAY QueryDr response TmnCode/TxnRef mismatch"
             db.commit()
@@ -514,9 +534,9 @@ class VNPaySandboxAdapter:
                 attempt.error_message = f"Invalid QueryDr vnp_Amount: {resp_amount_raw}"
                 db.commit()
                 raise CommerceError(ErrorCode.CONFLICT, str(err), status_code=409) from err
-            if resp_amount_vnd != payment.amount_vnd:
+            if resp_amount_vnd != snap_amount_vnd:
                 attempt.error_message = (
-                    f"QueryDr amount mismatch: expected {payment.amount_vnd}, got {resp_amount_vnd}"
+                    f"QueryDr amount mismatch: expected {snap_amount_vnd}, got {resp_amount_vnd}"
                 )
                 db.commit()
                 raise CommerceError(
@@ -529,19 +549,75 @@ class VNPaySandboxAdapter:
             response_code=resp_code or "",
             transaction_status=txn_status,
         )
+
+        # P1.5: Strict QueryDr confirmation field validation for SUCCEEDED (00/00)
+        resp_id = str(resp_data.get("vnp_ResponseId", "") or "").strip()
+        resp_txn_no = str(resp_data.get("vnp_TransactionNo", "") or "").strip()
+        resp_txn_type = str(resp_data.get("vnp_TransactionType", "") or "").strip()
+        if mapping.payment_status == PaymentStatus.SUCCEEDED:
+            missing_or_invalid: list[str] = []
+            if not resp_id:
+                missing_or_invalid.append("vnp_ResponseId missing")
+            if not resp_amount_raw:
+                missing_or_invalid.append("vnp_Amount missing")
+            if not resp_txn_no:
+                missing_or_invalid.append("vnp_TransactionNo missing")
+            if resp_txn_type and resp_txn_type != "01":
+                missing_or_invalid.append(
+                    f"vnp_TransactionType expected '01', got '{resp_txn_type}'"
+                )
+            elif not resp_txn_type:
+                missing_or_invalid.append("vnp_TransactionType missing")
+            if missing_or_invalid:
+                detail = (
+                    "QueryDr SUCCEEDED (00/00) rejected due to incomplete/invalid fields: "
+                    + "; ".join(missing_or_invalid)
+                )
+                attempt.error_message = detail
+                attempt.mapped_payment_status = PaymentStatus.UNKNOWN.value
+                if payment.status not in (
+                    PaymentStatus.SUCCEEDED.value,
+                    PaymentStatus.PARTIALLY_REFUNDED.value,
+                    PaymentStatus.REFUNDED.value,
+                ):
+                    payment.status = PaymentStatus.UNKNOWN.value
+                    payment.reconciliation_required = True
+                    payment.reconciliation_note = detail
+                    payment.last_observed_at = now
+                    payment.updated_at = now
+                    if ord_row is not None:
+                        ord_row.payment_status = PaymentStatus.UNKNOWN.value
+                        ord_row.reconciliation_status = (
+                            ReconciliationStatus.RECONCILIATION_REQUIRED.value
+                        )
+                        ord_row.reconciliation_reason = detail
+                        ord_row.updated_at = now
+                record_commerce_event(
+                    db,
+                    merchant_id=snap_merchant_id,
+                    commerce_session_id=snap_session_id,
+                    world_epoch=ord_row.world_epoch if ord_row else 1,
+                    event_type="PAYMENT_RECONCILIATION_REQUIRED",
+                    order_id=snap_order_id,
+                    payment_id=snap_payment_id,
+                    correlation_id=snap_correlation_id,
+                    payload={"querydr_request_id": req_id, "reason": detail},
+                )
+                db.commit()
+                return build_payment_observation(db, payment=payment)
+
         mapped_status_str = mapping.payment_status.value
         attempt.mapped_payment_status = mapped_status_str
 
-        ord_row = db.get(Order, payment.order_id)
         record_commerce_event(
             db,
-            merchant_id=payment.merchant_id,
-            commerce_session_id=payment.commerce_session_id,
+            merchant_id=snap_merchant_id,
+            commerce_session_id=snap_session_id,
             world_epoch=ord_row.world_epoch if ord_row else 1,
             event_type="PAYMENT_QUERY_COMPLETED",
-            order_id=payment.order_id,
-            payment_id=payment.id,
-            correlation_id=payment.correlation_id,
+            order_id=snap_order_id,
+            payment_id=snap_payment_id,
+            correlation_id=snap_correlation_id,
             payload={
                 "request_id": req_id,
                 "vnp_ResponseCode": resp_code,
@@ -551,45 +627,47 @@ class VNPaySandboxAdapter:
                 "provenance": prov_env,
             },
         )
-        db.commit()
 
-        # Apply authoritative observation if not already in a conflicting terminal state
-        if (
-            payment.status
-            in (
-                PaymentStatus.SUCCEEDED.value,
-                PaymentStatus.PARTIALLY_REFUNDED.value,
-                PaymentStatus.REFUNDED.value,
-            )
-            and mapping.payment_status != PaymentStatus.SUCCEEDED
+        # P1.1: Preserve already-confirmed or refunded terminal states under lock
+        if payment.status in (
+            PaymentStatus.SUCCEEDED.value,
+            PaymentStatus.PARTIALLY_REFUNDED.value,
+            PaymentStatus.REFUNDED.value,
         ):
-            # Conflicting provider observation on succeeded payment -> flag reconciliation!
-            payment.reconciliation_required = True
-            payment.reconciliation_note = (
-                f"Conflicting QueryDr observation ({mapped_status_str}) on payment in status "
-                f"{payment.status}"
-            )
-            if ord_row is not None:
-                ord_row.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
-                ord_row.reconciliation_reason = payment.reconciliation_note
+            if mapping.payment_status != PaymentStatus.SUCCEEDED:
+                payment.reconciliation_required = True
+                payment.reconciliation_note = (
+                    f"Conflicting QueryDr observation ({mapped_status_str}) on payment in status "
+                    f"{payment.status}"
+                )
+                if ord_row is not None:
+                    ord_row.reconciliation_status = (
+                        ReconciliationStatus.RECONCILIATION_REQUIRED.value
+                    )
+                    ord_row.reconciliation_reason = payment.reconciliation_note
+            else:
+                payment.last_observed_at = now
+                payment.updated_at = now
             db.commit()
             return build_payment_observation(db, payment=payment)
+
+        db.commit()
 
         updated_pay, _ = apply_authoritative_payment_observation(
             db,
             expected_provider=self.provider_name,
-            provider_ref=payment.provider_ref,
+            provider_ref=snap_provider_ref,
             notification_id=None,
-            merchant_id=payment.merchant_id,
-            order_id=payment.order_id,
-            amount_vnd=payment.amount_vnd,
+            merchant_id=snap_merchant_id,
+            order_id=snap_order_id,
+            amount_vnd=snap_amount_vnd,
             target_status=mapping.payment_status,
             observation_source="VNPAY_QUERYDR",
             signature_verified=True,
             provider_environment=prov_env,
-            provider_txn_no=str(resp_data.get("vnp_TransactionNo", "") or "").strip() or None,
-            provider_txn_date=str(resp_data.get("vnp_PayDate", "") or "").strip()
-            or payment.provider_txn_date,
+            provider_txn_no=resp_txn_no or None,
+            provider_txn_date=payment.provider_create_date or payment.provider_txn_date,
+            provider_pay_date=str(resp_data.get("vnp_PayDate", "") or "").strip() or None,
             provider_response_code=resp_code,
             provider_transaction_status=txn_status,
             force_reconciliation=mapping.reconciliation_required,
@@ -663,10 +741,11 @@ class VNPaySandboxAdapter:
                 f"Cannot refund payment in status '{payment.status}'",
                 status_code=409,
             )
-        if not payment.provider_txn_date:
+        orig_txn_date = payment.provider_create_date or payment.provider_txn_date
+        if not orig_txn_date:
             raise CommerceError(
                 ErrorCode.CONFLICT,
-                "Missing original VNPAY provider_txn_date required for refund",
+                "Missing original VNPAY provider_create_date required for refund",
                 status_code=409,
             )
 
@@ -733,7 +812,7 @@ class VNPaySandboxAdapter:
             "vnp_Amount": vnd_to_vnp_amount(refund_request.requested_amount_vnd),
             "vnp_OrderInfo": order_info,
             "vnp_TransactionNo": payment.provider_txn_no or "0",
-            "vnp_TransactionDate": payment.provider_txn_date,
+            "vnp_TransactionDate": orig_txn_date,
             "vnp_CreateBy": operator_id[:64],
             "vnp_CreateDate": create_date,
             "vnp_IpAddr": safe_ip,
@@ -815,6 +894,67 @@ class VNPaySandboxAdapter:
                 payment_id=payment.id,
                 correlation_id=payment.correlation_id,
                 payload={"refund_txn_id": txn.id, "reason": "invalid_response_signature"},
+            )
+            db.commit()
+            db.refresh(txn)
+            return txn
+
+        # P1.2: Strictly validate Refund response identity, amount, transaction type & ResponseId
+        validation_errors: list[str] = []
+        resp_tmn = str(resp_data.get("vnp_TmnCode", "") or "").strip()
+        resp_txn_ref = str(resp_data.get("vnp_TxnRef", "") or "").strip()
+        resp_amt_raw = str(resp_data.get("vnp_Amount", "") or "").strip()
+        resp_txn_type = str(resp_data.get("vnp_TransactionType", "") or "").strip()
+        resp_id = str(resp_data.get("vnp_ResponseId", "") or "").strip()
+
+        if resp_tmn != tmn_code:
+            validation_errors.append(f"vnp_TmnCode mismatch ({resp_tmn!r})")
+        if resp_txn_ref != payment.provider_ref:
+            validation_errors.append(f"vnp_TxnRef mismatch ({resp_txn_ref!r})")
+        if not resp_id:
+            validation_errors.append("vnp_ResponseId missing")
+        if resp_txn_type != txn_type:
+            validation_errors.append(
+                f"vnp_TransactionType mismatch (expected {txn_type!r}, got {resp_txn_type!r})"
+            )
+        if not resp_amt_raw:
+            validation_errors.append("vnp_Amount missing")
+        else:
+            try:
+                resp_amt_vnd = vnp_amount_to_vnd(resp_amt_raw)
+                if resp_amt_vnd != refund_request.requested_amount_vnd:
+                    validation_errors.append(
+                        f"vnp_Amount mismatch (expected {refund_request.requested_amount_vnd}, "
+                        f"got {resp_amt_vnd})"
+                    )
+            except ValueError:
+                validation_errors.append(f"vnp_Amount invalid ({resp_amt_raw!r})")
+
+        if validation_errors:
+            detail = (
+                "VNPAY Refund response field validation failed (marked UNKNOWN, balance reserved): "
+                + "; ".join(validation_errors)
+            )
+            txn.status = RefundTransactionStatus.UNKNOWN.value
+            txn.provider_payload_json = {
+                **(txn.provider_payload_json or {}),
+                "validation_errors": validation_errors,
+            }
+            payment.reconciliation_required = True
+            payment.reconciliation_note = detail
+            if order is not None:
+                order.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
+                order.reconciliation_reason = detail
+            record_commerce_event(
+                db,
+                merchant_id=payment.merchant_id,
+                commerce_session_id=payment.commerce_session_id,
+                world_epoch=world_epoch,
+                event_type="REFUND_STATUS_UNKNOWN",
+                order_id=payment.order_id,
+                payment_id=payment.id,
+                correlation_id=payment.correlation_id,
+                payload={"refund_txn_id": txn.id, "validation_errors": validation_errors},
             )
             db.commit()
             db.refresh(txn)

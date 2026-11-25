@@ -42,12 +42,25 @@ def map_vnpay_ipn_status(
     response_code: str,
     transaction_status: str | None,
 ) -> VNPayStatusMapping:
-    """Map VNPAY IPN `(vnp_ResponseCode, vnp_TransactionStatus)` to internal `PaymentStatus`."""
+    """Map VNPAY IPN `(vnp_ResponseCode, vnp_TransactionStatus)` to internal `PaymentStatus`.
+
+    P1.3 Hard Invariant:
+    - Successful payment STRICTLY requires BOTH `vnp_ResponseCode == "00"` AND
+      `vnp_TransactionStatus == "00"`.
+    - Missing/empty `vnp_TransactionStatus` NEVER confirms an order; it maps to `UNKNOWN` with
+      `reconciliation_required=True`.
+    """
     rc = (response_code or "").strip()
     ts = (transaction_status or "").strip()
 
-    # Both ResponseCode == "00" AND TransactionStatus == "00" (when supplied) required for SUCCEEDED
-    if rc == "00" and (ts == "00" or ts == ""):
+    if not rc or not ts:
+        return VNPayStatusMapping(
+            PaymentStatus.UNKNOWN,
+            True,
+            f"Incomplete VNPAY IPN status (ResponseCode='{rc}', TransactionStatus='{ts}')",
+        )
+
+    if rc == "00" and ts == "00":
         return VNPayStatusMapping(PaymentStatus.SUCCEEDED, False, None)
     if ts == "01":
         return VNPayStatusMapping(PaymentStatus.PENDING, False, "VNPAY transaction incomplete (01)")
@@ -63,17 +76,17 @@ def map_vnpay_ipn_status(
             True,
             "VNPAY suspected fraud (07): manual review and reconciliation required",
         )
-    if rc == "24" or ts == "02" or rc in {"09", "10", "11", "12", "13", "51", "65", "75", "79"}:
-        return VNPayStatusMapping(
-            PaymentStatus.FAILED,
-            False,
-            f"VNPAY payment failed (ResponseCode={rc}, TransactionStatus={ts or 'N/A'})",
-        )
-    if rc == "00" and ts not in {"", "00"}:
+    if rc == "00" and ts != "00":
         return VNPayStatusMapping(
             PaymentStatus.UNKNOWN,
             True,
             f"Conflicting VNPAY codes: ResponseCode=00 but TransactionStatus={ts}",
+        )
+    if rc == "24" or ts == "02" or rc in {"09", "10", "11", "12", "13", "51", "65", "75", "79"}:
+        return VNPayStatusMapping(
+            PaymentStatus.FAILED,
+            False,
+            f"VNPAY payment failed (ResponseCode={rc}, TransactionStatus={ts})",
         )
     return VNPayStatusMapping(
         PaymentStatus.UNKNOWN,

@@ -554,6 +554,8 @@ class Payment(Base):
     provider_ref: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
     provider_txn_no: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
     provider_txn_date: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    provider_create_date: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    provider_pay_date: Mapped[str | None] = mapped_column(String(20), nullable=True)
     provider_response_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
     provider_transaction_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     observation_source: Mapped[str] = mapped_column(
@@ -562,6 +564,17 @@ class Payment(Base):
     signature_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_observed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    querydr_claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    querydr_claimed_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    querydr_locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    querydr_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True, nullable=True
+    )
+    querydr_exhausted: Mapped[bool] = mapped_column(
+        Boolean, default=False, index=True, nullable=False
     )
     redirect_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     correlation_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)

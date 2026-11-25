@@ -257,6 +257,7 @@ def apply_authoritative_payment_observation(
     provider_environment: str,
     provider_txn_no: str | None = None,
     provider_txn_date: str | None = None,
+    provider_pay_date: str | None = None,
     provider_response_code: str | None = None,
     provider_transaction_status: str | None = None,
     force_reconciliation: bool = False,
@@ -452,7 +453,10 @@ def apply_authoritative_payment_observation(
         payment.last_notification_id = clean_nid
     if provider_txn_no:
         payment.provider_txn_no = provider_txn_no
-    if provider_txn_date:
+    # P1.4: NEVER overwrite immutable provider_create_date with vnp_PayDate!
+    if provider_pay_date:
+        payment.provider_pay_date = provider_pay_date
+    if provider_txn_date and not payment.provider_txn_date:
         payment.provider_txn_date = provider_txn_date
     if provider_response_code is not None:
         payment.provider_response_code = provider_response_code
