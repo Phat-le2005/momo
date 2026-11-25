@@ -747,18 +747,29 @@ def _count_records_in_interval(
     *,
     now: datetime,
     window_seconds: int = 60,
+    allowed_statuses: frozenset[str] | None = None,
+    timestamp_fields: tuple[str, ...] = ("created_at", "occurred_at", "requested_at"),
 ) -> float:
-    """Count only records created within `[now - window_seconds, now]` (never cumulative totals!).
+    """Count only records matching optional status filter within `[now - window_seconds, now]`.
 
-    If a record carries no parseable timestamp, it is only counted when `created_at` is absent
-    on synthetic minimal payloads to preserve backward compatibility with lightweight unit mocks.
+    Distinguishes created vs completed records using authoritative timestamps rather than
+    cumulative table lengths.
     """
     cutoff = now - timedelta(seconds=window_seconds)
     count = 0
     for rec in records:
-        ts_raw = rec.get("created_at") or rec.get("occurred_at") or rec.get("requested_at")
+        if allowed_statuses is not None:
+            st = str(rec.get("status") or "").strip().upper()
+            if st not in allowed_statuses:
+                continue
+        ts_raw: Any = None
+        for tf in timestamp_fields:
+            if rec.get(tf) is not None:
+                ts_raw = rec.get(tf)
+                break
         if ts_raw is None:
-            count += 1
+            if allowed_statuses is None:
+                count += 1
             continue
         ts_dt: datetime | None = None
         if isinstance(ts_raw, datetime):
@@ -1123,13 +1134,19 @@ def evaluate_recovery_postconditions(
             telem_payload, _ = connector.get_telemetry()
             metrics, _ = connector.get_metrics()
             windows_map = telem_payload.get("windows") or {}
+            w_completed = windows_map.get("completed_fixed_60s") or {}
             w_fixed = windows_map.get("fixed_60s") or {}
             w_roll = windows_map.get("60s") or {}
-            # Prefer non-overlapping time-aligned fixed_60s window when available with samples
-            w_eval = w_fixed if (w_fixed and int(w_fixed.get("request_count") or 0) > 0) else w_roll
+            if w_completed and int(w_completed.get("request_count") or 0) > 0:
+                w_eval = w_completed
+            elif w_fixed:
+                w_eval = w_fixed
+            else:
+                w_eval = w_roll
             req_count = int(w_eval.get("request_count") or 0)
             has_samples = bool(w_eval.get("has_samples", req_count > 0))
             truncated = bool(w_eval.get("truncated", False))
+            is_complete = w_eval.get("is_complete")
             last_age_ms = w_eval.get("last_sample_age_ms")
             win_id = str(w_eval.get("window_id") or "").strip()
             win_start_dt = _parse_iso_utc(w_eval.get("window_start"))
@@ -1141,6 +1158,7 @@ def evaluate_recovery_postconditions(
             evidence["window_id"] = win_id
             evidence["window_start"] = win_start_dt.isoformat() if win_start_dt else None
             evidence["window_end"] = win_end_dt.isoformat() if win_end_dt else None
+            evidence["is_complete"] = is_complete
             evidence["has_samples"] = has_samples
             evidence["request_count"] = req_count
             evidence["truncated"] = truncated
@@ -1149,8 +1167,18 @@ def evaluate_recovery_postconditions(
             evidence["current_error_rate"] = err_rate
             evidence["current_outbox_lag"] = outbox_lag
 
-            # Missing window_id, zero traffic, truncated, or stale samples NEVER prove recovery!
+            if is_complete is False:
+                return VerificationResult(
+                    RecoveryVerdict.INSUFFICIENT_EVIDENCE,
+                    False,
+                    "UNKNOWN",
+                    f"{code} telemetry window '{win_id}' is incomplete; awaiting completed window",
+                    evidence,
+                )
+
+            # Invalid observation gaps reset streak so gaps never falsely preserve recovery!
             if not win_id:
+                evidence["consecutive_healthy_windows"] = 0
                 return VerificationResult(
                     RecoveryVerdict.INSUFFICIENT_EVIDENCE,
                     False,
@@ -1159,6 +1187,7 @@ def evaluate_recovery_postconditions(
                     evidence,
                 )
             if not has_samples or req_count <= 0:
+                evidence["consecutive_healthy_windows"] = 0
                 return VerificationResult(
                     RecoveryVerdict.INSUFFICIENT_EVIDENCE,
                     False,
@@ -1167,6 +1196,7 @@ def evaluate_recovery_postconditions(
                     evidence,
                 )
             if truncated:
+                evidence["consecutive_healthy_windows"] = 0
                 return VerificationResult(
                     RecoveryVerdict.INSUFFICIENT_EVIDENCE,
                     False,
@@ -1175,6 +1205,7 @@ def evaluate_recovery_postconditions(
                     evidence,
                 )
             if isinstance(last_age_ms, (int, float)) and float(last_age_ms) > 120_000.0:
+                evidence["consecutive_healthy_windows"] = 0
                 return VerificationResult(
                     RecoveryVerdict.INSUFFICIENT_EVIDENCE,
                     False,
@@ -1578,21 +1609,72 @@ def run_binding_scan(
             )
 
             telem_data, telem_obs_at = conn.get_telemetry()
-            w60 = (telem_data.get("windows") or {}).get("60s") or {}
-            w10 = (telem_data.get("windows") or {}).get("10s") or {}
-            active_win = w10 if int(w10.get("request_count") or 0) > 0 else w60
+            windows_all = telem_data.get("windows") or {}
+            w_comp_fixed = windows_all.get("completed_fixed_60s") or {}
+            w_fixed = windows_all.get("fixed_60s") or {}
+            w60 = windows_all.get("60s") or {}
+            w10 = windows_all.get("10s") or {}
+
+            # Prompt 14.4 Fix 4: Use completed non-overlapping window for baseline learning!
+            if w_comp_fixed:
+                eval_win = w_comp_fixed
+            elif w_fixed and w_fixed.get("is_complete") is True:
+                eval_win = w_fixed
+            else:
+                eval_win = w10 if int(w10.get("request_count") or 0) > 0 else w60
+
+            eval_win_id = str(eval_win.get("window_id") or "").strip()
+            eval_win_start = _parse_iso_utc(eval_win.get("window_start"))
+            eval_win_end = _parse_iso_utc(eval_win.get("window_end"))
+            eval_is_complete = eval_win.get("is_complete", True) is not False
             has_samples = bool(
-                active_win.get("has_samples", int(active_win.get("request_count") or 0) > 0)
+                eval_win.get("has_samples", int(eval_win.get("request_count") or 0) > 0)
+            )
+            is_truncated = bool(eval_win.get("truncated", False))
+            orders_completed_60s = _count_records_in_interval(
+                orders,
+                now=obs_at,
+                window_seconds=60,
+                allowed_statuses=frozenset({"CONFIRMED", "PROCESSING", "SHIPPED", "DELIVERED"}),
+                timestamp_fields=("updated_at", "created_at"),
+            )
+            refunds_completed_60s = _count_records_in_interval(
+                refunds,
+                now=obs_at,
+                window_seconds=60,
+                allowed_statuses=frozenset({"SUCCEEDED", "COMPLETED"}),
+                timestamp_fields=("completed_at", "updated_at", "created_at"),
             )
             sig_vec = TelemetrySignalVector(
-                rps=float(active_win.get("rps") or 0.0),
-                p95_latency_ms=float((active_win.get("latency_ms") or {}).get("p95") or 0.0),
-                error_rate=float(active_win.get("error_rate") or 0.0),
+                rps=float(eval_win.get("rps") or 0.0),
+                p95_latency_ms=float((eval_win.get("latency_ms") or {}).get("p95") or 0.0),
+                error_rate=float(eval_win.get("error_rate") or 0.0),
                 outbox_lag=float(metrics.outbox_lag_count),
                 unsynced_payments=float(metrics.unsynced_payments),
-                order_throughput=_count_records_in_interval(orders, now=obs_at, window_seconds=60),
-                refund_count=_count_records_in_interval(refunds, now=obs_at, window_seconds=60),
+                order_throughput=orders_completed_60s,
+                refund_count=refunds_completed_60s,
             )
+
+            # Deduplicate baseline learning across scans AND Monitor restarts!
+            already_learned = bool(
+                eval_win_id
+                and binding.last_learned_window_id
+                and eval_win_id == binding.last_learned_window_id
+            )
+            overlapping_learned = bool(
+                binding.last_learned_window_end is not None
+                and eval_win_start is not None
+                and eval_win_start < binding.last_learned_window_end
+            )
+            can_learn_baseline = (
+                bool(eval_win_id)
+                and eval_is_complete
+                and has_samples
+                and not is_truncated
+                and not already_learned
+                and not overlapping_learned
+            )
+
             db.add(
                 BusinessObservation(
                     id=f"OBS-{uuid.uuid4().hex[:10].upper()}",
@@ -1604,11 +1686,14 @@ def run_binding_scan(
                     category="OPERATIONAL",
                     observation_type="TELEMETRY_WINDOW_SNAPSHOT",
                     evidence_kind="OBSERVED_FACT",
-                    entity_refs_json={"binding_id": binding.id},
+                    entity_refs_json={"binding_id": binding.id, "window_id": eval_win_id},
                     attributes_json={
+                        "window_id": eval_win_id,
+                        "is_complete": eval_is_complete,
                         "has_samples": has_samples,
-                        "truncated": bool(active_win.get("truncated", False)),
-                        "last_sample_age_ms": active_win.get("last_sample_age_ms"),
+                        "truncated": is_truncated,
+                        "baseline_learned": can_learn_baseline,
+                        "last_sample_age_ms": eval_win.get("last_sample_age_ms"),
                         "rps": sig_vec.rps,
                         "p95_latency_ms": sig_vec.p95_latency_ms,
                         "error_rate": sig_vec.error_rate,
@@ -1624,20 +1709,27 @@ def run_binding_scan(
                         ),
                     },
                     verification_status="VERIFIED",
-                    freshness_ms=int(active_win.get("last_sample_age_ms") or 0),
+                    freshness_ms=int(eval_win.get("last_sample_age_ms") or 0),
                     observed_at=telem_obs_at,
                 )
             )
-            open_world_candidates, baseline_evals = run_open_world_hybrid_detection(
-                db,
-                session_id=binding.session_id,
-                merchant_id=binding.merchant_id,
-                service_name="ministore-commerce",
-                signals=sig_vec,
-                regime="NORMAL",
-            )
+            baseline_evals: dict[str, Any] = {}
+            if can_learn_baseline:
+                open_world_candidates, baseline_evals = run_open_world_hybrid_detection(
+                    db,
+                    session_id=binding.session_id,
+                    merchant_id=binding.merchant_id,
+                    service_name="ministore-commerce",
+                    signals=sig_vec,
+                    regime="NORMAL",
+                )
+                binding.last_learned_window_id = eval_win_id
+                if eval_win_end is not None:
+                    binding.last_learned_window_end = eval_win_end
             coverage["open_world"] = {
                 "telemetry_available": True,
+                "window_id": eval_win_id,
+                "baseline_learned": can_learn_baseline,
                 "has_samples": has_samples,
                 "signals": {
                     "rps": sig_vec.rps,

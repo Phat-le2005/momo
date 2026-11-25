@@ -158,3 +158,144 @@ def test_open_world_recovery_rejects_missing_window_id_and_overlapping_windows(
     rec2, _ = verify_anomaly_recovery(db, obs=obs, connector=conn)
     assert rec2 is True
     assert obs.lifecycle_state == "RECOVERED"
+
+
+def test_prompt14_4_baseline_window_dedupe_and_incomplete_window_rejection(
+    db: Session, active_session: dict[str, str]
+) -> None:
+    """Prove:
+    1. Repeated scans of the SAME completed window increase baseline sample count ONLY ONCE.
+    2. Persisted last_learned_window_id prevents replay across Monitor restarts.
+    3. Incomplete windows (is_complete=False) cannot establish sustained recovery.
+    """
+    from sqlalchemy import select
+
+    from app.models.open_world import BehavioralBaseline
+    from app.monitoring.service import run_binding_scan
+
+    sid = active_session["id"]
+    t0 = datetime.now(UTC) - timedelta(minutes=3)
+
+    binding = CommerceSourceBinding(
+        id=f"BIND-DEDUPE-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        world_epoch=1,
+        base_url="http://127.0.0.1:8100",
+        merchant_id="MERCHANT_FINSHOP_01",
+        commerce_session_id="CSESS_FINSHOP_DEFAULT_01",
+        commerce_world_epoch=1,
+        is_enabled=True,
+    )
+    db.add(binding)
+    db.commit()
+
+    fixed_completed_win = {
+        "window_id": "FIXED60:2000",
+        "window_start": t0.isoformat(),
+        "window_end": (t0 + timedelta(seconds=60)).isoformat(),
+        "is_complete": True,
+        "has_samples": True,
+        "request_count": 15,
+        "rps": 0.25,
+        "truncated": False,
+        "last_sample_age_ms": 200.0,
+        "latency_ms": {"p95": 42.0},
+        "error_rate": 0.0,
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        if p == "/api/v1/service/events":
+            return httpx.Response(200, json={"events": [], "has_more": False})
+        if p == "/api/v1/service/orders":
+            return httpx.Response(200, json=[])
+        if p == "/api/v1/service/payments":
+            return httpx.Response(200, json=[])
+        if p == "/api/v1/service/refunds":
+            return httpx.Response(200, json=[])
+        if p == "/api/v1/service/inventory":
+            return httpx.Response(200, json=[])
+        if p == "/api/v1/service/metrics":
+            return httpx.Response(
+                200,
+                json={
+                    "outbox_lag_count": 0,
+                    "unsynced_payments": 0,
+                    "total_orders": 0,
+                    "total_payments": 0,
+                    "pending_refunds": 0,
+                },
+            )
+        if p == "/api/v1/service/telemetry":
+            return httpx.Response(
+                200,
+                json={
+                    "windows": {"completed_fixed_60s": fixed_completed_win},
+                    "measured_from_real_requests": True,
+                },
+            )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_handler)
+
+    # Scan 1: learns window FIXED60:2000 once -> sample_count == 1
+    run_binding_scan(db, binding=binding, transport=transport, auto_create_cases=False)
+    bl = db.scalar(
+        select(BehavioralBaseline).where(
+            BehavioralBaseline.session_id == sid,
+            BehavioralBaseline.metric_name == "p95_latency_ms",
+        )
+    )
+    assert bl is not None
+    assert bl.sample_count == 1
+    assert binding.last_learned_window_id == "FIXED60:2000"
+
+    # Scan 2 (same window repeated / Monitor restart) -> sample_count STAYS 1!
+    run_binding_scan(db, binding=binding, transport=transport, auto_create_cases=False)
+    db.refresh(bl)
+    assert bl.sample_count == 1
+
+    # Incomplete window MUST NOT advance sustained recovery streak
+    obs = AnomalyObservation(
+        id=f"ANOM-INC-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        world_epoch=1,
+        source_binding_id=binding.id,
+        merchant_id="MERCHANT_FINSHOP_01",
+        detector_code="OPEN_STAT",
+        anomaly_type="LATENCY_SPIKE",
+        severity="HIGH",
+        fingerprint=f"fp-inc-{uuid.uuid4().hex[:8]}",
+        rationale="P95 spike",
+        lifecycle_state="INVESTIGATING",
+    )
+    db.add(obs)
+    db.commit()
+
+    def _inc_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/service/telemetry":
+            return httpx.Response(
+                200,
+                json={
+                    "windows": {
+                        "fixed_60s": {
+                            "window_id": "FIXED60:2060",
+                            "window_start": (t0 + timedelta(seconds=60)).isoformat(),
+                            "window_end": (t0 + timedelta(seconds=120)).isoformat(),
+                            "is_complete": False,
+                            "has_samples": True,
+                            "request_count": 10,
+                            "truncated": False,
+                            "last_sample_age_ms": 100.0,
+                            "latency_ms": {"p95": 35.0},
+                            "error_rate": 0.0,
+                        }
+                    }
+                },
+            )
+        return _handler(request)
+
+    conn_inc = build_connector_for_binding(binding, transport=httpx.MockTransport(_inc_handler))
+    rec_inc, det_inc = verify_anomaly_recovery(db, obs=obs, connector=conn_inc)
+    assert rec_inc is False
+    assert "incomplete" in det_inc
