@@ -340,6 +340,8 @@ def validate_and_execute_agent_proposal(
     obs: AnomalyObservation,
     expected_run_id: str | None = None,
     expected_job_id: str | None = None,
+    expected_claim_token: str | None = None,
+    expected_anomaly_occurrence: int | None = None,
     expected_world_epoch: int | None = None,
     write_key: str | None = None,
     read_key: str | None = None,
@@ -391,12 +393,40 @@ def validate_and_execute_agent_proposal(
         from app.models.supervisor import SupervisorJob
 
         job_row = db.get(SupervisorJob, expected_job_id)
-        if job_row is not None and job_row.status in ("SUPERSEDED", "CANCELLED", "CANCELLING"):
-            raise AppError(
-                ErrorCode.CONFLICT,
-                f"SUPERSEDED_SUPERVISOR_JOB: job '{expected_job_id}' is '{job_row.status}'",
-                status_code=409,
-            )
+        if job_row is not None:
+            if job_row.status in ("SUPERSEDED", "CANCELLED", "CANCELLING", "FAILED", "COMPLETED"):
+                raise AppError(
+                    ErrorCode.CONFLICT,
+                    f"SUPERSEDED_SUPERVISOR_JOB: job '{expected_job_id}' is '{job_row.status}'",
+                    status_code=409,
+                )
+            if expected_claim_token is not None and job_row.claim_token != expected_claim_token:
+                raise AppError(
+                    ErrorCode.CONFLICT,
+                    f"INVALID_WORKER_CLAIM_TOKEN: job '{expected_job_id}' owned by another worker",
+                    status_code=409,
+                )
+            if job_row.locked_until is not None:
+                lu = job_row.locked_until
+                if lu.tzinfo is None:
+                    lu = lu.replace(tzinfo=UTC)
+                if lu <= datetime.now(UTC):
+                    raise AppError(
+                        ErrorCode.CONFLICT,
+                        f"EXPIRED_WORKER_LEASE: job '{expected_job_id}' lease expired at "
+                        f"{lu.isoformat()}",
+                        status_code=409,
+                    )
+    if (
+        expected_anomaly_occurrence is not None
+        and proposal.anomaly_occurrence != expected_anomaly_occurrence
+    ):
+        raise AppError(
+            ErrorCode.CONFLICT,
+            f"ANOMALY_OCCURRENCE_MISMATCH: proposal occurrence {proposal.anomaly_occurrence} "
+            f"!= current {expected_anomaly_occurrence}",
+            status_code=409,
+        )
     if expected_world_epoch is not None and binding.commerce_world_epoch != expected_world_epoch:
         raise AppError(
             ErrorCode.CONFLICT,

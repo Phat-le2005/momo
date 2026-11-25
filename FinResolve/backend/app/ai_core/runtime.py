@@ -1370,6 +1370,7 @@ class BoundedAgentRuntime:
                 id=f"PROP-{uuid.uuid4().hex[:10].upper()}",
                 case_id=case.id,
                 session_id=session_id,
+                investigation_run_id=run_id,
                 action_type=ActionType.ORDER_SYNC.value,
                 params_json={
                     "order_id": order.id,
@@ -1574,6 +1575,7 @@ class BoundedAgentRuntime:
                 id=f"PROP-{uuid.uuid4().hex[:10].upper()}",
                 case_id=case.id,
                 session_id=session_id,
+                investigation_run_id=run_id,
                 action_type=ActionType.REFUND_EXECUTE.value,
                 params_json={
                     "payment_id": payment.id,
@@ -1618,6 +1620,7 @@ class BoundedAgentRuntime:
             id=f"PROP-{uuid.uuid4().hex[:10].upper()}",
             case_id=case.id,
             session_id=session_id,
+            investigation_run_id=run_id,
             action_type=ActionType.HOLD_ORDER.value,
             params_json=dict(args),
             evidence_refs=fact_evidence_ids,

@@ -68,6 +68,10 @@ class CommerceSourceBinding(Base):
     last_scan_coverage_json: Mapped[dict[str, Any]] = mapped_column(
         JSON, nullable=False, default=dict
     )
+    last_learned_window_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_learned_window_end: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

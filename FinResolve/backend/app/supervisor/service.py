@@ -1970,13 +1970,14 @@ def process_next_supervisor_job(
                 step_traces = list(inv_res.step_traces)
                 decision_summary = inv_res.decision_summary
 
-                # Prompt 14.3 Fix 2: Fence proposals strictly to current run & active job
+                # Prompt 14.4 Fix 2: Fence proposals strictly to exact run_id & active claim_token
                 recovery_note = _run_commerce_post_investigation_recovery(
                     exec_db,
                     case_id=claimed_case_id,
                     session_id=claimed_session_id,
                     run_id=run_id,
                     job_id=claimed_job_id,
+                    claim_token=claim_token,
                     expected_world_epoch=claimed_world_epoch,
                     run_started_at=inv_started_at,
                     is_fallback_mode=is_fallback or (model_mode_val == "DEMO_RULES"),
@@ -2225,15 +2226,16 @@ def _run_commerce_post_investigation_recovery(
     session_id: str,
     run_id: str = "RUN-SUP",
     job_id: str | None = None,
+    claim_token: str | None = None,
     expected_world_epoch: int | None = None,
     run_started_at: datetime | None = None,
     is_fallback_mode: bool = False,
     anomaly_id: str | None = None,
     commerce_transport: Any = None,
 ) -> str | None:
-    """Consume the Agent's structured recovery proposal from the CURRENT investigation run
-    (or explicitly labeled fallback), validate fencing & evidence provenance, authorize via
-    PolicyEngine, execute atomically, and verify.
+    """Consume the Agent's structured recovery proposal strictly bound to the exact
+    `investigation_run_id` (NEVER by timestamp heuristic!), validate claim-token ownership,
+    fencing, and evidence provenance, authorize via PolicyEngine, execute atomically, and verify.
     """
     from app.models.cases import CaseEvent, Evidence
     from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
@@ -2244,6 +2246,7 @@ def _run_commerce_post_investigation_recovery(
     )
     from app.monitoring.service import build_connector_for_binding
 
+    _ = run_started_at  # intentionally unused: provenance is strictly by investigation_run_id
     case_obj = db.scalar(select(Case).where(Case.id == case_id, Case.session_id == session_id))
     if (
         case_obj is None
@@ -2296,21 +2299,25 @@ def _run_commerce_post_investigation_recovery(
     if obs is None or obs.lifecycle_state == "RECOVERED":
         return None
 
-    # Prompt 14.3 Fix 2: Fence ActionProposal strictly to PROPOSED status AND current run window
-    prop_filters: list[Any] = [
-        ActionProposal.case_id == case_obj.id,
-        ActionProposal.session_id == session_id,
-        ActionProposal.status == "PROPOSED",
-    ]
-    if run_started_at is not None:
-        prop_filters.append(ActionProposal.created_at >= run_started_at)
-
+    # Prompt 14.4 Fix 2: Query strictly by EXACT investigation_run_id + PROPOSED under row lock!
+    # NEVER select a proposal by creation timestamp alone or with NULL investigation_run_id!
     agent_action_prop = db.scalar(
         select(ActionProposal)
-        .where(*prop_filters)
+        .where(
+            ActionProposal.case_id == case_obj.id,
+            ActionProposal.session_id == session_id,
+            ActionProposal.investigation_run_id == run_id,
+            ActionProposal.status == "PROPOSED",
+        )
         .order_by(ActionProposal.created_at.desc())
+        .with_for_update(skip_locked=True)
         .limit(1)
     )
+    if agent_action_prop is not None:
+        # Atomically claim proposal so competing workers cannot execute it concurrently
+        agent_action_prop.status = "CLAIMING"
+        db.flush()
+
     reader = build_connector_for_binding(binding, transport=commerce_transport)
     safety_plan = build_evidence_driven_recovery_plan(
         db, binding=binding, obs=obs, connector=reader
@@ -2331,25 +2338,24 @@ def _run_commerce_post_investigation_recovery(
             "DETERMINISTIC_FALLBACK" if is_fallback_mode else "AGENT_STRUCTURED_PROPOSAL"
         )
         action_params = dict(agent_action_prop.params_json or {})
-        raw_ev_refs = action_params.get("evidence_refs")
+        raw_ev_refs = agent_action_prop.evidence_refs or action_params.get("evidence_refs")
+        # Never automatically attach every Case evidence record if Agent omitted evidence_refs!
         supporting_ev_ids = (
             [str(x) for x in raw_ev_refs]
             if isinstance(raw_ev_refs, list) and len(raw_ev_refs) > 0
-            else obs_ev_ids
+            else []
         )
-        # Preserve Agent's exact expected_version (never silently refresh stale version)
         raw_exp_ver = action_params.get("expected_version")
         prop_exp_ver: int | None = int(raw_exp_ver) if raw_exp_ver is not None else None
         prop_id = agent_action_prop.id
+        # Do NOT silently substitute anomaly targets when Agent omitted required order_id
         target_ord = (
-            str(action_params["order_id"])
-            if action_params.get("order_id") is not None
-            else obs.affected_order_id
+            str(action_params["order_id"]) if action_params.get("order_id") is not None else None
         )
         target_pay = (
             str(action_params["payment_id"])
             if action_params.get("payment_id") is not None
-            else obs.affected_payment_id
+            else None
         )
     elif not is_fallback_mode:
         proposed_cmd = "REQUEST_MANUAL_REVIEW"
@@ -2440,6 +2446,8 @@ def _run_commerce_post_investigation_recovery(
         obs=obs,
         expected_run_id=run_id,
         expected_job_id=job_id,
+        expected_claim_token=claim_token,
+        expected_anomaly_occurrence=int(obs.occurrence_count or 1),
         expected_world_epoch=expected_world_epoch,
         transport=commerce_transport,
     )

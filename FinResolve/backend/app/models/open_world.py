@@ -66,6 +66,13 @@ class RecoveryCommand(Base):
     policy_decision: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING")
     approval_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="PROPOSED", index=True)
+    execution_certainty: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="UNKNOWN", server_default="UNKNOWN"
+    )
+    uncertainty_resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    uncertainty_resolved_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
     response_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     verification_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
