@@ -312,15 +312,36 @@ def run_acceptance(
         assert r_ov.status_code == 200, r_ov.text
         ov_data = r_ov.json()
 
+        # Verify causal chain for Experiment D: anomaly -> case -> recovery_command -> CONFIRMED
+        matching_anoms = [
+            a for a in (ov_data.get("anomalies") or []) if a.get("affected_order_id") == order_d_id
+        ]
+        matching_cmds = [
+            c
+            for c in (ov_data.get("recovery_commands") or [])
+            if c.get("target_order_id") == order_d_id
+        ]
+        causal_chain_verified = (
+            bool(matching_anoms)
+            and bool(matching_anoms[0].get("linked_case_id"))
+            and bool(matching_cmds)
+            and matching_cmds[0].get("execution_certainty") == "COMMAND_EXECUTION_VERIFIED"
+        )
+
         report["checks"]["experiment_d_autonomous_recovery"] = {
+            "status": "PASS" if (recovered_d and causal_chain_verified) else "PARTIAL",
             "order_id": order_d_id,
             "payment_id": pay_d_id,
             "scan_anomalies_detected": scan_body.get("anomalies_detected"),
             "scan_cases_created": scan_body.get("cases_created"),
             "final_order_status": ord_d_status,
             "recovered": recovered_d,
-            "overview_anomalies_count": len(ov_data.get("anomalies") or []),
-            "overview_recovery_commands_count": len(ov_data.get("recovery_commands") or []),
+            "causal_chain_verified": causal_chain_verified,
+            "linked_case_id": matching_anoms[0].get("linked_case_id") if matching_anoms else None,
+            "recovery_command_id": matching_cmds[0].get("id") if matching_cmds else None,
+            "execution_certainty": (
+                matching_cmds[0].get("execution_certainty") if matching_cmds else None
+            ),
         }
         assert int(scan_body.get("anomalies_detected") or 0) >= 1, scan_body
         assert recovered_d is True, (
@@ -338,6 +359,11 @@ def run_acceptance(
         )
         assert r_stat_unauth.status_code in (401, 403), r_stat_unauth.status_code
         report["checks"]["experiment_e_f_security_and_reconciliation_guards"] = {
+            "status": "PARTIAL",
+            "note": (
+                "HTTP security & auth guards verified in Docker; full crash-reconciliation "
+                "and unsupported-incident escalation verified in PostgreSQL regression suite."
+            ),
             "unsupported_command_status": r_unsup.status_code,
             "unauth_status_lookup_status": r_stat_unauth.status_code,
         }
@@ -346,6 +372,11 @@ def run_acceptance(
         r_ov_final = client.get(f"{finresolve_url}/api/v1/experience/overview", headers=fin_headers)
         assert r_ov_final.status_code == 200
         report["checks"]["experiment_g_sustained_recovery"] = {
+            "status": "PARTIAL",
+            "note": (
+                "Independent telemetry window metadata verified in Docker; multi-window "
+                "non-overlapping sustained recovery enforced and tested in PostgreSQL suite."
+            ),
             "order_a_still_confirmed": True,
             "order_d_confirmed": recovered_d,
             "completed_window_tracked": w_comp.get("window_id") is not None

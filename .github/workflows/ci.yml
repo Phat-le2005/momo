@@ -23,7 +23,7 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      - run: node --experimental-strip-types --test src/lib/session-state.test.mts
+      - run: node --experimental-strip-types --test src/lib/session-state.test.mts src/lib/experience-api.test.mts
       - run: npm run build
 
   backend:
