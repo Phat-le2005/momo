@@ -1339,22 +1339,72 @@ class BoundedAgentRuntime:
 
                 proposed_version = int(raw_exp_version)
 
-                # Prompt 14.6 Fix 5: Require BOTH order_id AND payment_id observed in THIS run!
-                has_current_order_obs = (order_id in observed_orders) or any(
-                    t.status == "OK"
-                    and t.tool_name == "get_order"
-                    and t.args.get("order_id") == order_id
-                    for t in tool_observations
-                )
-                has_current_payment_obs = (payment_id in observed_payments) or any(
-                    t.status == "OK"
-                    and t.tool_name in ("get_payment_record", "find_payment_candidates")
-                    and (
-                        t.args.get("payment_id") == payment_id or t.args.get("order_id") == order_id
+                # Prompt 14.7 Fix 3: Require exact structured current-run returned evidence
+                # for BOTH order_id AND payment_id (NEVER rely on tool args or substring matches
+                # and NEVER fall back to unrelated fact_evidence_ids[:4]!).
+                current_run_ev_ids = [
+                    t.evidence_id for t in tool_observations if t.status == "OK" and t.evidence_id
+                ]
+                current_run_ev_rows = (
+                    list(
+                        self._db.scalars(
+                            select(Evidence).where(Evidence.id.in_(current_run_ev_ids))
+                        ).all()
                     )
-                    for t in tool_observations
+                    if current_run_ev_ids
+                    else []
                 )
-                http_prov_ok = has_current_order_obs and has_current_payment_obs
+
+                order_ev_refs: list[str] = []
+                payment_ev_refs: list[str] = []
+                for ev_row in current_run_ev_rows:
+                    p_json = ev_row.payload_json or {}
+                    inner = p_json.get("data") if isinstance(p_json.get("data"), dict) else p_json
+                    if not isinstance(inner, dict):
+                        continue
+                    # Exact structured order record returned by get_order ({"order": {...}})
+                    ord_rec = inner.get("order") if isinstance(inner.get("order"), dict) else inner
+                    if (
+                        isinstance(ord_rec, dict)
+                        and (
+                            str(ord_rec.get("id") or "") == order_id
+                            or str(ord_rec.get("order_id") or "") == order_id
+                        )
+                        and ("status" in ord_rec or "total_vnd" in ord_rec or "version" in ord_rec)
+                        and "amount_vnd" not in ord_rec
+                        and "provider" not in ord_rec
+                    ):
+                        order_ev_refs.append(ev_row.id)
+                    # Exact structured payment record returned by get_payment_record
+                    pay_rec = (
+                        inner.get("payment") if isinstance(inner.get("payment"), dict) else inner
+                    )
+                    if (
+                        isinstance(pay_rec, dict)
+                        and (
+                            str(pay_rec.get("id") or "") == payment_id
+                            or str(pay_rec.get("payment_id") or "") == payment_id
+                        )
+                        and (
+                            "amount_vnd" in pay_rec
+                            or "provider" in pay_rec
+                            or "order_id" in pay_rec
+                        )
+                    ):
+                        payment_ev_refs.append(ev_row.id)
+                    # Exact structured candidate returned by find_payment_candidates
+                    cands = inner.get("candidates")
+                    if isinstance(cands, list):
+                        for cand in cands:
+                            if isinstance(cand, dict) and (
+                                str(cand.get("id") or "") == payment_id
+                                or str(cand.get("payment_id") or "") == payment_id
+                            ):
+                                payment_ev_refs.append(ev_row.id)
+                                break
+
+                relevant_ev_refs = list(dict.fromkeys(order_ev_refs + payment_ev_refs))
+                http_prov_ok = bool(order_ev_refs) and bool(payment_ev_refs)
 
                 binding = self._db.get(CommerceSourceBinding, case.source_binding_id)
                 http_order: dict[str, Any] | None = None
@@ -1368,7 +1418,7 @@ class BoundedAgentRuntime:
                         http_order = None
                         http_payment = None
 
-                # Independently verify merchant scope, payment-to-order link, amount, currency
+                # Independently verify merchant, session, world_epoch, link, amount, currency
                 auth_order_ver: int | None = None
                 if isinstance(http_order, dict) and is_strict_int(http_order.get("version")):
                     auth_order_ver = int(http_order["version"])
@@ -1376,11 +1426,20 @@ class BoundedAgentRuntime:
                 scope_ok = True
                 if binding is not None and isinstance(http_order, dict):
                     ord_merchant = http_order.get("merchant_id")
+                    ord_csess = http_order.get("commerce_session_id")
+                    ord_epoch = http_order.get("world_epoch")
                     if ord_merchant and str(ord_merchant) != binding.merchant_id:
+                        scope_ok = False
+                    if ord_csess and str(ord_csess) != binding.commerce_session_id:
+                        scope_ok = False
+                    if ord_epoch is not None and int(ord_epoch) != binding.commerce_world_epoch:
                         scope_ok = False
                 if binding is not None and isinstance(http_payment, dict):
                     pay_merchant = http_payment.get("merchant_id")
+                    pay_csess = http_payment.get("commerce_session_id")
                     if pay_merchant and str(pay_merchant) != binding.merchant_id:
+                        scope_ok = False
+                    if pay_csess and str(pay_csess) != binding.commerce_session_id:
                         scope_ok = False
 
                 auth_amount = (
@@ -1449,21 +1508,26 @@ class BoundedAgentRuntime:
                     elif not agent_currency_ok:
                         detail_reason = "PAYMENT_CURRENCY_MISMATCH"
 
-                    risk = self._create_risk_signal(
-                        case=case,
-                        session_id=session_id,
-                        category=RiskCategory.UNVERIFIED_PAYMENT.value,
-                        level=RiskLevel.HIGH.value,
-                        response=RiskResponse.HOLD_ACTION.value,
-                        evidence_refs=fact_evidence_ids[:6],
-                        details={
-                            "attempted_action": "ORDER_SYNC",
-                            "block_reason": detail_reason,
-                            "order_id": order_id,
-                            "payment_id": payment_id,
-                        },
-                    )
-                    risk_signal_ids.append(risk.id)
+                    # Prompt 14.7 Fix 3: Do NOT attach a permanent HOLD_ACTION risk signal
+                    # solely for missing evidence when a subsequent investigation can collect it!
+                    risk_id: str | None = None
+                    if detail_reason != "MISSING_CURRENT_RUN_PROVENANCE":
+                        risk = self._create_risk_signal(
+                            case=case,
+                            session_id=session_id,
+                            category=RiskCategory.UNVERIFIED_PAYMENT.value,
+                            level=RiskLevel.HIGH.value,
+                            response=RiskResponse.HOLD_ACTION.value,
+                            evidence_refs=relevant_ev_refs,
+                            details={
+                                "attempted_action": "ORDER_SYNC",
+                                "block_reason": detail_reason,
+                                "order_id": order_id,
+                                "payment_id": payment_id,
+                            },
+                        )
+                        risk_signal_ids.append(risk.id)
+                        risk_id = risk.id
                     self._record_event(
                         case=case,
                         event_type="UNSAFE_PROPOSAL_BLOCKED",
@@ -1471,7 +1535,7 @@ class BoundedAgentRuntime:
                             "run_id": run_id,
                             "attempted_action": "ORDER_SYNC",
                             "reason": detail_reason,
-                            "risk_signal_id": risk.id,
+                            "risk_signal_id": risk_id,
                         },
                     )
                     case = self._safe_transition(
@@ -1480,25 +1544,6 @@ class BoundedAgentRuntime:
                         reason=f"Chặn ORDER_SYNC ({detail_reason}): dữ liệu Commerce chưa hợp lệ.",
                     )
                     return case, "UNVERIFIED_PAYMENT_BLOCKED"
-
-                # Prompt 14.6 Fix 5: Attach only supporting evidence refs relevant to target
-                fact_rows = list(
-                    self._db.scalars(
-                        select(Evidence).where(Evidence.id.in_(fact_evidence_ids))
-                    ).all()
-                )
-                relevant_ev_refs = [
-                    e.id
-                    for e in fact_rows
-                    if (
-                        order_id in str(e.source_ref or "")
-                        or payment_id in str(e.source_ref or "")
-                        or str((e.payload_json or {}).get("order_id") or "") == order_id
-                        or str((e.payload_json or {}).get("payment_id") or "") == payment_id
-                    )
-                ]
-                if not relevant_ev_refs:
-                    relevant_ev_refs = fact_evidence_ids[:4]
 
                 proposal = ActionProposal(
                     id=f"PROP-{uuid.uuid4().hex[:10].upper()}",
