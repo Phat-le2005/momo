@@ -2439,18 +2439,25 @@ def _run_commerce_post_investigation_recovery(
     )
     db.flush()
 
-    _, exec_res = validate_and_execute_agent_proposal(
-        db,
-        proposal=structured_prop,
-        binding=binding,
-        obs=obs,
-        expected_run_id=run_id,
-        expected_job_id=job_id,
-        expected_claim_token=claim_token,
-        expected_anomaly_occurrence=int(obs.occurrence_count or 1),
-        expected_world_epoch=expected_world_epoch,
-        transport=commerce_transport,
-    )
+    try:
+        _, exec_res = validate_and_execute_agent_proposal(
+            db,
+            proposal=structured_prop,
+            binding=binding,
+            obs=obs,
+            expected_run_id=run_id,
+            expected_job_id=job_id,
+            expected_claim_token=claim_token,
+            expected_anomaly_occurrence=int(obs.occurrence_count or 1),
+            expected_world_epoch=expected_world_epoch,
+            require_worker_fence=True,
+            transport=commerce_transport,
+        )
+    except Exception:
+        if agent_action_prop is not None and agent_action_prop.status == "CLAIMING":
+            agent_action_prop.status = "REJECTED"
+            db.commit()
+        raise
 
     if exec_res is None:
         if agent_action_prop is not None:

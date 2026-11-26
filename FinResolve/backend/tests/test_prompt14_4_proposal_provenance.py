@@ -314,3 +314,138 @@ def test_exact_investigation_run_provenance_and_worker_claim_token_fencing(
     assert len(exec_calls) == 1
     db.refresh(valid_prop)
     assert valid_prop.status == "EXECUTED"
+
+
+def test_prompt14_5_fail_closed_worker_fencing_rejects_missing_job_token_or_lease(
+    db: Session, active_session: dict[str, str]
+) -> None:
+    """Prompt 14.5 Fix 2: Missing job, missing claim_token, or missing lease MUST fail closed."""
+    sid = active_session["id"]
+    now = datetime.now(UTC)
+
+    binding = CommerceSourceBinding(
+        id=f"BIND-FC-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        world_epoch=1,
+        base_url="http://127.0.0.1:8100",
+        merchant_id="MERCHANT_FINSHOP_01",
+        commerce_session_id="CSESS_FINSHOP_DEFAULT_01",
+        commerce_world_epoch=1,
+        is_enabled=True,
+    )
+    db.add(binding)
+    db.flush()
+
+    case_obj = Case(
+        id=f"CASE-FC-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        type="PAYMENT_SYNC",
+        goal="Fail-closed fencing",
+        state=CaseState.INVESTIGATING.value,
+        owner="autonomous-monitor",
+        source_system="COMMERCE_HTTP",
+        source_binding_id=binding.id,
+        idempotency_key=f"IDEMP-FC-{uuid.uuid4().hex[:8]}",
+    )
+    db.add(case_obj)
+    db.flush()
+
+    ev = Evidence(
+        id=f"EVD-FC-{uuid.uuid4().hex[:8].upper()}",
+        case_id=case_obj.id,
+        session_id=sid,
+        kind=EvidenceKind.OBSERVED_FACT.value,
+        source="MINI_STORE_COMMERCE_HTTP",
+        source_ref="/api/v1/service/orders/ORD-FC-01",
+        payload_json={"order_id": "ORD-FC-01"},
+        observed_at=now,
+    )
+    db.add(ev)
+
+    obs = AnomalyObservation(
+        id=f"ANOM-FC-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        world_epoch=1,
+        source_binding_id=binding.id,
+        merchant_id="MERCHANT_FINSHOP_01",
+        detector_code="D01",
+        anomaly_type="PAYMENT_SUCCEEDED_ORDER_NOT_CONFIRMED",
+        severity="HIGH",
+        fingerprint=f"fp-fc-{uuid.uuid4().hex[:8]}",
+        affected_order_id="ORD-FC-01",
+        affected_payment_id="PAY-FC-01",
+        linked_case_id=case_obj.id,
+        rationale="Unsynced payment",
+        lifecycle_state="INVESTIGATING",
+    )
+    db.add(obs)
+
+    no_lease_job = SupervisorJob(
+        id=f"JOB-NOLS-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        world_epoch=1,
+        job_type="ANOMALY_INVESTIGATION",
+        dedupe_key=f"dedupe-nols-{uuid.uuid4().hex[:8]}",
+        target_case_id=case_obj.id,
+        status="RUNNING",
+        claim_token="TOK-NOLS-01",
+        locked_until=None,
+    )
+    db.add(no_lease_job)
+    db.commit()
+
+    prop = StructuredAgentRecoveryProposal(
+        case_id=case_obj.id,
+        run_id="RUN-FC-01",
+        anomaly_id=obs.id,
+        target_order_id="ORD-FC-01",
+        target_payment_id="PAY-FC-01",
+        expected_version=1,
+        supporting_evidence_ids=[ev.id],
+        proposed_command="REQUEST_ORDER_SYNC",
+    )
+
+    # 1. Non-existent job ID -> 409 MISSING_SUPERVISOR_JOB
+    with pytest.raises(AppError) as e_miss:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=prop,
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-FC-01",
+            expected_job_id="JOB-DOES-NOT-EXIST",
+            expected_claim_token="TOK-1",
+            require_worker_fence=True,
+        )
+    assert e_miss.value.status_code == 409
+    assert "MISSING_SUPERVISOR_JOB" in e_miss.value.message
+
+    # 2. Missing claim token -> 409 MISSING_WORKER_CLAIM_TOKEN
+    with pytest.raises(AppError) as e_tok:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=prop,
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-FC-01",
+            expected_job_id=no_lease_job.id,
+            expected_claim_token=None,
+            require_worker_fence=True,
+        )
+    assert e_tok.value.status_code == 409
+    assert "MISSING_WORKER_CLAIM_TOKEN" in e_tok.value.message
+
+    # 3. Missing lease expiration -> 409 MISSING_WORKER_LEASE
+    with pytest.raises(AppError) as e_ls:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=prop,
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-FC-01",
+            expected_job_id=no_lease_job.id,
+            expected_claim_token="TOK-NOLS-01",
+            require_worker_fence=True,
+        )
+    assert e_ls.value.status_code == 409
+    assert "MISSING_WORKER_LEASE" in e_ls.value.message

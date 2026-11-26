@@ -343,6 +343,7 @@ def validate_and_execute_agent_proposal(
     expected_claim_token: str | None = None,
     expected_anomaly_occurrence: int | None = None,
     expected_world_epoch: int | None = None,
+    require_worker_fence: bool = False,
     write_key: str | None = None,
     read_key: str | None = None,
     transport: httpx.BaseTransport | None = None,
@@ -389,34 +390,72 @@ def validate_and_execute_agent_proposal(
             f"PROPOSAL_RUN_MISMATCH: run '{proposal.run_id}' != current '{expected_run_id}'",
             status_code=403,
         )
-    if expected_job_id:
+    # Non-mutating Agent recommendations are respected directly before mutating fences
+    is_non_mutating = norm_cmd in (
+        "REQUEST_MANUAL_REVIEW",
+        "WAIT_FOR_OBSERVATION",
+        "COLLECT_MORE_EVIDENCE",
+    )
+
+    if (require_worker_fence or expected_job_id) and not is_non_mutating:
         from app.models.supervisor import SupervisorJob
 
-        job_row = db.get(SupervisorJob, expected_job_id)
-        if job_row is not None:
-            if job_row.status in ("SUPERSEDED", "CANCELLED", "CANCELLING", "FAILED", "COMPLETED"):
-                raise AppError(
-                    ErrorCode.CONFLICT,
-                    f"SUPERSEDED_SUPERVISOR_JOB: job '{expected_job_id}' is '{job_row.status}'",
-                    status_code=409,
-                )
-            if expected_claim_token is not None and job_row.claim_token != expected_claim_token:
-                raise AppError(
-                    ErrorCode.CONFLICT,
-                    f"INVALID_WORKER_CLAIM_TOKEN: job '{expected_job_id}' owned by another worker",
-                    status_code=409,
-                )
-            if job_row.locked_until is not None:
-                lu = job_row.locked_until
-                if lu.tzinfo is None:
-                    lu = lu.replace(tzinfo=UTC)
-                if lu <= datetime.now(UTC):
-                    raise AppError(
-                        ErrorCode.CONFLICT,
-                        f"EXPIRED_WORKER_LEASE: job '{expected_job_id}' lease expired at "
-                        f"{lu.isoformat()}",
-                        status_code=409,
-                    )
+        if not expected_job_id or not expected_job_id.strip():
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "MISSING_SUPERVISOR_JOB: autonomous mutation requires an active SupervisorJob ID",
+                status_code=409,
+            )
+        # Re-read authoritative job ownership directly from PostgreSQL immediately before dispatch
+        job_row = db.scalar(
+            select(SupervisorJob).where(SupervisorJob.id == expected_job_id).with_for_update()
+        )
+        if job_row is None:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"MISSING_SUPERVISOR_JOB: job '{expected_job_id}' does not exist",
+                status_code=409,
+            )
+        if job_row.status != "RUNNING":
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"SUPERSEDED_SUPERVISOR_JOB: job '{expected_job_id}' is '{job_row.status}', "
+                "not RUNNING",
+                status_code=409,
+            )
+        if job_row.session_id != binding.session_id:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"JOB_SESSION_MISMATCH: job '{expected_job_id}' belongs to another session",
+                status_code=409,
+            )
+        if not expected_claim_token or not expected_claim_token.strip():
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "MISSING_WORKER_CLAIM_TOKEN: autonomous mutation requires a non-empty claim token",
+                status_code=409,
+            )
+        if job_row.claim_token != expected_claim_token:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"INVALID_WORKER_CLAIM_TOKEN: job '{expected_job_id}' owned by another worker",
+                status_code=409,
+            )
+        if job_row.locked_until is None:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"MISSING_WORKER_LEASE: job '{expected_job_id}' has no active lease expiration",
+                status_code=409,
+            )
+        lu = job_row.locked_until
+        if lu.tzinfo is None:
+            lu = lu.replace(tzinfo=UTC)
+        if lu <= datetime.now(UTC):
+            raise AppError(
+                ErrorCode.CONFLICT,
+                f"EXPIRED_WORKER_LEASE: job '{expected_job_id}' lease expired at {lu.isoformat()}",
+                status_code=409,
+            )
     if (
         expected_anomaly_occurrence is not None
         and proposal.anomaly_occurrence != expected_anomaly_occurrence
