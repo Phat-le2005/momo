@@ -1262,9 +1262,7 @@ class BoundedAgentRuntime:
                 and has_alias_ver
                 and raw_exp_order_version != raw_exp_version_alias
             )
-            raw_exp_version = (
-                raw_exp_order_version if has_canonical_ver else raw_exp_version_alias
-            )
+            raw_exp_version = raw_exp_order_version if has_canonical_ver else raw_exp_version_alias
 
             if (
                 not isinstance(raw_order_id, str)
@@ -1352,8 +1350,7 @@ class BoundedAgentRuntime:
                     t.status == "OK"
                     and t.tool_name in ("get_payment_record", "find_payment_candidates")
                     and (
-                        t.args.get("payment_id") == payment_id
-                        or t.args.get("order_id") == order_id
+                        t.args.get("payment_id") == payment_id or t.args.get("order_id") == order_id
                     )
                     for t in tool_observations
                 )
@@ -1392,14 +1389,10 @@ class BoundedAgentRuntime:
                     else 0
                 )
                 order_total = (
-                    int(http_order.get("total_vnd") or -1)
-                    if isinstance(http_order, dict)
-                    else -1
+                    int(http_order.get("total_vnd") or -1) if isinstance(http_order, dict) else -1
                 )
                 agent_amount_ok = raw_amount is None or int(raw_amount) == auth_amount
-                agent_currency_ok = (
-                    raw_currency is None or raw_currency.strip().upper() == "VND"
-                )
+                agent_currency_ok = raw_currency is None or raw_currency.strip().upper() == "VND"
 
                 # Prompt 14.6 Fix 2: Reject stale version explicitly (request fresh investigation)
                 if (
