@@ -985,11 +985,37 @@ class BoundedAgentRuntime:
                 break
 
             if step_kind == PlanStepKind.PROPOSE_ACTION:
+                action_name = str(plan.next_step.action_type or plan.next_step.tool_name)
+                if (
+                    case.source_system == "COMMERCE_HTTP"
+                    and action_name in ("propose_order_sync", "ORDER_SYNC")
+                    and replans_used < self._max_replans
+                ):
+                    has_ord_tool = any(
+                        t.status == "OK" and t.tool_name == "get_order" for t in tool_observations
+                    )
+                    has_pay_tool = any(
+                        t.status == "OK"
+                        and t.tool_name in ("get_payment_record", "find_payment_candidates")
+                        for t in tool_observations
+                    )
+                    if not (has_ord_tool and has_pay_tool):
+                        missing_tool = "get_payment_record" if not has_pay_tool else "get_order"
+                        replans_used += 1
+                        validation_feedback = (
+                            f"Before proposing {action_name}, you MUST first execute READ_TOOL "
+                            f"'{missing_tool}' in this investigation run so both order and payment "
+                            "have authoritative current-run provenance."
+                        )
+                        expected_case_version = case.version
+                        self._maybe_commit()
+                        continue
+
                 case, stop_reason = self._handle_propose_action(
                     case=case,
                     session_id=session_id,
                     run_id=effective_run_id,
-                    action_name=str(plan.next_step.action_type or plan.next_step.tool_name),
+                    action_name=action_name,
                     args=plan.next_step.args,
                     decision_summary=plan.decision_summary,
                     tool_observations=tool_observations,
@@ -1224,34 +1250,61 @@ class BoundedAgentRuntime:
             raw_order_id = args.get("order_id")
             raw_payment_id = args.get("payment_id")
             raw_amount = args.get("amount")
-            raw_exp_version = args.get("expected_order_version")
+            raw_currency = args.get("currency")
+            raw_exp_order_version = args.get("expected_order_version")
+            raw_exp_version_alias = args.get("expected_version")
+
+            # Prompt 14.6 Fix 1 & 2: Reject contradictory version aliases and non-strict integers
+            has_canonical_ver = raw_exp_order_version is not None
+            has_alias_ver = raw_exp_version_alias is not None
+            contradictory_ver_aliases = (
+                has_canonical_ver
+                and has_alias_ver
+                and raw_exp_order_version != raw_exp_version_alias
+            )
+            raw_exp_version = (
+                raw_exp_order_version if has_canonical_ver else raw_exp_version_alias
+            )
 
             if (
                 not isinstance(raw_order_id, str)
                 or not raw_order_id.strip()
                 or not isinstance(raw_payment_id, str)
                 or not raw_payment_id.strip()
+                or contradictory_ver_aliases
                 or (raw_amount is not None and (not is_strict_int(raw_amount) or raw_amount <= 0))
+                or (
+                    raw_currency is not None
+                    and (not isinstance(raw_currency, str) or not raw_currency.strip())
+                )
                 or (
                     raw_exp_version is not None
                     and (not is_strict_int(raw_exp_version) or raw_exp_version < 1)
                 )
             ):
+                block_reason = (
+                    "CONTRADICTORY_VERSION_ALIASES"
+                    if contradictory_ver_aliases
+                    else "INVALID_ACTION_ARGUMENTS"
+                )
                 self._record_event(
                     case=case,
                     event_type="UNSAFE_PROPOSAL_BLOCKED",
                     payload={
                         "run_id": run_id,
                         "attempted_action": "ORDER_SYNC",
-                        "reason": "INVALID_ACTION_ARGUMENTS",
+                        "reason": block_reason,
                     },
                 )
                 case = self._safe_transition(
                     case,
                     CaseState.ESCALATED,
-                    reason="Chặn đề xuất ORDER_SYNC do tham số đầu ra từ model không hợp lệ.",
+                    reason=(
+                        "Chặn đề xuất ORDER_SYNC do tham số đầu ra từ model không hợp lệ "
+                        f"({block_reason})."
+                    ),
                 )
-                return case, "INVALID_ACTION_ARGUMENTS_BLOCKED"
+                return case, f"{block_reason}_BLOCKED"
 
             order_id = raw_order_id.strip()
             payment_id = raw_payment_id.strip()
@@ -1261,6 +1314,50 @@ class BoundedAgentRuntime:
             if case.source_system == "COMMERCE_HTTP" and case.source_binding_id:
                 from app.models.monitoring import CommerceSourceBinding
                 from app.monitoring.service import build_connector_for_binding
+
+                # Prompt 14.6 Fix 2: COMMERCE_HTTP state-changing proposals MUST explicitly
+                # supply target expected_order_version — NEVER silently substitute latest version!
+                if raw_exp_version is None:
+                    self._record_event(
+                        case=case,
+                        event_type="UNSAFE_PROPOSAL_BLOCKED",
+                        payload={
+                            "run_id": run_id,
+                            "attempted_action": "ORDER_SYNC",
+                            "reason": "MISSING_EXPECTED_ORDER_VERSION",
+                            "order_id": order_id,
+                            "payment_id": payment_id,
+                        },
+                    )
+                    case = self._safe_transition(
+                        case,
+                        CaseState.WAITING_EVIDENCE,
+                        reason=(
+                            "Chặn đề xuất ORDER_SYNC: Agent phải cung cấp rõ "
+                            "expected_order_version từ bằng chứng quan sát."
+                        ),
+                    )
+                    return case, "MISSING_EXPECTED_VERSION_BLOCKED"
+
+                proposed_version = int(raw_exp_version)
+
+                # Prompt 14.6 Fix 5: Require BOTH order_id AND payment_id observed in THIS run!
+                has_current_order_obs = (order_id in observed_orders) or any(
+                    t.status == "OK"
+                    and t.tool_name == "get_order"
+                    and t.args.get("order_id") == order_id
+                    for t in tool_observations
+                )
+                has_current_payment_obs = (payment_id in observed_payments) or any(
+                    t.status == "OK"
+                    and t.tool_name in ("get_payment_record", "find_payment_candidates")
+                    and (
+                        t.args.get("payment_id") == payment_id
+                        or t.args.get("order_id") == order_id
+                    )
+                    for t in tool_observations
+                )
+                http_prov_ok = has_current_order_obs and has_current_payment_obs
 
                 binding = self._db.get(CommerceSourceBinding, case.source_binding_id)
                 http_order: dict[str, Any] | None = None
@@ -1274,39 +1371,101 @@ class BoundedAgentRuntime:
                         http_order = None
                         http_payment = None
 
-                http_prov_ok = (
-                    (order_id in observed_orders)
-                    or (payment_id in observed_payments)
-                    or any(
-                        t.status == "OK"
-                        and (
-                            t.args.get("order_id") == order_id
-                            or t.args.get("payment_id") == payment_id
-                        )
-                        for t in tool_observations
-                    )
+                # Independently verify merchant scope, payment-to-order link, amount, currency
+                auth_order_ver: int | None = None
+                if isinstance(http_order, dict) and is_strict_int(http_order.get("version")):
+                    auth_order_ver = int(http_order["version"])
+
+                scope_ok = True
+                if binding is not None and isinstance(http_order, dict):
+                    ord_merchant = http_order.get("merchant_id")
+                    if ord_merchant and str(ord_merchant) != binding.merchant_id:
+                        scope_ok = False
+                if binding is not None and isinstance(http_payment, dict):
+                    pay_merchant = http_payment.get("merchant_id")
+                    if pay_merchant and str(pay_merchant) != binding.merchant_id:
+                        scope_ok = False
+
+                auth_amount = (
+                    int(http_payment.get("amount_vnd") or 0)
+                    if isinstance(http_payment, dict)
+                    else 0
                 )
+                order_total = (
+                    int(http_order.get("total_vnd") or -1)
+                    if isinstance(http_order, dict)
+                    else -1
+                )
+                agent_amount_ok = raw_amount is None or int(raw_amount) == auth_amount
+                agent_currency_ok = (
+                    raw_currency is None or raw_currency.strip().upper() == "VND"
+                )
+
+                # Prompt 14.6 Fix 2: Reject stale version explicitly (request fresh investigation)
+                if (
+                    http_prov_ok
+                    and scope_ok
+                    and auth_order_ver is not None
+                    and proposed_version != auth_order_ver
+                ):
+                    self._record_event(
+                        case=case,
+                        event_type="UNSAFE_PROPOSAL_BLOCKED",
+                        payload={
+                            "run_id": run_id,
+                            "attempted_action": "ORDER_SYNC",
+                            "reason": "STALE_ORDER_VERSION",
+                            "order_id": order_id,
+                            "payment_id": payment_id,
+                            "proposed_version": proposed_version,
+                            "authoritative_version": auth_order_ver,
+                        },
+                    )
+                    case = self._safe_transition(
+                        case,
+                        CaseState.WAITING_EVIDENCE,
+                        reason=(
+                            f"Từ chối đề xuất lỗi thời: Agent đề xuất version {proposed_version} "
+                            f"nhưng phiên bản hiện tại là {auth_order_ver}. Cần điều tra lại."
+                        ),
+                    )
+                    return case, "STALE_VERSION_REJECTED"
+
                 http_verified = (
                     http_prov_ok
+                    and scope_ok
                     and isinstance(http_order, dict)
                     and isinstance(http_payment, dict)
                     and str(http_payment.get("order_id") or "") == order_id
                     and str(http_payment.get("status") or "").upper() in ("SUCCEEDED", "SUCCESS")
-                    and int(http_payment.get("amount_vnd") or 0)
-                    == int(http_order.get("total_vnd") or -1)
-                    and http_order.get("version") is not None
+                    and auth_amount > 0
+                    and auth_amount == order_total
+                    and agent_amount_ok
+                    and agent_currency_ok
+                    and auth_order_ver is not None
+                    and proposed_version == auth_order_ver
                 )
                 if not http_verified or http_order is None or http_payment is None:
+                    detail_reason = "COMMERCE_HTTP_PAYMENT_NOT_VERIFIED"
+                    if not http_prov_ok:
+                        detail_reason = "MISSING_CURRENT_RUN_PROVENANCE"
+                    elif not scope_ok:
+                        detail_reason = "MERCHANT_SCOPE_MISMATCH"
+                    elif not agent_amount_ok:
+                        detail_reason = "PAYMENT_AMOUNT_MISMATCH"
+                    elif not agent_currency_ok:
+                        detail_reason = "PAYMENT_CURRENCY_MISMATCH"
+
                     risk = self._create_risk_signal(
                         case=case,
                         session_id=session_id,
                         category=RiskCategory.UNVERIFIED_PAYMENT.value,
                         level=RiskLevel.HIGH.value,
                         response=RiskResponse.HOLD_ACTION.value,
-                        evidence_refs=fact_evidence_ids,
+                        evidence_refs=fact_evidence_ids[:6],
                         details={
                             "attempted_action": "ORDER_SYNC",
-                            "block_reason": "COMMERCE_HTTP_PAYMENT_NOT_VERIFIED",
+                            "block_reason": detail_reason,
                             "order_id": order_id,
                             "payment_id": payment_id,
                         },
@@ -1318,18 +1477,36 @@ class BoundedAgentRuntime:
                         payload={
                             "run_id": run_id,
                             "attempted_action": "ORDER_SYNC",
-                            "reason": "COMMERCE_HTTP_PAYMENT_NOT_VERIFIED",
+                            "reason": detail_reason,
                             "risk_signal_id": risk.id,
                         },
                     )
                     case = self._safe_transition(
                         case,
                         CaseState.WAITING_EVIDENCE,
-                        reason="Chặn ORDER_SYNC: dữ liệu Commerce chưa xác nhận thanh toán.",
+                        reason=f"Chặn ORDER_SYNC ({detail_reason}): dữ liệu Commerce chưa hợp lệ.",
                     )
                     return case, "UNVERIFIED_PAYMENT_BLOCKED"
 
-                ord_ver = int(http_order["version"])
+                # Prompt 14.6 Fix 5: Attach only supporting evidence refs relevant to target
+                fact_rows = list(
+                    self._db.scalars(
+                        select(Evidence).where(Evidence.id.in_(fact_evidence_ids))
+                    ).all()
+                )
+                relevant_ev_refs = [
+                    e.id
+                    for e in fact_rows
+                    if (
+                        order_id in str(e.source_ref or "")
+                        or payment_id in str(e.source_ref or "")
+                        or str((e.payload_json or {}).get("order_id") or "") == order_id
+                        or str((e.payload_json or {}).get("payment_id") or "") == payment_id
+                    )
+                ]
+                if not relevant_ev_refs:
+                    relevant_ev_refs = fact_evidence_ids[:4]
+
                 proposal = ActionProposal(
                     id=f"PROP-{uuid.uuid4().hex[:10].upper()}",
                     case_id=case.id,
@@ -1340,11 +1517,11 @@ class BoundedAgentRuntime:
                         "order_id": order_id,
                         "payment_id": payment_id,
                         "merchant_id": binding.merchant_id if binding else "",
-                        "amount": int(http_payment.get("amount_vnd") or 0),
+                        "amount": auth_amount,
                         "currency": "VND",
-                        "expected_order_version": ord_ver,
+                        "expected_order_version": proposed_version,
                     },
-                    evidence_refs=fact_evidence_ids,
+                    evidence_refs=relevant_ev_refs,
                     expected_version=case.version,
                     risk_level=RiskLevel.LOW.value,
                     status=ActionProposalStatus.PROPOSED.value,
