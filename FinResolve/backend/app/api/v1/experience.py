@@ -18,7 +18,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Header, status
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -71,6 +71,51 @@ class ExperienceBootstrapResponse(BaseModel):
     session: dict[str, Any]
     sandbox: dict[str, Any]
     guardian: dict[str, Any]
+
+
+_SENSITIVE_TRACE_SUBSTRINGS: tuple[str, ...] = (
+    "secret",
+    "token",
+    "api_key",
+    "write_key",
+    "service_key",
+    "password",
+    "authorization",
+    "cookie",
+    "credential",
+)
+
+
+def _scrub_sensitive_trace(value: Any) -> Any:
+    """Recursively redact sensitive keys from technical_trace payloads before sending to browser."""
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for k, v in value.items():
+            kl = str(k).lower()
+            if any(sub in kl for sub in _SENSITIVE_TRACE_SUBSTRINGS):
+                cleaned[str(k)] = "[REDACTED]"
+            else:
+                cleaned[str(k)] = _scrub_sensitive_trace(v)
+        return cleaned
+    if isinstance(value, list):
+        return [_scrub_sensitive_trace(item) for item in value]
+    return value
+
+
+def _effective_connectivity_status(binding: CommerceSourceBinding | None) -> str:
+    """An initialized binding without a verified scan MUST NOT claim CONNECTED."""
+    if binding is None:
+        return "UNCONFIGURED"
+    if binding.connectivity_status == "CONNECTED" and binding.last_successful_scan_at is None:
+        return "UNVERIFIED"
+    return binding.connectivity_status
+
+
+def _sandbox_isolation_mode(commerce_session_id: str) -> str:
+    """Honest sandbox ownership label: never claim a shared default sandbox is per-user isolated."""
+    if commerce_session_id == "CSESS_FINSHOP_DEFAULT_01":
+        return "SHARED_DEMO_SANDBOX"
+    return "DEDICATED_SANDBOX"
 
 
 def _resolve_existing_active_session(
@@ -142,11 +187,12 @@ def bootstrap_experience(
     db.commit()
     worker_health = get_worker_health(db)
     worker_ok = bool(worker_health.get("worker_healthy", False))
-    conn_status = binding.connectivity_status if binding is not None else "UNCONFIGURED"
+    conn_status = _effective_connectivity_status(binding)
     overall = "READY" if (worker_ok and conn_status == "CONNECTED") else "DEGRADED"
 
-    # Public browser-visible MiniStore URL (never internal docker hostname)
-    storefront_url = "http://localhost:3100"
+    # Configurable public browser-visible MiniStore URL (never internal docker hostname)
+    storefront_url = settings.commerce_public_storefront_url.strip() or "http://localhost:3100"
+    eff_csess = binding.commerce_session_id if binding else settings.commerce_session_id
 
     return ExperienceBootstrapResponse(
         status=overall,
@@ -160,10 +206,9 @@ def bootstrap_experience(
         },
         sandbox={
             "environment_name": "FinShop LIVE Sandbox (MOCK)",
+            "sandbox_isolation_mode": _sandbox_isolation_mode(eff_csess),
             "merchant_id": binding.merchant_id if binding else settings.commerce_merchant_id,
-            "commerce_session_id": (
-                binding.commerce_session_id if binding else settings.commerce_session_id
-            ),
+            "commerce_session_id": eff_csess,
             "commerce_world_epoch": (
                 binding.commerce_world_epoch if binding else settings.commerce_world_epoch
             ),
@@ -231,16 +276,36 @@ def get_experience_overview(
         if a.lifecycle_state == "RECOVERED" and a.verification_verdict == "VERIFIED_RECOVERY"
     ]
 
-    pending_props = list(
-        db.scalars(
-            select(ActionProposal)
-            .where(
-                ActionProposal.session_id == sid,
-                ActionProposal.status == ActionProposalStatus.PROPOSED.value,
-            )
-            .order_by(ActionProposal.created_at.desc())
-            .limit(20)
-        ).all()
+    # Prompt 14.7 Fix 4: Derive exact active-world Case IDs so approvals, timeline, and KPIs
+    # NEVER leak obsolete incidents/proposals from previous world epochs after Reset!
+    epoch_case_id_set: set[str] = {a.linked_case_id for a in anomalies if a.linked_case_id}
+    job_case_ids = db.scalars(
+        select(SupervisorJob.target_case_id).where(
+            SupervisorJob.session_id == sid,
+            SupervisorJob.world_epoch == epoch,
+            SupervisorJob.target_case_id.is_not(None),
+        )
+    ).all()
+    for cid in job_case_ids:
+        if cid:
+            epoch_case_id_set.add(cid)
+    epoch_case_ids = list(epoch_case_id_set)
+
+    pending_props = (
+        list(
+            db.scalars(
+                select(ActionProposal)
+                .where(
+                    ActionProposal.session_id == sid,
+                    ActionProposal.case_id.in_(epoch_case_ids),
+                    ActionProposal.status == ActionProposalStatus.PROPOSED.value,
+                )
+                .order_by(ActionProposal.created_at.desc())
+                .limit(20)
+            ).all()
+        )
+        if epoch_case_ids
+        else []
     )
 
     queued_jobs = int(
@@ -254,7 +319,7 @@ def get_experience_overview(
         or 0
     )
 
-    # Real baselines for this session (never fabricated)
+    # Real baselines for this session — explicitly distinguish historical vs current-world samples
     baselines = list(
         db.scalars(
             select(BehavioralBaseline)
@@ -263,7 +328,23 @@ def get_experience_overview(
             .limit(12)
         ).all()
     )
-    baseline_warm = any(b.sample_count >= 5 for b in baselines)
+    sup_upd = sup_state.updated_at
+    if sup_upd.tzinfo is None:
+        sup_upd = sup_upd.replace(tzinfo=UTC)
+    current_world_baselines = [
+        b
+        for b in baselines
+        if epoch == 1
+        or (
+            (
+                b.last_updated_at.replace(tzinfo=UTC)
+                if b.last_updated_at.tzinfo is None
+                else b.last_updated_at
+            )
+            >= sup_upd
+        )
+    ]
+    baseline_warm = any(b.sample_count >= 5 for b in current_world_baselines)
 
     cov = dict(binding.last_scan_coverage_json or {}) if binding else {}
     raw_ow = cov.get("open_world")
@@ -271,7 +352,7 @@ def get_experience_overview(
     raw_sig = ow.get("signals")
     sig: dict[str, Any] = raw_sig if isinstance(raw_sig, dict) else {}
 
-    # Real business events observed from MiniStore
+    # Real business events observed from MiniStore in active world epoch
     norm_events = list(
         db.scalars(
             select(NormalizedEvent)
@@ -284,7 +365,7 @@ def get_experience_overview(
         ).all()
     )
 
-    # Human-readable Guardian timeline from SupervisorActivity + CaseEvent
+    # Human-readable Guardian timeline scoped strictly to active world epoch
     activities = list(
         db.scalars(
             select(SupervisorActivity)
@@ -296,13 +377,20 @@ def get_experience_overview(
             .limit(25)
         ).all()
     )
-    case_events = list(
-        db.scalars(
-            select(CaseEvent)
-            .where(CaseEvent.session_id == sid)
-            .order_by(CaseEvent.created_at.desc())
-            .limit(25)
-        ).all()
+    case_events = (
+        list(
+            db.scalars(
+                select(CaseEvent)
+                .where(
+                    CaseEvent.session_id == sid,
+                    CaseEvent.case_id.in_(epoch_case_ids),
+                )
+                .order_by(CaseEvent.created_at.desc())
+                .limit(25)
+            ).all()
+        )
+        if epoch_case_ids
+        else []
     )
 
     timeline_items: list[dict[str, Any]] = []
@@ -316,7 +404,7 @@ def get_experience_overview(
                 "case_id": act.case_id,
                 "job_id": act.job_id,
                 "timestamp": act.created_at.isoformat(),
-                "technical_trace": act.metadata_json or {},
+                "technical_trace": _scrub_sensitive_trace(act.metadata_json or {}),
             }
         )
     for cev in case_events:
@@ -335,7 +423,7 @@ def get_experience_overview(
                     "case_id": cev.case_id,
                     "job_id": (cev.payload_json or {}).get("supervisor_job_id"),
                     "timestamp": cev.created_at.isoformat(),
-                    "technical_trace": cev.payload_json or {},
+                    "technical_trace": _scrub_sensitive_trace(cev.payload_json or {}),
                 }
             )
     timeline_items.sort(key=lambda x: str(x["timestamp"]), reverse=True)
@@ -351,10 +439,28 @@ def get_experience_overview(
             .limit(15)
         ).all()
     )
+    unresolved_guards = int(
+        db.scalar(
+            select(func.count(RecoveryCommand.id)).where(
+                RecoveryCommand.session_id == sid,
+                or_(
+                    RecoveryCommand.state.in_(["EXECUTING", "UNKNOWN_OUTCOME"]),
+                    and_(
+                        RecoveryCommand.state == "MANUAL_REVIEW",
+                        RecoveryCommand.execution_certainty.in_(
+                            ["UNKNOWN", "COMMAND_EXECUTION_UNKNOWN"]
+                        ),
+                        RecoveryCommand.uncertainty_resolved_at.is_(None),
+                    ),
+                ),
+            )
+        )
+        or 0
+    )
 
     # Derive truthful Guardian visual state (NEVER fake "Monitoring" when disconnected!)
     worker_ok = bool(worker_health.get("worker_healthy", False))
-    conn_status = binding.connectivity_status if binding else "UNCONFIGURED"
+    conn_status = _effective_connectivity_status(binding)
     if not worker_ok and conn_status != "CONNECTED":
         guardian_visual_state = "DISCONNECTED"
     elif pending_props:
@@ -368,20 +474,41 @@ def get_experience_overview(
     else:
         guardian_visual_state = "MONITORING"
 
-    total_cases = int(db.scalar(select(func.count(Case.id)).where(Case.session_id == sid)) or 0)
-    waiting_approval_cases = int(
-        db.scalar(
-            select(func.count(Case.id)).where(
-                Case.session_id == sid,
-                Case.state == CaseState.WAITING_APPROVAL.value,
+    total_cases = (
+        int(
+            db.scalar(
+                select(func.count(Case.id)).where(
+                    Case.session_id == sid,
+                    Case.id.in_(epoch_case_ids),
+                )
             )
+            or 0
         )
-        or 0
+        if epoch_case_ids
+        else 0
+    )
+    waiting_approval_cases = (
+        int(
+            db.scalar(
+                select(func.count(Case.id)).where(
+                    Case.session_id == sid,
+                    Case.id.in_(epoch_case_ids),
+                    Case.state == CaseState.WAITING_APPROVAL.value,
+                )
+            )
+            or 0
+        )
+        if epoch_case_ids
+        else 0
     )
 
     return {
         "session_id": sid,
         "world_epoch": epoch,
+        "sandbox_isolation_mode": _sandbox_isolation_mode(
+            binding.commerce_session_id if binding else settings.commerce_session_id
+        ),
+        "unresolved_uncertainty_guards": unresolved_guards,
         "updated_at": datetime.now(UTC).isoformat(),
         "guardian": {
             "visual_state": guardian_visual_state,
@@ -531,12 +658,71 @@ def reset_experience_session(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Increment world_epoch strictly for the caller's session without touching other sessions."""
+    """Increment world_epoch strictly for the caller's session without touching other sessions.
+
+    Prompt 14.7 Fix 4:
+    - Supersedes/expires old active ActionProposals from prior epochs so they cannot execute.
+    - Cancels queued SupervisorJobs from prior epochs so stale workers cannot mutate the new world.
+    - Preserves unresolved uncertain RecoveryCommand mutation guards intact!
+    """
     sid = current_session.id
     sup_state = ensure_supervisor_state(db, sid)
+    prev_epoch = sup_state.world_epoch
+    now = datetime.now(UTC)
+
+    # Expire old PROPOSED ActionProposals belonging to this session before advancing epoch
+    old_props = list(
+        db.scalars(
+            select(ActionProposal).where(
+                ActionProposal.session_id == sid,
+                ActionProposal.status == ActionProposalStatus.PROPOSED.value,
+            )
+        ).all()
+    )
+    expired_proposals = 0
+    for prop in old_props:
+        prop.status = ActionProposalStatus.CANCELLED.value
+        expired_proposals += 1
+
+    # Cancel stale QUEUED SupervisorJobs from previous world epoch
+    old_jobs = list(
+        db.scalars(
+            select(SupervisorJob).where(
+                SupervisorJob.session_id == sid,
+                SupervisorJob.world_epoch <= prev_epoch,
+                SupervisorJob.status == "QUEUED",
+            )
+        ).all()
+    )
+    cancelled_jobs = 0
+    for j in old_jobs:
+        j.status = "CANCELLED"
+        j.updated_at = now
+        cancelled_jobs += 1
+
+    # Count unresolved uncertain RecoveryCommand guards (NEVER release on dashboard reset!)
+    unresolved_guards = int(
+        db.scalar(
+            select(func.count(RecoveryCommand.id)).where(
+                RecoveryCommand.session_id == sid,
+                or_(
+                    RecoveryCommand.state.in_(["EXECUTING", "UNKNOWN_OUTCOME"]),
+                    and_(
+                        RecoveryCommand.state == "MANUAL_REVIEW",
+                        RecoveryCommand.execution_certainty.in_(
+                            ["UNKNOWN", "COMMAND_EXECUTION_UNKNOWN"]
+                        ),
+                        RecoveryCommand.uncertainty_resolved_at.is_(None),
+                    ),
+                ),
+            )
+        )
+        or 0
+    )
+
     sup_state.world_epoch += 1
     sup_state.status = "MONITORING"
-    sup_state.updated_at = datetime.now(UTC)
+    sup_state.updated_at = now
 
     settings = get_settings()
     binding_id: str | None = None
@@ -557,5 +743,8 @@ def reset_experience_session(
         "session_id": sid,
         "world_epoch": sup_state.world_epoch,
         "binding_id": binding_id,
+        "expired_proposals_count": expired_proposals,
+        "cancelled_jobs_count": cancelled_jobs,
+        "unresolved_guard_count": unresolved_guards,
         "status": "RESET_COMPLETE",
     }

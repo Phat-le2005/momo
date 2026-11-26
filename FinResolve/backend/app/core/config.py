@@ -118,6 +118,7 @@ class Settings(BaseSettings):
     commerce_connector_timeout_seconds: float = Field(default=5.0, gt=0.1, le=60.0)
     commerce_connector_id: str = "default_ministore"
     commerce_allowed_hosts: str = "localhost,127.0.0.1,commerce-api"
+    commerce_public_storefront_url: str = "http://localhost:3100"
     autonomous_recovery_enabled: bool = True
     commerce_write_key: SecretStr = SecretStr("")
     command_auth_signing_secret: SecretStr = SecretStr("")
