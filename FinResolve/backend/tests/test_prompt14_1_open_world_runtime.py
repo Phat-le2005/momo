@@ -90,9 +90,14 @@ def test_monitor_scan_automatically_detects_novel_anomaly_and_verifies_sustained
                 },
             )
         if path == "/api/v1/service/telemetry":
+            win_start = telem_state.get("window_start") or "2026-11-26T00:00:00+00:00"
+            win_end = telem_state.get("window_end") or "2026-11-26T00:01:00+00:00"
             win = {
                 "window_id": telem_state["window_id"],
                 "window_seconds": 60,
+                "window_start": win_start,
+                "window_end": win_end,
+                "is_complete": True,
                 "has_samples": telem_state["request_count"] > 0,
                 "truncated": telem_state["truncated"],
                 "last_sample_age_ms": telem_state["last_sample_age_ms"],
@@ -110,7 +115,12 @@ def test_monitor_scan_automatically_detects_novel_anomaly_and_verifies_sustained
             return httpx.Response(
                 200,
                 json={
-                    "windows": {"10s": win, "60s": win, "300s": win},
+                    "windows": {
+                        "10s": win,
+                        "60s": win,
+                        "300s": win,
+                        "completed_fixed_60s": win,
+                    },
                     "measured_from_real_requests": True,
                 },
             )
@@ -118,9 +128,14 @@ def test_monitor_scan_automatically_detects_novel_anomaly_and_verifies_sustained
 
     transport = httpx.MockTransport(_handler)
 
-    # 1. Establish normal baseline across 5 distinct normal windows -> ZERO Cases!
+    # 1. Establish normal baseline across 5 distinct completed windows -> ZERO Cases!
+    from datetime import UTC, datetime, timedelta
+
+    base_t0 = datetime(2026, 11, 26, 0, 0, 0, tzinfo=UTC)
     for i in range(5):
-        telem_state["window_id"] = f"W60:WARM:{i}"
+        telem_state["window_id"] = f"FIXED60:WARM:{i}"
+        telem_state["window_start"] = (base_t0 + timedelta(minutes=i)).isoformat()
+        telem_state["window_end"] = (base_t0 + timedelta(minutes=i + 1)).isoformat()
         telem_state["p95"] = 34.0 + float(i % 2)
         telem_state["error_rate"] = 0.0
         summary = run_binding_scan(
@@ -139,8 +154,10 @@ def test_monitor_scan_automatically_detects_novel_anomaly_and_verifies_sustained
     assert len(obs_rows) >= 5
     assert binding.last_scan_coverage_json.get("open_world", {}).get("telemetry_available") is True
 
-    # 2. Introduce novel operational degradation in a new window (latency 650ms + 35% error rate!)
-    telem_state["window_id"] = "W60:DEG:1"
+    # 2. Introduce novel operational degradation in a new completed window!
+    telem_state["window_id"] = "FIXED60:DEG:1"
+    telem_state["window_start"] = (base_t0 + timedelta(minutes=5)).isoformat()
+    telem_state["window_end"] = (base_t0 + timedelta(minutes=6)).isoformat()
     telem_state["p95"] = 650.0
     telem_state["error_rate"] = 0.35
     degraded_summary = run_binding_scan(
@@ -221,6 +238,8 @@ def test_monitor_scan_automatically_detects_novel_anomaly_and_verifies_sustained
 
     # 3c. First valid healthy window -> streak = 1/2
     telem_state["window_id"] = "W60:HEALTHY:1"
+    telem_state["window_start"] = (base_t0 + timedelta(minutes=6)).isoformat()
+    telem_state["window_end"] = (base_t0 + timedelta(minutes=7)).isoformat()
     rec1 = run_binding_scan(
         db,
         binding=binding,
@@ -244,8 +263,10 @@ def test_monitor_scan_automatically_detects_novel_anomaly_and_verifies_sustained
     db.refresh(anom)
     assert anom.lifecycle_state != "RECOVERED"
 
-    # 3e. Second DISTINCT valid healthy window -> sustained VERIFIED_RECOVERY!
+    # 3e. Second DISTINCT non-overlapping valid healthy window -> sustained VERIFIED_RECOVERY!
     telem_state["window_id"] = "W60:HEALTHY:2"
+    telem_state["window_start"] = (base_t0 + timedelta(minutes=7)).isoformat()
+    telem_state["window_end"] = (base_t0 + timedelta(minutes=8)).isoformat()
     rec2 = run_binding_scan(
         db,
         binding=binding,

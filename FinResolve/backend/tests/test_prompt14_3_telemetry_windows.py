@@ -299,3 +299,97 @@ def test_prompt14_4_baseline_window_dedupe_and_incomplete_window_rejection(
     rec_inc, det_inc = verify_anomaly_recovery(db, obs=obs, connector=conn_inc)
     assert rec_inc is False
     assert "incomplete" in det_inc
+
+
+def test_prompt14_5_rolling_windows_and_missing_completeness_never_update_baseline(
+    db: Session, active_session: dict[str, str]
+) -> None:
+    """Prompt 14.5 Fix 4: Rolling windows & missing completeness metadata MUST NOT learn."""
+    from sqlalchemy import select
+
+    from app.models.open_world import BehavioralBaseline
+    from app.monitoring.service import run_binding_scan
+
+    sid = active_session["id"]
+    t0 = datetime.now(UTC) - timedelta(minutes=2)
+
+    binding = CommerceSourceBinding(
+        id=f"BIND-ROLL-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        world_epoch=1,
+        base_url="http://127.0.0.1:8100",
+        merchant_id="MERCHANT_FINSHOP_01",
+        commerce_session_id="CSESS_FINSHOP_DEFAULT_01",
+        commerce_world_epoch=1,
+        is_enabled=True,
+    )
+    db.add(binding)
+    db.commit()
+
+    telem_payload: dict[str, Any] = {
+        "windows": {
+            "10s": {
+                "window_id": "W10:10:1",
+                "has_samples": True,
+                "request_count": 10,
+                "rps": 1.0,
+                "latency_ms": {"p95": 40.0},
+                "error_rate": 0.0,
+            },
+            "60s": {
+                "window_id": "W60:20:1",
+                "has_samples": True,
+                "request_count": 20,
+                "rps": 0.33,
+                "latency_ms": {"p95": 40.0},
+                "error_rate": 0.0,
+            },
+        },
+        "measured_from_real_requests": True,
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        if p == "/api/v1/service/events":
+            return httpx.Response(200, json={"events": [], "has_more": False})
+        if p in (
+            "/api/v1/service/orders",
+            "/api/v1/service/payments",
+            "/api/v1/service/refunds",
+            "/api/v1/service/inventory",
+        ):
+            return httpx.Response(200, json=[])
+        if p == "/api/v1/service/metrics":
+            return httpx.Response(
+                200,
+                json={
+                    "outbox_lag_count": 0,
+                    "unsynced_payments": 0,
+                    "total_orders": 0,
+                    "total_payments": 0,
+                    "pending_refunds": 0,
+                },
+            )
+        if p == "/api/v1/service/telemetry":
+            return httpx.Response(200, json=telem_payload)
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_handler)
+
+    # 1. Rolling-only telemetry -> ZERO baseline rows created!
+    run_binding_scan(db, binding=binding, transport=transport, auto_create_cases=False)
+    assert db.scalar(select(BehavioralBaseline).where(BehavioralBaseline.session_id == sid)) is None
+
+    # 2. completed_fixed_60s MISSING is_complete metadata -> fails closed, ZERO baseline rows!
+    telem_payload["windows"]["completed_fixed_60s"] = {
+        "window_id": "FIXED60:3000",
+        "window_start": t0.isoformat(),
+        "window_end": (t0 + timedelta(seconds=60)).isoformat(),
+        "has_samples": True,
+        "request_count": 15,
+        "rps": 0.25,
+        "latency_ms": {"p95": 40.0},
+        "error_rate": 0.0,
+    }
+    run_binding_scan(db, binding=binding, transport=transport, auto_create_cases=False)
+    assert db.scalar(select(BehavioralBaseline).where(BehavioralBaseline.session_id == sid)) is None

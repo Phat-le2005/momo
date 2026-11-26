@@ -1612,47 +1612,61 @@ def run_binding_scan(
             windows_all = telem_data.get("windows") or {}
             w_comp_fixed = windows_all.get("completed_fixed_60s") or {}
             w_fixed = windows_all.get("fixed_60s") or {}
-            w60 = windows_all.get("60s") or {}
-            w10 = windows_all.get("10s") or {}
 
-            # Prompt 14.4 Fix 4: Use completed non-overlapping window for baseline learning!
+            # Prompt 14.5 Fix 4: NEVER fall back to rolling 10s/60s windows for baseline learning!
+            # Require explicit completed fixed window with is_complete=True and valid boundaries.
             if w_comp_fixed:
                 eval_win = w_comp_fixed
             elif w_fixed and w_fixed.get("is_complete") is True:
                 eval_win = w_fixed
             else:
-                eval_win = w10 if int(w10.get("request_count") or 0) > 0 else w60
+                eval_win = {}
 
             eval_win_id = str(eval_win.get("window_id") or "").strip()
             eval_win_start = _parse_iso_utc(eval_win.get("window_start"))
             eval_win_end = _parse_iso_utc(eval_win.get("window_end"))
-            eval_is_complete = eval_win.get("is_complete", True) is not False
+            # Missing completeness metadata MUST fail closed!
+            eval_is_complete = eval_win.get("is_complete") is True
             has_samples = bool(
                 eval_win.get("has_samples", int(eval_win.get("request_count") or 0) > 0)
             )
             is_truncated = bool(eval_win.get("truncated", False))
-            orders_completed_60s = _count_records_in_interval(
-                orders,
-                now=obs_at,
-                window_seconds=60,
-                allowed_statuses=frozenset({"CONFIRMED", "PROCESSING", "SHIPPED", "DELIVERED"}),
-                timestamp_fields=("updated_at", "created_at"),
+            last_age_ms = eval_win.get("last_sample_age_ms")
+            is_stale = isinstance(last_age_ms, (int, float)) and float(last_age_ms) > 120_000.0
+            valid_bounds = (
+                eval_win_start is not None
+                and eval_win_end is not None
+                and eval_win_end > eval_win_start
             )
-            refunds_completed_60s = _count_records_in_interval(
-                refunds,
-                now=obs_at,
-                window_seconds=60,
-                allowed_statuses=frozenset({"SUCCEEDED", "COMPLETED"}),
-                timestamp_fields=("completed_at", "updated_at", "created_at"),
-            )
+
+            # Count authoritative business transition events strictly within [win_start, win_end)
+            # (never count unrelated order updated_at mutations as newly completed transactions!)
+            orders_completed_interval = 0.0
+            refunds_completed_interval = 0.0
+            if valid_bounds and eval_win_start is not None and eval_win_end is not None:
+                seen_order_confirm_ids: set[str] = set()
+                seen_refund_comp_ids: set[str] = set()
+                for rev in remote_events:
+                    ev_ts = _parse_iso_utc(rev.get("occurred_at") or rev.get("created_at"))
+                    if ev_ts is None or not (eval_win_start <= ev_ts < eval_win_end):
+                        continue
+                    etype = str(rev.get("event_type") or "").upper()
+                    ev_key = str(rev.get("order_id") or rev.get("event_id") or "")
+                    if etype in ("ORDER_CONFIRMED", "PAYMENT_SYNCED_TO_ORDER") and ev_key:
+                        seen_order_confirm_ids.add(ev_key)
+                    elif etype in ("REFUND_SUCCEEDED", "REFUND_COMPLETED") and ev_key:
+                        seen_refund_comp_ids.add(str(rev.get("event_id") or ev_key))
+                orders_completed_interval = float(len(seen_order_confirm_ids))
+                refunds_completed_interval = float(len(seen_refund_comp_ids))
+
             sig_vec = TelemetrySignalVector(
                 rps=float(eval_win.get("rps") or 0.0),
                 p95_latency_ms=float((eval_win.get("latency_ms") or {}).get("p95") or 0.0),
                 error_rate=float(eval_win.get("error_rate") or 0.0),
                 outbox_lag=float(metrics.outbox_lag_count),
                 unsynced_payments=float(metrics.unsynced_payments),
-                order_throughput=orders_completed_60s,
-                refund_count=refunds_completed_60s,
+                order_throughput=orders_completed_interval,
+                refund_count=refunds_completed_interval,
             )
 
             # Deduplicate baseline learning across scans AND Monitor restarts!
@@ -1668,9 +1682,11 @@ def run_binding_scan(
             )
             can_learn_baseline = (
                 bool(eval_win_id)
+                and valid_bounds
                 and eval_is_complete
                 and has_samples
                 and not is_truncated
+                and not is_stale
                 and not already_learned
                 and not overlapping_learned
             )
