@@ -2299,6 +2299,11 @@ def _run_commerce_post_investigation_recovery(
     if obs is None or obs.lifecycle_state == "RECOVERED":
         return None
 
+    # Prompt 14.8 Fix 2: Fence stale running workers against dispatching mutations after Reset!
+    sup_state_check = ensure_supervisor_state(db, session_id)
+    if sup_state_check.world_epoch != obs.world_epoch:
+        return "STALE_WORLD_EPOCH_FENCED"
+
     # Prompt 14.4 Fix 2: Query strictly by EXACT investigation_run_id + PROPOSED under row lock!
     # NEVER select a proposal by creation timestamp alone or with NULL investigation_run_id!
     agent_action_prop = db.scalar(

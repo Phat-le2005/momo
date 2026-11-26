@@ -447,18 +447,24 @@ def execute_and_verify_commerce_recovery(
             idempotent_replay=True,
         )
 
-    # 1b (Prompt 14.3 Fix 5 + Prompt 14.4 Fix 5): Atomic PostgreSQL advisory lock per target
-    # resource prevents concurrent check-then-insert races across competing workers, AND
-    # retains the mutation guard across MANUAL_REVIEW while execution_certainty is uncertain!
+    # 1b (Prompt 14.8 Fix 1): Atomic PostgreSQL advisory lock keyed on CANONICAL BUSINESS RESOURCE
+    # identity (merchant, commerce_session, world_epoch, order/payment) so two FinResolve
+    # workspaces can NEVER issue conflicting mutations against the same Commerce entity, AND
+    # uncertain execution guards survive workspace ownership changes and dashboard resets!
     from sqlalchemy import and_, or_
     from sqlalchemy import text as sa_text
 
-    target_lock_key = f"rcmd:{binding.id}:{obs.affected_order_id or obs.id}"
+    canonical_target = obs.affected_order_id or obs.affected_payment_id or obs.id
+    target_lock_key = (
+        f"biz:{binding.merchant_id}:{binding.commerce_session_id}:"
+        f"{binding.commerce_world_epoch}:{canonical_target}"
+    )
     db.execute(sa_text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": target_lock_key})
 
     conflict_scope: list[Any] = [
-        RecoveryCommand.session_id == binding.session_id,
-        RecoveryCommand.source_binding_id == binding.id,
+        RecoveryCommand.merchant_id == binding.merchant_id,
+        RecoveryCommand.commerce_session_id == binding.commerce_session_id,
+        RecoveryCommand.world_epoch == binding.commerce_world_epoch,
         or_(
             RecoveryCommand.state.in_(["EXECUTING", "UNKNOWN_OUTCOME", "VERIFYING"]),
             and_(
@@ -470,6 +476,8 @@ def execute_and_verify_commerce_recovery(
     ]
     if obs.affected_order_id:
         conflict_scope.append(RecoveryCommand.target_order_id == obs.affected_order_id)
+    elif obs.affected_payment_id:
+        conflict_scope.append(RecoveryCommand.target_payment_id == obs.affected_payment_id)
     else:
         conflict_scope.append(RecoveryCommand.anomaly_id == obs.id)
     in_flight = db.scalar(select(RecoveryCommand).where(*conflict_scope).limit(1))

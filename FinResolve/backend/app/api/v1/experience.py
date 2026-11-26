@@ -16,9 +16,10 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -31,7 +32,12 @@ from app.models.enums import ActionProposalStatus, CaseState, SessionStatus
 from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
 from app.models.open_world import BehavioralBaseline, RecoveryCommand
 from app.models.session import DemoSession
-from app.models.supervisor import NormalizedEvent, SupervisorActivity, SupervisorJob
+from app.models.supervisor import (
+    NormalizedEvent,
+    SupervisorActivity,
+    SupervisorJob,
+    SupervisorState,
+)
 from app.monitoring.service import ensure_commerce_binding, run_binding_scan
 from app.supervisor.service import ensure_supervisor_state, get_worker_health
 
@@ -118,6 +124,64 @@ def _sandbox_isolation_mode(commerce_session_id: str) -> str:
     return "DEDICATED_SANDBOX"
 
 
+def _find_active_shared_sandbox_owner(
+    db: Session,
+    *,
+    merchant_id: str,
+    commerce_session_id: str,
+    commerce_world_epoch: int,
+    exclude_session_id: str | None = None,
+) -> CommerceSourceBinding | None:
+    """Return another active non-expired workspace holding control of a shared sandbox."""
+    now = datetime.now(UTC)
+    stmt = (
+        select(CommerceSourceBinding)
+        .join(DemoSession, CommerceSourceBinding.session_id == DemoSession.id)
+        .where(
+            CommerceSourceBinding.merchant_id == merchant_id,
+            CommerceSourceBinding.commerce_session_id == commerce_session_id,
+            CommerceSourceBinding.commerce_world_epoch == commerce_world_epoch,
+            CommerceSourceBinding.is_enabled.is_(True),
+            DemoSession.status == SessionStatus.ACTIVE.value,
+            DemoSession.expires_at > now,
+        )
+        .order_by(CommerceSourceBinding.created_at.asc())
+    )
+    if exclude_session_id:
+        stmt = stmt.where(CommerceSourceBinding.session_id != exclude_session_id)
+    return db.scalar(stmt.limit(1))
+
+
+def _count_unresolved_guards_for_scope(
+    db: Session,
+    *,
+    merchant_id: str,
+    commerce_session_id: str,
+    commerce_world_epoch: int,
+) -> int:
+    """Count unresolved uncertain RecoveryCommands on the canonical Commerce business scope."""
+    return int(
+        db.scalar(
+            select(func.count(RecoveryCommand.id)).where(
+                RecoveryCommand.merchant_id == merchant_id,
+                RecoveryCommand.commerce_session_id == commerce_session_id,
+                RecoveryCommand.world_epoch == commerce_world_epoch,
+                or_(
+                    RecoveryCommand.state.in_(["EXECUTING", "UNKNOWN_OUTCOME"]),
+                    and_(
+                        RecoveryCommand.state == "MANUAL_REVIEW",
+                        RecoveryCommand.execution_certainty.in_(
+                            ["UNKNOWN", "COMMAND_EXECUTION_UNKNOWN"]
+                        ),
+                        RecoveryCommand.uncertainty_resolved_at.is_(None),
+                    ),
+                ),
+            )
+        )
+        or 0
+    )
+
+
 def _resolve_existing_active_session(
     db: Session,
     session_token: str | None,
@@ -173,26 +237,55 @@ def bootstrap_experience(
 
     sup_state = ensure_supervisor_state(db, sess.id)
     binding: CommerceSourceBinding | None = None
+    workspace_role = "CONTROLLER"
+    eff_csess = settings.commerce_session_id
+    eff_merchant = settings.commerce_merchant_id
+    eff_epoch = settings.commerce_world_epoch
+
     if settings.commerce_service_base_url.strip():
-        binding = ensure_commerce_binding(
-            db,
-            session_id=sess.id,
-            connector_id=settings.commerce_connector_id or "default_ministore",
-            merchant_id=settings.commerce_merchant_id,
-            commerce_session_id=settings.commerce_session_id,
-            commerce_world_epoch=settings.commerce_world_epoch,
-            is_enabled=True,
+        # Serialize shared sandbox ownership claims via PostgreSQL advisory transaction lock
+        owner_lock_key = f"sandbox_owner:{eff_merchant}:{eff_csess}:{eff_epoch}"
+        db.execute(sa_text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": owner_lock_key})
+
+        is_shared = _sandbox_isolation_mode(eff_csess) == "SHARED_DEMO_SANDBOX"
+        other_owner = (
+            _find_active_shared_sandbox_owner(
+                db,
+                merchant_id=eff_merchant,
+                commerce_session_id=eff_csess,
+                commerce_world_epoch=eff_epoch,
+                exclude_session_id=sess.id,
+            )
+            if is_shared
+            else None
         )
+        if other_owner is not None:
+            # Another active workspace already controls the shared sandbox -> READ_ONLY_PREVIEW!
+            workspace_role = "READ_ONLY_PREVIEW"
+            binding = None
+        else:
+            binding = ensure_commerce_binding(
+                db,
+                session_id=sess.id,
+                connector_id=settings.commerce_connector_id or "default_ministore",
+                merchant_id=eff_merchant,
+                commerce_session_id=eff_csess,
+                commerce_world_epoch=eff_epoch,
+                is_enabled=True,
+            )
 
     db.commit()
     worker_health = get_worker_health(db)
     worker_ok = bool(worker_health.get("worker_healthy", False))
-    conn_status = _effective_connectivity_status(binding)
+    conn_status = (
+        "READ_ONLY_PREVIEW"
+        if workspace_role == "READ_ONLY_PREVIEW"
+        else _effective_connectivity_status(binding)
+    )
     overall = "READY" if (worker_ok and conn_status == "CONNECTED") else "DEGRADED"
 
     # Configurable public browser-visible MiniStore URL (never internal docker hostname)
     storefront_url = settings.commerce_public_storefront_url.strip() or "http://localhost:3100"
-    eff_csess = binding.commerce_session_id if binding else settings.commerce_session_id
 
     return ExperienceBootstrapResponse(
         status=overall,
@@ -203,15 +296,15 @@ def bootstrap_experience(
             "status": sess.status,
             "expires_at": sess.expires_at.isoformat(),
             "world_epoch": sup_state.world_epoch,
+            "workspace_role": workspace_role,
         },
         sandbox={
             "environment_name": "FinShop LIVE Sandbox (MOCK)",
             "sandbox_isolation_mode": _sandbox_isolation_mode(eff_csess),
-            "merchant_id": binding.merchant_id if binding else settings.commerce_merchant_id,
+            "workspace_role": workspace_role,
+            "merchant_id": binding.merchant_id if binding else eff_merchant,
             "commerce_session_id": eff_csess,
-            "commerce_world_epoch": (
-                binding.commerce_world_epoch if binding else settings.commerce_world_epoch
-            ),
+            "commerce_world_epoch": binding.commerce_world_epoch if binding else eff_epoch,
             "binding_id": binding.id if binding else None,
             "connectivity_status": conn_status,
             "storefront_url": storefront_url,
@@ -248,10 +341,72 @@ def get_experience_overview(
         .where(
             CommerceSourceBinding.session_id == sid,
             CommerceSourceBinding.world_epoch == epoch,
+            CommerceSourceBinding.is_enabled.is_(True),
         )
         .order_by(CommerceSourceBinding.created_at.desc())
         .limit(1)
     )
+    is_read_only_preview = (
+        binding is None
+        and bool(settings.commerce_service_base_url.strip())
+        and _sandbox_isolation_mode(settings.commerce_session_id) == "SHARED_DEMO_SANDBOX"
+        and _find_active_shared_sandbox_owner(
+            db,
+            merchant_id=settings.commerce_merchant_id,
+            commerce_session_id=settings.commerce_session_id,
+            commerce_world_epoch=settings.commerce_world_epoch,
+            exclude_session_id=sid,
+        )
+        is not None
+    )
+    if is_read_only_preview:
+        return {
+            "session_id": sid,
+            "world_epoch": epoch,
+            "workspace_role": "READ_ONLY_PREVIEW",
+            "sandbox_isolation_mode": "SHARED_DEMO_SANDBOX",
+            "unresolved_uncertainty_guards": 0,
+            "updated_at": datetime.now(UTC).isoformat(),
+            "guardian": {
+                "visual_state": "DISCONNECTED",
+                "supervisor_status": "READ_ONLY_PREVIEW",
+                "worker_healthy": bool(worker_health.get("worker_healthy", False)),
+                "connectivity_status": "READ_ONLY_PREVIEW",
+                "model_mode": settings.model_mode.value,
+                "model_name": settings.model_name or "deterministic-demo",
+                "queued_jobs": 0,
+                "last_scan_at": None,
+            },
+            "kpis": {
+                "orders_observed": None,
+                "payments_observed": None,
+                "active_anomalies": 0,
+                "verified_recoveries": 0,
+                "pending_approvals": 0,
+                "total_anomalies_detected": 0,
+                "total_cases": 0,
+            },
+            "business_health": {
+                "telemetry_available": False,
+                "has_samples": False,
+                "window_id": None,
+                "rps": None,
+                "p95_latency_ms": None,
+                "error_rate": None,
+                "outbox_lag": None,
+                "unsynced_payments": None,
+                "baseline_status": "WARMING_UP",
+                "baseline_message_vi": (
+                    "Sandbox dùng chung đang được điều khiển bởi phiên khác (chế độ chỉ xem)."
+                ),
+                "baselines": [],
+            },
+            "anomalies": [],
+            "approvals": [],
+            "recovery_commands": [],
+            "recent_business_events": [],
+            "timeline": [],
+        }
 
     anomalies = list(
         db.scalars(
@@ -636,6 +791,22 @@ def trigger_experience_scan(
         )
     )
     if binding is None:
+        settings = get_settings()
+        if (
+            settings.commerce_service_base_url.strip()
+            and _find_active_shared_sandbox_owner(
+                db,
+                merchant_id=settings.commerce_merchant_id,
+                commerce_session_id=settings.commerce_session_id,
+                commerce_world_epoch=settings.commerce_world_epoch,
+                exclude_session_id=sid,
+            )
+            is not None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="SHARED_SANDBOX_CONTROLLED_BY_ANOTHER_WORKSPACE",
+            )
         return {"scanned": False, "connectivity_status": "UNCONFIGURED"}
 
     summary = run_binding_scan(db, binding=binding, auto_create_cases=True)
@@ -658,24 +829,53 @@ def reset_experience_session(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Increment world_epoch strictly for the caller's session without touching other sessions.
+    """Increment dashboard world_epoch atomically under row lock without touching other sessions.
 
-    Prompt 14.7 Fix 4:
-    - Supersedes/expires old active ActionProposals from prior epochs so they cannot execute.
-    - Cancels queued SupervisorJobs from prior epochs so stale workers cannot mutate the new world.
+    Prompt 14.8 Fix 2:
+    - Acquires SELECT ... FOR UPDATE on SupervisorState so concurrent resets never lose increments.
+    - Cancels old PROPOSED and APPROVED (not yet executed) ActionProposals from prior epochs.
+    - Cancels stale QUEUED SupervisorJobs from prior epochs.
     - Preserves unresolved uncertain RecoveryCommand mutation guards intact!
+    - Never mutates the external Commerce world epoch.
     """
     sid = current_session.id
-    sup_state = ensure_supervisor_state(db, sid)
+    settings = get_settings()
+
+    # Enforce shared sandbox ownership on reset when commerce is configured
+    if settings.commerce_service_base_url.strip():
+        other_owner = _find_active_shared_sandbox_owner(
+            db,
+            merchant_id=settings.commerce_merchant_id,
+            commerce_session_id=settings.commerce_session_id,
+            commerce_world_epoch=settings.commerce_world_epoch,
+            exclude_session_id=sid,
+        )
+        if other_owner is not None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="SHARED_SANDBOX_CONTROLLED_BY_ANOTHER_WORKSPACE",
+            )
+
+    ensure_supervisor_state(db, sid)
+    sup_state = db.scalar(
+        select(SupervisorState).where(SupervisorState.session_id == sid).with_for_update()
+    )
+    if sup_state is None:
+        sup_state = ensure_supervisor_state(db, sid)
     prev_epoch = sup_state.world_epoch
     now = datetime.now(UTC)
 
-    # Expire old PROPOSED ActionProposals belonging to this session before advancing epoch
+    # Cancel old PROPOSED and APPROVED (undispatched) ActionProposals before advancing epoch
     old_props = list(
         db.scalars(
             select(ActionProposal).where(
                 ActionProposal.session_id == sid,
-                ActionProposal.status == ActionProposalStatus.PROPOSED.value,
+                ActionProposal.status.in_(
+                    [
+                        ActionProposalStatus.PROPOSED.value,
+                        ActionProposalStatus.APPROVED.value,
+                    ]
+                ),
             )
         ).all()
     )
@@ -701,30 +901,17 @@ def reset_experience_session(
         cancelled_jobs += 1
 
     # Count unresolved uncertain RecoveryCommand guards (NEVER release on dashboard reset!)
-    unresolved_guards = int(
-        db.scalar(
-            select(func.count(RecoveryCommand.id)).where(
-                RecoveryCommand.session_id == sid,
-                or_(
-                    RecoveryCommand.state.in_(["EXECUTING", "UNKNOWN_OUTCOME"]),
-                    and_(
-                        RecoveryCommand.state == "MANUAL_REVIEW",
-                        RecoveryCommand.execution_certainty.in_(
-                            ["UNKNOWN", "COMMAND_EXECUTION_UNKNOWN"]
-                        ),
-                        RecoveryCommand.uncertainty_resolved_at.is_(None),
-                    ),
-                ),
-            )
-        )
-        or 0
+    unresolved_guards = _count_unresolved_guards_for_scope(
+        db,
+        merchant_id=settings.commerce_merchant_id,
+        commerce_session_id=settings.commerce_session_id,
+        commerce_world_epoch=settings.commerce_world_epoch,
     )
 
     sup_state.world_epoch += 1
     sup_state.status = "MONITORING"
     sup_state.updated_at = now
 
-    settings = get_settings()
     binding_id: str | None = None
     if settings.commerce_service_base_url.strip():
         b = ensure_commerce_binding(
@@ -742,9 +929,52 @@ def reset_experience_session(
     return {
         "session_id": sid,
         "world_epoch": sup_state.world_epoch,
+        "dashboard_world_epoch": sup_state.world_epoch,
+        "commerce_world_epoch": settings.commerce_world_epoch,
         "binding_id": binding_id,
         "expired_proposals_count": expired_proposals,
         "cancelled_jobs_count": cancelled_jobs,
         "unresolved_guard_count": unresolved_guards,
         "status": "RESET_COMPLETE",
+    }
+
+
+@router.post(
+    "/release",
+    summary="Safely release shared sandbox control if no unresolved uncertain commands exist",
+)
+def release_experience_ownership(
+    current_session: DemoSession = Depends(get_current_session),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Release shared sandbox ownership ONLY when zero unresolved uncertain guards exist."""
+    sid = current_session.id
+    settings = get_settings()
+    unresolved = _count_unresolved_guards_for_scope(
+        db,
+        merchant_id=settings.commerce_merchant_id,
+        commerce_session_id=settings.commerce_session_id,
+        commerce_world_epoch=settings.commerce_world_epoch,
+    )
+    if unresolved > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="UNRESOLVED_UNCERTAINTY_GUARD_BLOCKS_RELEASE",
+        )
+    bindings = list(
+        db.scalars(
+            select(CommerceSourceBinding).where(
+                CommerceSourceBinding.session_id == sid,
+                CommerceSourceBinding.is_enabled.is_(True),
+            )
+        ).all()
+    )
+    for b in bindings:
+        b.is_enabled = False
+        b.updated_at = datetime.now(UTC)
+    db.commit()
+    return {
+        "session_id": sid,
+        "released_bindings": len(bindings),
+        "status": "OWNERSHIP_RELEASED",
     }
