@@ -2345,7 +2345,11 @@ def _run_commerce_post_investigation_recovery(
             if isinstance(raw_ev_refs, list) and len(raw_ev_refs) > 0
             else []
         )
-        raw_exp_ver = action_params.get("expected_version")
+        raw_exp_ver = (
+            action_params.get("expected_version")
+            if action_params.get("expected_version") is not None
+            else action_params.get("expected_order_version")
+        )
         prop_exp_ver: int | None = int(raw_exp_ver) if raw_exp_ver is not None else None
         prop_id = agent_action_prop.id
         # Do NOT silently substitute anomaly targets when Agent omitted required order_id

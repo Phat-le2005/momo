@@ -263,7 +263,7 @@ class BoundedAgentRuntime:
         adapter: ModelAdapter | None = None,
         max_steps: int = 6,
         max_replans: int = 2,
-        max_wall_time_seconds: float = 15.0,
+        max_wall_time_seconds: float = 45.0,
         token_budget: int | None = None,
         manage_transactions: bool = True,
         stale_investigation_timeout_seconds: int = 120,
@@ -1256,6 +1256,124 @@ class BoundedAgentRuntime:
             order_id = raw_order_id.strip()
             payment_id = raw_payment_id.strip()
 
+            # For real external COMMERCE_HTTP cases, validate authoritative MiniStore records
+            # observed via HTTP tools (rather than local SimOrder/SimPayment simulator tables).
+            if case.source_system == "COMMERCE_HTTP" and case.source_binding_id:
+                from app.models.monitoring import CommerceSourceBinding
+                from app.monitoring.service import build_connector_for_binding
+
+                binding = self._db.get(CommerceSourceBinding, case.source_binding_id)
+                http_order: dict[str, Any] | None = None
+                http_payment: dict[str, Any] | None = None
+                if binding is not None:
+                    try:
+                        conn = build_connector_for_binding(binding)
+                        http_order = conn.get_order(order_id)["data"]
+                        http_payment = conn.get_payment(payment_id)["data"]
+                    except Exception:  # noqa: BLE001
+                        http_order = None
+                        http_payment = None
+
+                http_prov_ok = (
+                    (order_id in observed_orders)
+                    or (payment_id in observed_payments)
+                    or any(
+                        t.status == "OK"
+                        and (
+                            t.args.get("order_id") == order_id
+                            or t.args.get("payment_id") == payment_id
+                        )
+                        for t in tool_observations
+                    )
+                )
+                http_verified = (
+                    http_prov_ok
+                    and isinstance(http_order, dict)
+                    and isinstance(http_payment, dict)
+                    and str(http_payment.get("order_id") or "") == order_id
+                    and str(http_payment.get("status") or "").upper() in ("SUCCEEDED", "SUCCESS")
+                    and int(http_payment.get("amount_vnd") or 0)
+                    == int(http_order.get("total_vnd") or -1)
+                    and http_order.get("version") is not None
+                )
+                if not http_verified or http_order is None or http_payment is None:
+                    risk = self._create_risk_signal(
+                        case=case,
+                        session_id=session_id,
+                        category=RiskCategory.UNVERIFIED_PAYMENT.value,
+                        level=RiskLevel.HIGH.value,
+                        response=RiskResponse.HOLD_ACTION.value,
+                        evidence_refs=fact_evidence_ids,
+                        details={
+                            "attempted_action": "ORDER_SYNC",
+                            "block_reason": "COMMERCE_HTTP_PAYMENT_NOT_VERIFIED",
+                            "order_id": order_id,
+                            "payment_id": payment_id,
+                        },
+                    )
+                    risk_signal_ids.append(risk.id)
+                    self._record_event(
+                        case=case,
+                        event_type="UNSAFE_PROPOSAL_BLOCKED",
+                        payload={
+                            "run_id": run_id,
+                            "attempted_action": "ORDER_SYNC",
+                            "reason": "COMMERCE_HTTP_PAYMENT_NOT_VERIFIED",
+                            "risk_signal_id": risk.id,
+                        },
+                    )
+                    case = self._safe_transition(
+                        case,
+                        CaseState.WAITING_EVIDENCE,
+                        reason="Chặn ORDER_SYNC: dữ liệu Commerce chưa xác nhận thanh toán.",
+                    )
+                    return case, "UNVERIFIED_PAYMENT_BLOCKED"
+
+                ord_ver = int(http_order["version"])
+                proposal = ActionProposal(
+                    id=f"PROP-{uuid.uuid4().hex[:10].upper()}",
+                    case_id=case.id,
+                    session_id=session_id,
+                    investigation_run_id=run_id,
+                    action_type=ActionType.ORDER_SYNC.value,
+                    params_json={
+                        "order_id": order_id,
+                        "payment_id": payment_id,
+                        "merchant_id": binding.merchant_id if binding else "",
+                        "amount": int(http_payment.get("amount_vnd") or 0),
+                        "currency": "VND",
+                        "expected_version": ord_ver,
+                        "expected_order_version": ord_ver,
+                    },
+                    evidence_refs=fact_evidence_ids,
+                    expected_version=case.version,
+                    risk_level=RiskLevel.LOW.value,
+                    status=ActionProposalStatus.PROPOSED.value,
+                    created_at=datetime.now(UTC),
+                )
+                self._db.add(proposal)
+                self._db.flush()
+                proposed_action_ids.append(proposal.id)
+                self._record_event(
+                    case=case,
+                    event_type="ACTION_PROPOSED",
+                    payload={
+                        "run_id": run_id,
+                        "proposal_id": proposal.id,
+                        "action_type": proposal.action_type,
+                        "params_json": proposal.params_json,
+                        "evidence_refs": proposal.evidence_refs,
+                        "status": proposal.status,
+                    },
+                )
+                case = self._safe_transition(
+                    case,
+                    CaseState.WAITING_APPROVAL,
+                    reason=decision_summary,
+                    extra_payload={"proposal_id": proposal.id, "action_type": proposal.action_type},
+                )
+                return case, "ACTION_PROPOSED"
+
             # Check authoritative evidence provenance: both order_id and payment_id must have
             # been observed in this investigation's tool reads!
             has_provenance = (order_id in observed_orders) and (payment_id in observed_payments)
@@ -1378,6 +1496,7 @@ class BoundedAgentRuntime:
                     "merchant_id": payment.merchant_id,
                     "amount": payment.amount,
                     "currency": payment.currency,
+                    "expected_version": order.version,
                     "expected_order_version": order.version,
                 },
                 evidence_refs=fact_evidence_ids,

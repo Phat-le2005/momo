@@ -53,13 +53,40 @@ All **5/5** GitHub Actions jobs passed:
 
 ---
 
-## 4. Final Readiness Decisions
+## 4. Real Live LLM Supervisor Validation Evidence (Section 7)
+
+Executed live against real Google Gemini API (`gemini-3.1-flash-lite`) + real MiniStore Uvicorn (`http://127.0.0.1:8100`) + real PostgreSQL 17 with **ZERO fallback** (`is_fallback: false`, `model_mode: "LLM_API"`):
+
+- **Model Mode & Adapter**: `LLM_API` / `LLMModelAdapter(gemini:gemini-3.1-flash-lite)` (`is_fallback: false`)
+- **Supervisor Job / Case / Investigation Run**: `JOB-LIVE-E5ACA5D6` / `CASE-LIVE-B6402D72` / `RUN-5291DFE013`
+- **Actual Tool Calls (over real TCP HTTP to MiniStore)**:
+  1. `get_order(ORD-6957BC9E85)` -> `OK` (`EVD-5B44AC4321`)
+  2. `get_payment_record(PAY-C0A2CF729C)` -> `OK` (`EVD-5C90FF8302`)
+- **Current-Run Agent Proposal**:
+  - `proposal_id`: `PROP-9A8D6483E4` (`investigation_run_id == RUN-5291DFE013`, `status: EXECUTED`)
+  - `action_type`: `ORDER_SYNC`
+  - `evidence_refs`: `["EVD-5B44AC4321", "EVD-5C90FF8302"]`
+  - `params`: `order_id=ORD-6957BC9E85`, `payment_id=PAY-C0A2CF729C`, `amount=274000`, `expected_version=1`
+- **Policy Decision & Signed Recovery Command**:
+  - `command_id`: `RCMD-70155E0E92` (`REQUEST_ORDER_SYNC`, `idempotency_key: AGT-ANOM-LIVE-71B898-OCC1-REQUEST_ORDER_SYNC`)
+  - `policy_decision`: `ALLOW_POLICY_ENGINE_LOCAL_MOCK_L`
+  - `state`: `VERIFIED`, `execution_certainty`: `COMMAND_EXECUTION_VERIFIED`
+- **Authoritative MiniStore Outcome & Independent Verification**:
+  - MiniStore order `ORD-6957BC9E85`: `PENDING_PAYMENT (v1)` -> `CONFIRMED (v2)`
+  - Anomaly `ANOM-LIVE-71B8984B`: `RECOVERED` / `VERIFIED_RECOVERY` (`recovery_source: AI_APPROVED_ACTION`)
+- **Token Usage & Latency**: `total_tokens_used = 8412`, `steps_executed = 3`, `latency_ms = 20397.5 ms`
+
+> **Configuration Note**: Set `MODEL_NAME=gemini-3.1-flash-lite` in `FinResolve/backend/.env` (the previously configured `gemini-3.6-flash` currently returns `503 Service Unavailable` from Google's endpoint).
+
+---
+
+## 5. Final Readiness Decisions
 
 - **`ENGINEERING_MERGE_READINESS`**: **READY**
   - All audited P0/P1/P2 defects across Prompts 14.3–14.5 are resolved and covered by PostgreSQL regression tests.
   - All 5/5 GitHub Actions jobs pass, including the full 9-service Docker Compose runtime acceptance stack, real Tesseract `eng+vie` pixel OCR, persistent private receipt volume survival across container recreation, fail-closed worker fencing, exact Agent target authorization, and ambiguous recovery uncertainty protection.
   - Recommended action: open PR from `feat/open-world-autonomous-guardian` into `main` for human review and merge (not auto-merged).
-- **`LIVE_AI_DEMO_READINESS`**: **`REAL_LLM_VERIFICATION_PENDING`**
-  - No external `MODEL_API_KEY` was provisioned in this session; live-model Supervisor execution remains pending authorized model credentials.
+- **`LIVE_AI_DEMO_READINESS`**: **READY**
+  - Verified end-to-end with real Google Gemini API (`gemini-3.1-flash-lite`, `model_mode=LLM_API`, `is_fallback=false`), real HTTP tool calls, current-run `ActionProposal` bound to `RUN-5291DFE013`, PolicyEngine HMAC-SHA256 signing, atomic MiniStore confirmation, and independent `VERIFIED_RECOVERY`.
 - **`EXTERNAL_PAYMENT_READINESS`**: **INTENTIONALLY_DEFERRED (DISABLED)**
   - `COMMERCE_VNPAY_ENABLED=false` and `COMMERCE_VNPAY_REFUND_ENABLED=false` remain enforced; `LOCAL_MOCK` is active and verified end-to-end.
