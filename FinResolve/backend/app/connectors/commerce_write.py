@@ -48,6 +48,112 @@ LOW_RISK_AUTO_COMMANDS: frozenset[str] = frozenset(
     }
 )
 
+# Prompt 14.6 Fix 3: Strict receiver semantic status allowlists (never treat unknown as executed)
+SUPPORTED_EXECUTED_STATUSES: frozenset[str] = frozenset(
+    {"EXECUTED", "SYNCED", "ALREADY_SYNCED", "APPLIED", "CONFIRMED"}
+)
+SUPPORTED_REJECTED_STATUSES: frozenset[str] = frozenset({"REJECTED", "FAILED", "DENIED", "ERROR"})
+SUPPORTED_ESCALATED_STATUSES: frozenset[str] = frozenset(
+    {"ESCALATED_MANUAL_REVIEW", "MANUAL_REVIEW"}
+)
+
+# Prompt 14.6 Fix 4: Machine-readable 409 conflict codes that prove NO mutation occurred
+CONFIRMED_409_REJECTION_CODES: frozenset[str] = frozenset(
+    {
+        "VERSION_MISMATCH",
+        "STALE_VERSION",
+        "STALE_WORLD_EPOCH",
+        "IDEMPOTENCY_KEY_CONFLICT",
+        "REQUEST_HASH_MISMATCH",
+        "SCOPE_MISMATCH",
+        "INVALID_AUTHORIZATION",
+    }
+)
+
+
+def _extract_conflict_reason_code(resp_json: dict[str, Any]) -> str:
+    """Extract machine-readable conflict reason code from a receiver HTTP 409 body."""
+    if not isinstance(resp_json, dict):
+        return ""
+    direct = str(resp_json.get("reason_code") or "").strip().upper()
+    if direct:
+        return direct
+    err_obj = resp_json.get("error")
+    if isinstance(err_obj, str):
+        err_up = err_obj.strip().upper()
+        for code in CONFIRMED_409_REJECTION_CODES:
+            if err_up.startswith(code):
+                return code
+        if err_up.startswith("COMMAND_IN_FLIGHT") or err_up.startswith("COMMAND_IN_PROGRESS"):
+            return "COMMAND_IN_FLIGHT"
+    if isinstance(err_obj, dict):
+        details = err_obj.get("details")
+        if isinstance(details, dict):
+            rc = str(details.get("reason_code") or "").strip().upper()
+            if rc:
+                return rc
+        msg = str(err_obj.get("message") or "").strip().upper()
+        for code in CONFIRMED_409_REJECTION_CODES:
+            if msg.startswith(code):
+                return code
+        if msg.startswith("COMMAND_IN_FLIGHT") or msg.startswith("COMMAND_IN_PROGRESS"):
+            return "COMMAND_IN_FLIGHT"
+    detail_str = str(resp_json.get("detail") or "").strip().upper()
+    for code in CONFIRMED_409_REJECTION_CODES:
+        if detail_str.startswith(code):
+            return code
+    if detail_str.startswith("COMMAND_IN_FLIGHT") or detail_str.startswith("COMMAND_IN_PROGRESS"):
+        return "COMMAND_IN_FLIGHT"
+    return ""
+
+
+def _validate_receiver_http200_identity(
+    *,
+    resp_json: dict[str, Any],
+    expected_idempotency_key: str,
+    expected_command: str,
+    expected_request_hash: str,
+    expected_merchant_id: str,
+    expected_world_epoch: int,
+    expected_order_id: str | None,
+) -> tuple[bool, str]:
+    """Strictly verify mandatory receiver identity & semantic status on HTTP 200 (Prompt 14.6)."""
+    if not isinstance(resp_json, dict) or not resp_json:
+        return False, "EMPTY_OR_MALFORMED_RESPONSE_BODY"
+
+    resp_idemp = str(resp_json.get("idempotency_key") or "").strip()
+    resp_cmd = str(resp_json.get("command") or "").strip().upper()
+    resp_hash = str(resp_json.get("request_hash") or "").strip()
+    resp_merchant = str(resp_json.get("merchant_id") or "").strip()
+    resp_status = str(resp_json.get("status") or "").strip().upper()
+    resp_epoch = resp_json.get("world_epoch")
+
+    if not resp_idemp or resp_idemp != expected_idempotency_key:
+        return False, "MISSING_OR_MISMATCHED_IDEMPOTENCY_KEY"
+    if not resp_cmd or resp_cmd != expected_command:
+        return False, "MISSING_OR_MISMATCHED_COMMAND"
+    if not resp_hash or resp_hash != expected_request_hash:
+        return False, "MISSING_OR_MISMATCHED_REQUEST_HASH"
+    if not resp_merchant or resp_merchant != expected_merchant_id:
+        return False, "MISSING_OR_MISMATCHED_MERCHANT_SCOPE"
+    if resp_epoch is not None and int(resp_epoch) != int(expected_world_epoch):
+        return False, "MISMATCHED_WORLD_EPOCH"
+    if expected_order_id and expected_command in (
+        "REQUEST_ORDER_SYNC",
+        "REQUEST_PAYMENT_RECONCILIATION",
+    ):
+        resp_order = str(resp_json.get("order_id") or "").strip()
+        if not resp_order or resp_order != expected_order_id:
+            return False, "MISSING_OR_MISMATCHED_TARGET_ORDER"
+
+    all_supported = (
+        SUPPORTED_EXECUTED_STATUSES | SUPPORTED_REJECTED_STATUSES | SUPPORTED_ESCALATED_STATUSES
+    )
+    if not resp_status or resp_status not in all_supported:
+        return False, f"UNKNOWN_OR_MISSING_EXECUTION_STATUS:{resp_status or 'EMPTY'}"
+
+    return True, resp_status
+
 
 @dataclass
 class RecoveryExecutionResult:
@@ -567,7 +673,50 @@ def execute_and_verify_commerce_recovery(
             response_payload=cmd_row.response_json,
         )
 
-    # 2. Definitive pre-commit client rejection (4xx) -> CONFIRMED_REJECTED
+    # 2. HTTP 409 Conflict: Distinguish confirmed pre-mutation rejection vs uncertain/in-flight
+    if http_status == 409:
+        conflict_code = _extract_conflict_reason_code(cmd_row.response_json)
+        if conflict_code not in CONFIRMED_409_REJECTION_CODES:
+            # Uncertain / in-progress / undocumented 409 -> preserve UNKNOWN_OUTCOME + guard!
+            cmd_row.state = "UNKNOWN_OUTCOME"
+            cmd_row.execution_certainty = "COMMAND_EXECUTION_UNKNOWN"
+            obs.verification_verdict = RecoveryVerdict.UNKNOWN_OUTCOME.value
+            if obs.linked_case_id:
+                db.add(
+                    CaseEvent(
+                        id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
+                        case_id=obs.linked_case_id,
+                        session_id=obs.session_id,
+                        type="COMMERCE_RECOVERY_OUTCOME_UNKNOWN",
+                        payload_json={
+                            "command_id": cmd_row.id,
+                            "command": norm_cmd,
+                            "http_status": 409,
+                            "conflict_reason_code": conflict_code or "UNDOCUMENTED_CONFLICT",
+                            "idempotency_key": idempotency_key,
+                            "execution_certainty": "COMMAND_EXECUTION_UNKNOWN",
+                            "response": cmd_row.response_json,
+                        },
+                        created_at=datetime.now(UTC),
+                    )
+                )
+            db.commit()
+            return RecoveryExecutionResult(
+                command_id=cmd_row.id,
+                command=norm_cmd,
+                executed=False,
+                http_status=409,
+                verified_recovery=False,
+                verdict=RecoveryVerdict.UNKNOWN_OUTCOME.value,
+                recovery_source=None,
+                detail=(
+                    f"Ambiguous/in-progress HTTP 409 conflict "
+                    f"({conflict_code or 'UNDOCUMENTED_CONFLICT'}); preserving UNKNOWN_OUTCOME"
+                ),
+                response_payload=cmd_row.response_json,
+            )
+
+    # 3. Definitive pre-commit client rejection (4xx or confirmed pre-mutation 409)
     if http_status != 200:
         cmd_row.state = "FAILED"
         cmd_row.execution_certainty = "CONFIRMED_REJECTED"
@@ -602,12 +751,17 @@ def execute_and_verify_commerce_recovery(
             response_payload=cmd_row.response_json,
         )
 
-    # 3. HTTP 200: Verify response identity & semantic execution status (NEVER blindly trust 200!)
-    resp_idemp = str(cmd_row.response_json.get("idempotency_key") or "").strip()
-    resp_cmd = str(cmd_row.response_json.get("command") or "").strip().upper()
-    resp_semantic = str(cmd_row.response_json.get("status") or "").strip().upper()
-
-    if (resp_idemp and resp_idemp != idempotency_key) or (resp_cmd and resp_cmd != norm_cmd):
+    # 4. HTTP 200: Strictly require complete receiver identity + supported semantic status
+    identity_ok, identity_detail = _validate_receiver_http200_identity(
+        resp_json=cmd_row.response_json,
+        expected_idempotency_key=idempotency_key,
+        expected_command=norm_cmd,
+        expected_request_hash=req_hash,
+        expected_merchant_id=binding.merchant_id,
+        expected_world_epoch=binding.commerce_world_epoch,
+        expected_order_id=obs.affected_order_id,
+    )
+    if not identity_ok:
         cmd_row.state = "UNKNOWN_OUTCOME"
         cmd_row.execution_certainty = "COMMAND_EXECUTION_UNKNOWN"
         obs.verification_verdict = RecoveryVerdict.UNKNOWN_OUTCOME.value
@@ -622,7 +776,7 @@ def execute_and_verify_commerce_recovery(
                         "command_id": cmd_row.id,
                         "command": norm_cmd,
                         "http_status": 200,
-                        "reason": "RESPONSE_IDENTITY_MISMATCH",
+                        "reason": identity_detail,
                         "response": cmd_row.response_json,
                     },
                     created_at=datetime.now(UTC),
@@ -637,11 +791,13 @@ def execute_and_verify_commerce_recovery(
             verified_recovery=False,
             verdict=RecoveryVerdict.UNKNOWN_OUTCOME.value,
             recovery_source=None,
-            detail="RESPONSE_IDENTITY_MISMATCH on HTTP 200; preserving UNKNOWN_OUTCOME",
+            detail=f"{identity_detail} on HTTP 200; preserving UNKNOWN_OUTCOME",
             response_payload=cmd_row.response_json,
         )
 
-    if resp_semantic in ("REJECTED", "FAILED", "DENIED", "ERROR"):
+    resp_semantic = identity_detail
+
+    if resp_semantic in SUPPORTED_REJECTED_STATUSES:
         cmd_row.state = "FAILED"
         cmd_row.execution_certainty = "CONFIRMED_REJECTED"
         if obs.linked_case_id:
@@ -674,7 +830,7 @@ def execute_and_verify_commerce_recovery(
             response_payload=cmd_row.response_json,
         )
 
-    if resp_semantic == "ESCALATED_MANUAL_REVIEW":
+    if resp_semantic in SUPPORTED_ESCALATED_STATUSES:
         cmd_row.state = "MANUAL_REVIEW"
         cmd_row.execution_certainty = "CONFIRMED_ESCALATED"
         if obs.linked_case_id:

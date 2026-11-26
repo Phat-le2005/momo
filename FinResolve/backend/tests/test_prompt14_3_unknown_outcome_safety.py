@@ -469,9 +469,11 @@ def test_prompt14_5_ambiguous_transport_502_identity_mismatch_and_semantic_rejec
                         },
                     )
                 if mode == "SEMANTIC_REJECT":
+                    from tests.helpers_recovery import mock_receiver_response
+
                     return httpx.Response(
                         200,
-                        json={"status": "REJECTED", "command": "REQUEST_ORDER_SYNC"},
+                        json=mock_receiver_response(request, status="REJECTED"),
                     )
                 if mode == "HTTP_409":
                     return httpx.Response(409, json={"error": "VERSION_MISMATCH"})

@@ -297,7 +297,14 @@ def test_durable_recovery_protocol_planner_and_real_baseline_comparison(
                 state["timeline"].append(
                     {"payload": {"sync_source": "FINRESOLVE_RECOVERY_COMMAND"}}
                 )
-                return httpx.Response(200, json={"status": "EXECUTED", "order_status": "CONFIRMED"})
+                from tests.helpers_recovery import mock_receiver_response
+
+                return httpx.Response(
+                    200,
+                    json=mock_receiver_response(
+                        request, status="EXECUTED", extra={"order_status": "CONFIRMED"}
+                    ),
+                )
         return httpx.Response(200, json=[])
 
     transport = httpx.MockTransport(_handler)

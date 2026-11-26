@@ -127,17 +127,19 @@ def test_full_autonomous_supervisor_recovery_pipeline_e2e(
             order_state["status"] = "CONFIRMED"
             order_state["version"] = 2
             payment_state["is_synced_to_order"] = True
+            from tests.helpers_recovery import mock_receiver_response
+
             return httpx.Response(
                 200,
-                json={
-                    "command": "REQUEST_ORDER_SYNC",
-                    "status": "SYNCED",
-                    "order_id": order_state["id"],
-                    "order_status": order_state["status"],
-                    "order_version": order_state["version"],
-                    "payment_id": payment_state["id"],
-                    "is_synced_to_order": True,
-                },
+                json=mock_receiver_response(
+                    request,
+                    status="SYNCED",
+                    extra={
+                        "order_status": order_state["status"],
+                        "order_version": order_state["version"],
+                        "is_synced_to_order": True,
+                    },
+                ),
             )
         return httpx.Response(404)
 

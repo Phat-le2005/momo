@@ -184,7 +184,14 @@ def test_exact_investigation_run_provenance_and_worker_claim_token_fencing(
             order_state["status"] = "CONFIRMED"
             order_state["version"] = 2
             payment_state["is_synced_to_order"] = True
-            return httpx.Response(200, json={"status": "SYNCED", "order_status": "CONFIRMED"})
+            from tests.helpers_recovery import mock_receiver_response
+
+            return httpx.Response(
+                200,
+                json=mock_receiver_response(
+                    request, status="SYNCED", extra={"order_status": "CONFIRMED"}
+                ),
+            )
         return httpx.Response(404)
 
     transport = httpx.MockTransport(_handler)

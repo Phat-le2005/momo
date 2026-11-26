@@ -94,14 +94,15 @@ def _mock_transport(
                 order_state["status"] = "CONFIRMED"
                 order_state["version"] = int(order_state.get("version", 1)) + 1
                 payment_state["is_synced_to_order"] = True
+            from tests.helpers_recovery import mock_receiver_response
+
             return httpx.Response(
                 200,
-                json={
-                    "command": "REQUEST_ORDER_SYNC",
-                    "status": "SYNCED",
-                    "order_id": order_state["id"],
-                    "order_status": order_state["status"],
-                },
+                json=mock_receiver_response(
+                    request,
+                    status="SYNCED",
+                    extra={"order_status": order_state["status"]},
+                ),
             )
         return httpx.Response(404, json={"detail": "not found"})
 

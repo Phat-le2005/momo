@@ -168,7 +168,14 @@ def test_closed_loop_c01_recovery_c02_lookalike_and_independent_oracle(
                 commerce_state["timeline"].append(
                     {"payload": {"sync_source": "FINRESOLVE_RECOVERY_COMMAND"}}
                 )
-                return httpx.Response(200, json={"status": "EXECUTED", "order_status": "CONFIRMED"})
+                from tests.helpers_recovery import mock_receiver_response
+
+                return httpx.Response(
+                    200,
+                    json=mock_receiver_response(
+                        request, status="EXECUTED", extra={"order_status": "CONFIRMED"}
+                    ),
+                )
             return httpx.Response(409, json={"error": "PAYMENT_NOT_CONFIRMED"})
         return httpx.Response(200, json=[])
 

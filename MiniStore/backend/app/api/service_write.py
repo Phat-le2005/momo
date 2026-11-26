@@ -180,6 +180,7 @@ def _require_write_principal(
             f"STALE_WORLD_EPOCH: requested world_epoch={x_world_epoch} does not match "
             f"authoritative world_epoch={csess.world_epoch}",
             status_code=409,
+            details={"reason_code": "STALE_WORLD_EPOCH"},
         )
 
     return WritePrincipal(
@@ -357,10 +358,16 @@ def get_recovery_command_status(
         )
     return {
         "id": row.id,
+        "command_id": row.id,
         "idempotency_key": row.idempotency_key,
         "request_hash": row.request_hash,
         "command": row.command,
+        "merchant_id": row.merchant_id,
+        "commerce_session_id": row.commerce_session_id,
         "world_epoch": row.world_epoch,
+        "target_order_id": row.target_order_id,
+        "target_payment_id": row.target_payment_id,
+        "target_event_id": row.target_event_id,
         "status": row.status,
         "http_status": row.http_status,
         "result": row.result_json,
@@ -409,12 +416,14 @@ def execute_recovery_command(
                 ErrorCode.CONFLICT,
                 "IDEMPOTENCY_KEY_CONFLICT: idempotency_key reused with different payload",
                 status_code=409,
+                details={"reason_code": "IDEMPOTENCY_KEY_CONFLICT"},
             )
         if existing.status == "EXECUTING":
             raise CommerceError(
                 ErrorCode.CONFLICT,
                 "COMMAND_IN_FLIGHT: concurrent duplicate execution blocked",
                 status_code=409,
+                details={"reason_code": "COMMAND_IN_FLIGHT"},
             )
         if existing.status == "EXECUTED":
             replayed = dict(existing.result_json or {})
@@ -459,7 +468,18 @@ def execute_recovery_command(
             ErrorCode.CONFLICT,
             "COMMAND_IN_FLIGHT: concurrent duplicate command rejected by unique constraint",
             status_code=409,
+            details={"reason_code": "COMMAND_IN_FLIGHT"},
         ) from exc
+
+    identity_envelope: dict[str, Any] = {
+        "command_id": rec.id,
+        "command": cmd,
+        "idempotency_key": payload.idempotency_key,
+        "request_hash": req_hash,
+        "merchant_id": principal.merchant_id,
+        "commerce_session_id": principal.commerce_session_id,
+        "world_epoch": principal.world_epoch,
+    }
 
     response: dict[str, Any]
     try:
@@ -508,14 +528,13 @@ def execute_recovery_command(
                 commit=False,
             )
             response = {
-                "command": cmd,
+                **identity_envelope,
                 "status": outcome_status,
                 "order_id": order.id,
                 "order_status": order.status,
                 "order_version": order.version,
                 "payment_id": pay.id,
                 "is_synced_to_order": pay.is_synced_to_order,
-                "idempotency_key": payload.idempotency_key,
             }
         elif cmd == "REQUEST_EVENT_REDELIVERY":
             if not payload.event_id and not payload.order_id:
@@ -546,12 +565,11 @@ def execute_recovery_command(
                 row.next_attempt_at = now
                 redelivered += 1
             response = {
-                "command": cmd,
+                **identity_envelope,
                 "status": "EXECUTED",
                 "redelivered_count": redelivered,
                 "event_id": payload.event_id,
                 "order_id": payload.order_id,
-                "idempotency_key": payload.idempotency_key,
             }
         elif cmd == "REQUEST_PAYMENT_RECONCILIATION":
             if not payload.order_id:
@@ -581,6 +599,7 @@ def execute_recovery_command(
                         f"got {recon_order.version}"
                     ),
                     status_code=409,
+                    details={"reason_code": "VERSION_MISMATCH"},
                 )
             recon_order.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
             recon_order.reconciliation_reason = payload.reason
@@ -591,11 +610,10 @@ def execute_recovery_command(
                     pay_row.reconciliation_required = True
                     pay_row.reconciliation_note = payload.reason
             response = {
-                "command": cmd,
+                **identity_envelope,
                 "status": "EXECUTED",
                 "order_id": recon_order.id,
                 "reconciliation_status": recon_order.reconciliation_status,
-                "idempotency_key": payload.idempotency_key,
             }
         else:
             record_commerce_event(
@@ -613,11 +631,10 @@ def execute_recovery_command(
                 },
             )
             response = {
-                "command": cmd,
+                **identity_envelope,
                 "status": "ESCALATED_MANUAL_REVIEW",
                 "order_id": payload.order_id,
                 "payment_id": payload.payment_id,
-                "idempotency_key": payload.idempotency_key,
             }
     except CommerceError:
         db.rollback()
