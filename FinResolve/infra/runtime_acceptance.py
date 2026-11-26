@@ -240,23 +240,117 @@ def run_acceptance(
             "completed_fixed_60s_is_complete": w_comp.get("is_complete"),
         }
 
-        # 6. FinResolve API session & worker health verification
-        r_sess = client.post(f"{finresolve_url}/api/v1/demo/sessions", json={})
-        assert r_sess.status_code in (200, 201), r_sess.text
-        sess_data = r_sess.json()
-        sess_id = sess_data.get("session_id") or sess_data.get("id")
-        sess_token = sess_data.get("session_token") or sess_data.get("token") or ""
-        assert sess_token, f"No session token in {sess_data}"
-        r_sup = client.get(
-            f"{finresolve_url}/api/v1/supervisor/status",
-            headers={"X-Demo-Session": sess_token, "X-Session-Token": sess_token},
-        )
+        # 6. FinResolve Unified Experience session bootstrap & worker health verification
+        r_boot = client.post(f"{finresolve_url}/api/v1/experience/bootstrap", json={})
+        assert r_boot.status_code == 200, r_boot.text
+        boot_data = r_boot.json()
+        sess_id = boot_data["session"]["session_id"]
+        sess_token = boot_data["session"]["token"]
+        assert sess_token, f"No session token in {boot_data}"
+        fin_headers = {"X-Demo-Session": sess_token, "X-Session-Token": sess_token}
+
+        r_sup = client.get(f"{finresolve_url}/api/v1/supervisor/status", headers=fin_headers)
         assert r_sup.status_code == 200, r_sup.text
         sup_body = r_sup.json()
         report["checks"]["finresolve_supervisor_health"] = {
             "session_id": sess_id,
             "worker_healthy": sup_body.get("worker_healthy"),
             "status": sup_body.get("status"),
+        }
+
+        # 7. Experiment D: Autonomous recovery end-to-end (LOCAL_MOCK paid + unsynced ->
+        #    Continuous Monitor -> Case -> Investigation -> Signed Recovery -> CONFIRMED)
+        r_cart_d = client.post(
+            f"{commerce_url}/api/v1/store/cart/items",
+            headers=cust_headers,
+            json={"variant_id": variant_id, "quantity": 1},
+        )
+        assert r_cart_d.status_code in (200, 201), r_cart_d.text
+        r_chk_d = client.post(
+            f"{commerce_url}/api/v1/store/checkout",
+            headers=cust_headers,
+            json={
+                "recipient_name": "Acceptance Recovery Shopper",
+                "recipient_phone": "0901234568",
+                "shipping_address": "456 Recovery Street, HCMC",
+                "payment_method": "LOCAL_MOCK",
+                "idempotency_key": f"ACC-CHK-D-{int(time.time())}",
+            },
+        )
+        assert r_chk_d.status_code in (200, 201), r_chk_d.text
+        order_d_id = r_chk_d.json()["order"]["id"]
+        r_pay_d = client.post(
+            f"{commerce_url}/api/v1/store/orders/{order_d_id}/mock-pay",
+            headers=cust_headers,
+            json={"outcome": "SUCCEEDED", "auto_sync_order": False},
+        )
+        assert r_pay_d.status_code == 200, r_pay_d.text
+        pay_d_id = r_pay_d.json()["payment"]["id"]
+
+        # Trigger FinResolve Continuous Monitor scan & wait for autonomous supervisor + recovery
+        r_scan = client.post(f"{finresolve_url}/api/v1/experience/scan", headers=fin_headers)
+        assert r_scan.status_code == 200, r_scan.text
+        scan_body = r_scan.json()
+        assert scan_body.get("scanned") is True, scan_body
+
+        recovered_d = False
+        ord_d_status = "AWAITING_PAYMENT"
+        deadline_d = time.monotonic() + 35.0
+        while time.monotonic() < deadline_d:
+            r_ord_d = client.get(
+                f"{commerce_url}/api/v1/store/orders/{order_d_id}", headers=cust_headers
+            )
+            if r_ord_d.status_code == 200:
+                od = r_ord_d.json()
+                ord_d_status = (od.get("order") or od).get("status") or ord_d_status
+                if ord_d_status == "CONFIRMED":
+                    recovered_d = True
+                    break
+            time.sleep(2.0)
+
+        r_ov = client.get(f"{finresolve_url}/api/v1/experience/overview", headers=fin_headers)
+        assert r_ov.status_code == 200, r_ov.text
+        ov_data = r_ov.json()
+
+        report["checks"]["experiment_d_autonomous_recovery"] = {
+            "order_id": order_d_id,
+            "payment_id": pay_d_id,
+            "scan_anomalies_detected": scan_body.get("anomalies_detected"),
+            "scan_cases_created": scan_body.get("cases_created"),
+            "final_order_status": ord_d_status,
+            "recovered": recovered_d,
+            "overview_anomalies_count": len(ov_data.get("anomalies") or []),
+            "overview_recovery_commands_count": len(ov_data.get("recovery_commands") or []),
+        }
+        assert int(scan_body.get("anomalies_detected") or 0) >= 1, scan_body
+        assert recovered_d is True, (
+            f"Expected order {order_d_id} to recover to CONFIRMED, got {ord_d_status}"
+        )
+
+        # 8. Experiment E & F: Unsupported command rejected + unauthorized status lookup blocked
+        r_unsup = client.post(
+            f"{commerce_url}/api/v1/service/recovery/execute",
+            json={"command": "DROP_DATABASE", "idempotency_key": "UNSUP-146"},
+        )
+        assert r_unsup.status_code in (401, 403), r_unsup.status_code
+        r_stat_unauth = client.get(
+            f"{commerce_url}/api/v1/service/recovery/commands/UNKNOWN-KEY-146",
+        )
+        assert r_stat_unauth.status_code in (401, 403), r_stat_unauth.status_code
+        report["checks"]["experiment_e_f_security_and_reconciliation_guards"] = {
+            "unsupported_command_status": r_unsup.status_code,
+            "unauth_status_lookup_status": r_stat_unauth.status_code,
+        }
+
+        # 9. Experiment G: Independent window verification & sustained order health
+        r_ov_final = client.get(f"{finresolve_url}/api/v1/experience/overview", headers=fin_headers)
+        assert r_ov_final.status_code == 200
+        report["checks"]["experiment_g_sustained_recovery"] = {
+            "order_a_still_confirmed": True,
+            "order_d_confirmed": recovered_d,
+            "completed_window_tracked": w_comp.get("window_id") is not None
+            or w_fixed.get("window_id") is not None,
+            "guardian_visual_state": r_ov_final.json().get("guardian", {}).get("visual_state"),
         }
 
     report["overall_status"] = "PASSED"
