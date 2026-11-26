@@ -9,6 +9,7 @@ from app import __version__
 from app.api.v1.actions import router as actions_router
 from app.api.v1.cases import router as cases_router
 from app.api.v1.demo_scenarios import router as demo_scenarios_router
+from app.api.v1.experience import router as experience_router
 from app.api.v1.incidents import router as incidents_router
 from app.api.v1.judge import router as judge_router
 from app.api.v1.monitoring import router as monitoring_router
@@ -27,6 +28,7 @@ api_v1_router.include_router(incidents_router)
 api_v1_router.include_router(supervisor_router)
 api_v1_router.include_router(monitoring_router)
 api_v1_router.include_router(judge_router)
+api_v1_router.include_router(experience_router)
 
 
 class ApiMeta(BaseModel):
