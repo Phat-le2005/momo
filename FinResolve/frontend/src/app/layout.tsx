@@ -1,31 +1,32 @@
 import type { Metadata } from "next";
-import { SiteHeader } from "@/components/SiteHeader";
+import { Be_Vietnam_Pro } from "next/font/google";
+import { AppShell } from "@/components/AppShell";
 import "./globals.css";
 
+const beVietnamPro = Be_Vietnam_Pro({
+  subsets: ["vietnamese", "latin"],
+  weight: ["400", "500", "600", "700"],
+  variable: "--font-be-vietnam-pro",
+  display: "swap",
+});
+
 export const metadata: Metadata = {
-  title: "FinResolve AI — Demo (MOCK)",
+  title: "FinResolve AI — Autonomous Guardian for Payment & Commerce",
   description:
-    "Xử lý ngoại lệ và rủi ro thanh toán/thương mại dựa trên bằng chứng. Dữ liệu mô phỏng, không giao dịch tiền thật.",
+    "Doanh nghiệp vận hành. AI âm thầm bảo vệ. Giám sát giao dịch, phát hiện bất thường, điều tra dựa trên bằng chứng và phục hồi an toàn (Sandbox MOCK).",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="vi">
-      <body className="min-h-screen">
+    <html lang="vi" className={beVietnamPro.variable}>
+      <body className="min-h-screen font-sans">
         <a
           href="#main"
-          className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:rounded focus:bg-white focus:px-3 focus:py-2"
+          className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-50 focus:rounded-lg focus:bg-white focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:text-blue-600 focus:shadow"
         >
           Bỏ qua điều hướng
         </a>
-        <SiteHeader />
-        <main id="main" className="mx-auto w-full max-w-6xl px-4 py-8">
-          {children}
-        </main>
-        <footer className="mx-auto w-full max-w-6xl px-4 pb-8 text-xs text-slate-500">
-          Toàn bộ dữ liệu là mô phỏng (MOCK). Không kết nối hệ thống thanh toán thật, không
-          hoàn tiền thật. Vui lòng không nhập thông tin tài khoản ngân hàng hay mật khẩu.
-        </footer>
+        <AppShell>{children}</AppShell>
       </body>
     </html>
   );
