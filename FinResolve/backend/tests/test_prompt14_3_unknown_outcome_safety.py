@@ -345,13 +345,227 @@ def test_prompt14_4_uncertainty_guard_retained_after_manual_review_and_404_exter
     assert res_ext.verdict == "BUSINESS_STATE_RECOVERED"
     assert cmd.execution_certainty == "COMMAND_EXECUTION_UNKNOWN"
 
-    # 4. Explicit authorized manual resolution releases the uncertainty guard
+    # 4. Unauthorized manual resolution or missing evidence -> REJECTED!
+    with pytest.raises(AppError) as exc_unauth:
+        resolve_uncertain_recovery_command(
+            db,
+            command_id=cmd.id,
+            session_id=sid,
+            resolved_by="random_caller",
+            operator_role="GUEST",
+            supporting_evidence_ref="EVD-1",
+        )
+    assert exc_unauth.value.status_code == 403
+
+    with pytest.raises(AppError) as exc_noev:
+        resolve_uncertain_recovery_command(
+            db,
+            command_id=cmd.id,
+            session_id=sid,
+            resolved_by="demo_manager",
+            operator_role="DEMO_MANAGER",
+            supporting_evidence_ref="",
+        )
+    assert exc_noev.value.status_code == 400
+
+    # 5. Explicit authorized manual resolution with evidence releases the uncertainty guard
     resolve_uncertain_recovery_command(
         db,
         command_id=cmd.id,
         session_id=sid,
         resolved_by="demo_manager",
+        operator_role="DEMO_MANAGER",
+        supporting_evidence_ref="EVD-OPERATOR-CHECK-01",
         resolution_note="Verified externally by operator",
     )
     assert cmd.uncertainty_resolved_at is not None
-    assert cmd.uncertainty_resolved_by == "demo_manager"
+    assert cmd.uncertainty_resolved_by == "DEMO_MANAGER:demo_manager"
+
+
+def test_prompt14_5_ambiguous_transport_502_identity_mismatch_and_semantic_rejection(
+    db: Session, active_session: dict[str, str]
+) -> None:
+    """Prompt 14.5 Fix 1: Prove connection reset, HTTP 502, and HTTP 200 identity mismatch
+    ALL preserve UNKNOWN_OUTCOME + COMMAND_EXECUTION_UNKNOWN, while 409 / semantic REJECTED
+    classify as CONFIRMED_REJECTED.
+    """
+    from sqlalchemy import select
+
+    sid = active_session["id"]
+    now = datetime.now(UTC)
+
+    binding = CommerceSourceBinding(
+        id=f"BIND-AMB-{uuid.uuid4().hex[:8].upper()}",
+        session_id=sid,
+        world_epoch=1,
+        base_url="http://127.0.0.1:8100",
+        merchant_id="MERCHANT_FINSHOP_01",
+        commerce_session_id="CSESS_FINSHOP_DEFAULT_01",
+        commerce_world_epoch=1,
+        is_enabled=True,
+    )
+    db.add(binding)
+    db.flush()
+
+    def _make_obs(tag: str) -> AnomalyObservation:
+        o = AnomalyObservation(
+            id=f"ANOM-{tag}-{uuid.uuid4().hex[:6].upper()}",
+            session_id=sid,
+            world_epoch=1,
+            source_binding_id=binding.id,
+            merchant_id="MERCHANT_FINSHOP_01",
+            detector_code="D01",
+            anomaly_type="PAYMENT_SUCCEEDED_ORDER_NOT_CONFIRMED",
+            severity="HIGH",
+            fingerprint=f"fp-{tag}-{uuid.uuid4().hex[:6]}",
+            affected_order_id=f"ORD-{tag}",
+            affected_payment_id=f"PAY-{tag}",
+            rationale="Unsynced payment",
+            lifecycle_state="INVESTIGATING",
+        )
+        db.add(o)
+        db.commit()
+        return o
+
+    def _base_handler(mode: str, order_id: str, pay_id: str) -> httpx.MockTransport:
+        def _h(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/timeline"):
+                return httpx.Response(200, json=[])
+            if request.url.path.startswith("/api/v1/service/orders/"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": order_id,
+                        "status": "PENDING_PAYMENT",
+                        "version": 1,
+                        "total_vnd": 100000,
+                    },
+                )
+            if request.url.path.startswith("/api/v1/service/payments/"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": pay_id,
+                        "order_id": order_id,
+                        "provider": "LOCAL_MOCK",
+                        "status": "SUCCEEDED",
+                        "is_synced_to_order": False,
+                        "amount_vnd": 100000,
+                        "confirmed_at": (now - timedelta(minutes=3)).isoformat(),
+                    },
+                )
+            if request.method == "POST" and request.url.path == "/api/v1/service/recovery/execute":
+                if mode == "CONN_RESET":
+                    raise httpx.RemoteProtocolError("peer closed connection after commit")
+                if mode == "HTTP_502":
+                    return httpx.Response(502, json={"error": "Bad Gateway"})
+                if mode == "IDEMP_MISMATCH":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "status": "EXECUTED",
+                            "command": "REQUEST_ORDER_SYNC",
+                            "idempotency_key": "DIFFERENT-KEY-999",
+                        },
+                    )
+                if mode == "SEMANTIC_REJECT":
+                    return httpx.Response(
+                        200,
+                        json={"status": "REJECTED", "command": "REQUEST_ORDER_SYNC"},
+                    )
+                if mode == "HTTP_409":
+                    return httpx.Response(409, json={"error": "VERSION_MISMATCH"})
+            return httpx.Response(404)
+
+        return httpx.MockTransport(_h)
+
+    # 1. Connection reset -> UNKNOWN_OUTCOME + COMMAND_EXECUTION_UNKNOWN (guard blocks replan!)
+    obs1 = _make_obs("RST")
+    t1 = _base_handler("CONN_RESET", "ORD-RST", "PAY-RST")
+    r1 = execute_and_verify_commerce_recovery(
+        db,
+        binding=binding,
+        obs=obs1,
+        command="REQUEST_ORDER_SYNC",
+        idempotency_key=f"IDEMP-RST-{uuid.uuid4().hex[:6]}",
+        expected_version=1,
+        transport=t1,
+    )
+    assert r1.verdict == "UNKNOWN_OUTCOME"
+    c1 = db.scalar(select(RecoveryCommand).where(RecoveryCommand.id == r1.command_id))
+    assert c1 is not None and c1.state == "UNKNOWN_OUTCOME"
+    assert c1.execution_certainty == "COMMAND_EXECUTION_UNKNOWN"
+    with pytest.raises(AppError) as exc_blk:
+        execute_and_verify_commerce_recovery(
+            db,
+            binding=binding,
+            obs=obs1,
+            command="REQUEST_ORDER_SYNC",
+            idempotency_key=f"IDEMP-RST2-{uuid.uuid4().hex[:6]}",
+            expected_version=1,
+            transport=t1,
+        )
+    assert exc_blk.value.status_code == 409
+
+    # 2. HTTP 502 -> UNKNOWN_OUTCOME + COMMAND_EXECUTION_UNKNOWN
+    obs2 = _make_obs("502")
+    r2 = execute_and_verify_commerce_recovery(
+        db,
+        binding=binding,
+        obs=obs2,
+        command="REQUEST_ORDER_SYNC",
+        idempotency_key=f"IDEMP-502-{uuid.uuid4().hex[:6]}",
+        expected_version=1,
+        transport=_base_handler("HTTP_502", "ORD-502", "PAY-502"),
+    )
+    assert r2.verdict == "UNKNOWN_OUTCOME"
+    c2 = db.scalar(select(RecoveryCommand).where(RecoveryCommand.id == r2.command_id))
+    assert c2 is not None and c2.execution_certainty == "COMMAND_EXECUTION_UNKNOWN"
+
+    # 3. HTTP 200 with mismatched idempotency_key -> UNKNOWN_OUTCOME
+    obs3 = _make_obs("MIS")
+    r3 = execute_and_verify_commerce_recovery(
+        db,
+        binding=binding,
+        obs=obs3,
+        command="REQUEST_ORDER_SYNC",
+        idempotency_key=f"IDEMP-MIS-{uuid.uuid4().hex[:6]}",
+        expected_version=1,
+        transport=_base_handler("IDEMP_MISMATCH", "ORD-MIS", "PAY-MIS"),
+    )
+    assert r3.verdict == "UNKNOWN_OUTCOME"
+    assert r3.executed is False
+
+    # 4. HTTP 200 with semantic REJECTED -> FAILED + CONFIRMED_REJECTED
+    obs4 = _make_obs("SEM")
+    r4 = execute_and_verify_commerce_recovery(
+        db,
+        binding=binding,
+        obs=obs4,
+        command="REQUEST_ORDER_SYNC",
+        idempotency_key=f"IDEMP-SEM-{uuid.uuid4().hex[:6]}",
+        expected_version=1,
+        transport=_base_handler("SEMANTIC_REJECT", "ORD-SEM", "PAY-SEM"),
+    )
+    assert r4.executed is False
+    c4 = db.scalar(select(RecoveryCommand).where(RecoveryCommand.id == r4.command_id))
+    assert (
+        c4 is not None and c4.state == "FAILED" and c4.execution_certainty == "CONFIRMED_REJECTED"
+    )
+
+    # 5. Definitive HTTP 409 -> FAILED + CONFIRMED_REJECTED
+    obs5 = _make_obs("409")
+    r5 = execute_and_verify_commerce_recovery(
+        db,
+        binding=binding,
+        obs=obs5,
+        command="REQUEST_ORDER_SYNC",
+        idempotency_key=f"IDEMP-409-{uuid.uuid4().hex[:6]}",
+        expected_version=1,
+        transport=_base_handler("HTTP_409", "ORD-409", "PAY-409"),
+    )
+    assert r5.executed is False
+    c5 = db.scalar(select(RecoveryCommand).where(RecoveryCommand.id == r5.command_id))
+    assert (
+        c5 is not None and c5.state == "FAILED" and c5.execution_certainty == "CONFIRMED_REJECTED"
+    )

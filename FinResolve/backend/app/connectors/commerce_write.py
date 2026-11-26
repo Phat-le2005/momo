@@ -485,17 +485,36 @@ def execute_and_verify_commerce_recovery(
             expected_version=effective_expected_version,
         )
     except CommerceConnectorError as exc:
-        is_timeout = "timed out" in str(exc).lower()
-        cmd_row.state = "UNKNOWN_OUTCOME" if is_timeout else "FAILED"
+        # Prompt 14.5 Fix 1: ANY transport/timeout/reset/malformed-response failure after
+        # possible dispatch MUST remain UNKNOWN_OUTCOME + COMMAND_EXECUTION_UNKNOWN!
+        # NEVER mark FAILED or release uncertainty guards on ambiguous transport errors!
+        cmd_row.state = "UNKNOWN_OUTCOME"
+        cmd_row.execution_certainty = "COMMAND_EXECUTION_UNKNOWN"
         cmd_row.http_status = exc.status_code
-        cmd_row.response_json = {"error": str(exc)}
+        cmd_row.response_json = {
+            "error": str(exc),
+            "outcome_classification": "COMMAND_EXECUTION_UNKNOWN",
+        }
         cmd_row.updated_at = datetime.now(UTC)
-        verdict = (
-            RecoveryVerdict.UNKNOWN_OUTCOME.value
-            if is_timeout
-            else RecoveryVerdict.SOURCE_UNAVAILABLE.value
-        )
+        verdict = RecoveryVerdict.UNKNOWN_OUTCOME.value
         obs.verification_verdict = verdict
+        if obs.linked_case_id:
+            db.add(
+                CaseEvent(
+                    id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
+                    case_id=obs.linked_case_id,
+                    session_id=obs.session_id,
+                    type="COMMERCE_RECOVERY_OUTCOME_UNKNOWN",
+                    payload_json={
+                        "command_id": cmd_row.id,
+                        "command": norm_cmd,
+                        "idempotency_key": idempotency_key,
+                        "execution_certainty": "COMMAND_EXECUTION_UNKNOWN",
+                        "error": str(exc),
+                    },
+                    created_at=datetime.now(UTC),
+                )
+            )
         db.commit()
         return RecoveryExecutionResult(
             command_id=cmd_row.id,
@@ -505,15 +524,190 @@ def execute_and_verify_commerce_recovery(
             verified_recovery=False,
             verdict=verdict,
             recovery_source=None,
-            detail=str(exc),
+            detail=f"Ambiguous post-dispatch transport outcome (guard retained): {exc}",
             response_payload={},
         )
 
     cmd_row.http_status = http_status
-    cmd_row.response_json = resp_data
-    cmd_row.state = "VERIFYING" if http_status == 200 else "FAILED"
+    cmd_row.response_json = resp_data if isinstance(resp_data, dict) else {"raw": str(resp_data)}
     cmd_row.updated_at = datetime.now(UTC)
 
+    # 1. Ambiguous 5xx / unexpected status codes -> UNKNOWN_OUTCOME (retain guard!)
+    if http_status >= 500 or http_status not in (200, 400, 401, 403, 404, 409, 422):
+        cmd_row.state = "UNKNOWN_OUTCOME"
+        cmd_row.execution_certainty = "COMMAND_EXECUTION_UNKNOWN"
+        obs.verification_verdict = RecoveryVerdict.UNKNOWN_OUTCOME.value
+        if obs.linked_case_id:
+            db.add(
+                CaseEvent(
+                    id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
+                    case_id=obs.linked_case_id,
+                    session_id=obs.session_id,
+                    type="COMMERCE_RECOVERY_OUTCOME_UNKNOWN",
+                    payload_json={
+                        "command_id": cmd_row.id,
+                        "command": norm_cmd,
+                        "http_status": http_status,
+                        "idempotency_key": idempotency_key,
+                        "execution_certainty": "COMMAND_EXECUTION_UNKNOWN",
+                    },
+                    created_at=datetime.now(UTC),
+                )
+            )
+        db.commit()
+        return RecoveryExecutionResult(
+            command_id=cmd_row.id,
+            command=norm_cmd,
+            executed=False,
+            http_status=http_status,
+            verified_recovery=False,
+            verdict=RecoveryVerdict.UNKNOWN_OUTCOME.value,
+            recovery_source=None,
+            detail=f"Ambiguous receiver HTTP {http_status}; outcome uncertain (guard retained)",
+            response_payload=cmd_row.response_json,
+        )
+
+    # 2. Definitive pre-commit client rejection (4xx) -> CONFIRMED_REJECTED
+    if http_status != 200:
+        cmd_row.state = "FAILED"
+        cmd_row.execution_certainty = "CONFIRMED_REJECTED"
+        if obs.linked_case_id:
+            db.add(
+                CaseEvent(
+                    id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
+                    case_id=obs.linked_case_id,
+                    session_id=obs.session_id,
+                    type="COMMERCE_RECOVERY_COMMAND_REJECTED",
+                    payload_json={
+                        "command_id": cmd_row.id,
+                        "command": norm_cmd,
+                        "http_status": http_status,
+                        "idempotency_key": idempotency_key,
+                        "execution_certainty": "CONFIRMED_REJECTED",
+                        "response": cmd_row.response_json,
+                    },
+                    created_at=datetime.now(UTC),
+                )
+            )
+        db.commit()
+        return RecoveryExecutionResult(
+            command_id=cmd_row.id,
+            command=norm_cmd,
+            executed=False,
+            http_status=http_status,
+            verified_recovery=False,
+            verdict=RecoveryVerdict.STILL_INCONSISTENT.value,
+            recovery_source=None,
+            detail=f"Commerce recovery command definitively rejected (HTTP {http_status})",
+            response_payload=cmd_row.response_json,
+        )
+
+    # 3. HTTP 200: Verify response identity & semantic execution status (NEVER blindly trust 200!)
+    resp_idemp = str(cmd_row.response_json.get("idempotency_key") or "").strip()
+    resp_cmd = str(cmd_row.response_json.get("command") or "").strip().upper()
+    resp_semantic = str(cmd_row.response_json.get("status") or "").strip().upper()
+
+    if (resp_idemp and resp_idemp != idempotency_key) or (resp_cmd and resp_cmd != norm_cmd):
+        cmd_row.state = "UNKNOWN_OUTCOME"
+        cmd_row.execution_certainty = "COMMAND_EXECUTION_UNKNOWN"
+        obs.verification_verdict = RecoveryVerdict.UNKNOWN_OUTCOME.value
+        if obs.linked_case_id:
+            db.add(
+                CaseEvent(
+                    id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
+                    case_id=obs.linked_case_id,
+                    session_id=obs.session_id,
+                    type="COMMERCE_RECOVERY_OUTCOME_UNKNOWN",
+                    payload_json={
+                        "command_id": cmd_row.id,
+                        "command": norm_cmd,
+                        "http_status": 200,
+                        "reason": "RESPONSE_IDENTITY_MISMATCH",
+                        "response": cmd_row.response_json,
+                    },
+                    created_at=datetime.now(UTC),
+                )
+            )
+        db.commit()
+        return RecoveryExecutionResult(
+            command_id=cmd_row.id,
+            command=norm_cmd,
+            executed=False,
+            http_status=200,
+            verified_recovery=False,
+            verdict=RecoveryVerdict.UNKNOWN_OUTCOME.value,
+            recovery_source=None,
+            detail="RESPONSE_IDENTITY_MISMATCH on HTTP 200; preserving UNKNOWN_OUTCOME",
+            response_payload=cmd_row.response_json,
+        )
+
+    if resp_semantic in ("REJECTED", "FAILED", "DENIED", "ERROR"):
+        cmd_row.state = "FAILED"
+        cmd_row.execution_certainty = "CONFIRMED_REJECTED"
+        if obs.linked_case_id:
+            db.add(
+                CaseEvent(
+                    id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
+                    case_id=obs.linked_case_id,
+                    session_id=obs.session_id,
+                    type="COMMERCE_RECOVERY_COMMAND_REJECTED",
+                    payload_json={
+                        "command_id": cmd_row.id,
+                        "command": norm_cmd,
+                        "http_status": 200,
+                        "semantic_status": resp_semantic,
+                        "response": cmd_row.response_json,
+                    },
+                    created_at=datetime.now(UTC),
+                )
+            )
+        db.commit()
+        return RecoveryExecutionResult(
+            command_id=cmd_row.id,
+            command=norm_cmd,
+            executed=False,
+            http_status=200,
+            verified_recovery=False,
+            verdict=RecoveryVerdict.STILL_INCONSISTENT.value,
+            recovery_source=None,
+            detail=f"HTTP 200 carried unsuccessful semantic status '{resp_semantic}'",
+            response_payload=cmd_row.response_json,
+        )
+
+    if resp_semantic == "ESCALATED_MANUAL_REVIEW":
+        cmd_row.state = "MANUAL_REVIEW"
+        cmd_row.execution_certainty = "CONFIRMED_ESCALATED"
+        if obs.linked_case_id:
+            db.add(
+                CaseEvent(
+                    id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
+                    case_id=obs.linked_case_id,
+                    session_id=obs.session_id,
+                    type="COMMERCE_RECOVERY_ESCALATED",
+                    payload_json={
+                        "command_id": cmd_row.id,
+                        "command": norm_cmd,
+                        "http_status": 200,
+                        "response": cmd_row.response_json,
+                    },
+                    created_at=datetime.now(UTC),
+                )
+            )
+        db.commit()
+        return RecoveryExecutionResult(
+            command_id=cmd_row.id,
+            command=norm_cmd,
+            executed=False,
+            http_status=200,
+            verified_recovery=False,
+            verdict=RecoveryVerdict.STILL_INCONSISTENT.value,
+            recovery_source=None,
+            detail="Receiver escalated command to manual review without mutation",
+            response_payload=cmd_row.response_json,
+        )
+
+    cmd_row.state = "VERIFYING"
+    cmd_row.execution_certainty = "COMMAND_EXECUTION_VERIFIED"
     if obs.linked_case_id:
         db.add(
             CaseEvent(
@@ -524,30 +718,17 @@ def execute_and_verify_commerce_recovery(
                 payload_json={
                     "command_id": cmd_row.id,
                     "command": norm_cmd,
-                    "http_status": http_status,
+                    "http_status": 200,
                     "idempotency_key": idempotency_key,
-                    "response": resp_data,
+                    "execution_certainty": "COMMAND_EXECUTION_VERIFIED",
+                    "response": cmd_row.response_json,
                 },
                 created_at=datetime.now(UTC),
             )
         )
     db.commit()
 
-    if http_status != 200:
-        return RecoveryExecutionResult(
-            command_id=cmd_row.id,
-            command=norm_cmd,
-            executed=False,
-            http_status=http_status,
-            verified_recovery=False,
-            verdict=RecoveryVerdict.STILL_INCONSISTENT.value,
-            recovery_source=None,
-            detail=f"Commerce recovery command returned HTTP {http_status}",
-            response_payload=resp_data,
-        )
-
     # Independent post-action verification (NEVER trust HTTP 200 alone!)
-    cmd_row.execution_certainty = "COMMAND_EXECUTION_VERIFIED"
     recovered, detail = verify_anomaly_recovery(db, obs=obs, connector=reader)
     cmd_row.state = "VERIFIED" if recovered else "MANUAL_REVIEW"
     cmd_row.verification_json = {
@@ -876,15 +1057,42 @@ def reconcile_stranded_recovery_commands(
     return reconciled
 
 
+AUTHORIZED_UNCERTAINTY_RESOLVER_ROLES: frozenset[str] = frozenset(
+    {"DEMO_MANAGER", "INCIDENT_ADMIN", "OPERATOR_ADMIN"}
+)
+
+
 def resolve_uncertain_recovery_command(
     db: Session,
     *,
     command_id: str,
     session_id: str,
     resolved_by: str,
+    operator_role: str = "DEMO_MANAGER",
+    supporting_evidence_ref: str = "",
     resolution_note: str = "Explicitly resolved after operator verification",
 ) -> RecoveryCommand:
-    """Explicitly release an unresolved uncertainty guard after authorized manual review."""
+    """Explicitly release an unresolved uncertainty guard after authorized operator review.
+
+    Requires authenticated operator identity, authorized role, non-empty supporting evidence
+    reference, and records an immutable audit event on the linked Case.
+    """
+    norm_role = operator_role.strip().upper()
+    if norm_role not in AUTHORIZED_UNCERTAINTY_RESOLVER_ROLES or not resolved_by.strip():
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            f"UNAUTHORIZED_UNCERTAINTY_RESOLUTION: role '{operator_role}' is not authorized "
+            "to release an uncertain recovery command guard",
+            status_code=403,
+        )
+    if not supporting_evidence_ref.strip():
+        raise AppError(
+            ErrorCode.BAD_REQUEST,
+            "MISSING_RESOLUTION_EVIDENCE: supporting_evidence_ref is required to release "
+            "an uncertain recovery command guard",
+            status_code=400,
+        )
+
     row = db.scalar(
         select(RecoveryCommand)
         .where(
@@ -901,13 +1109,30 @@ def resolve_uncertain_recovery_command(
         )
     now = datetime.now(UTC)
     row.uncertainty_resolved_at = now
-    row.uncertainty_resolved_by = resolved_by
+    row.uncertainty_resolved_by = f"{norm_role}:{resolved_by.strip()}"
     verif = dict(row.verification_json or {})
     verif["manual_resolution_note"] = resolution_note
-    verif["manual_resolved_by"] = resolved_by
+    verif["manual_resolved_by"] = row.uncertainty_resolved_by
+    verif["manual_resolution_evidence_ref"] = supporting_evidence_ref.strip()
     verif["manual_resolved_at"] = now.isoformat()
     row.verification_json = verif
     row.updated_at = now
+    if row.case_id:
+        db.add(
+            CaseEvent(
+                id=f"CEV-{uuid.uuid4().hex[:10].upper()}",
+                case_id=row.case_id,
+                session_id=session_id,
+                type="UNCERTAIN_COMMAND_MANUALLY_RESOLVED",
+                payload_json={
+                    "command_id": row.id,
+                    "resolved_by": row.uncertainty_resolved_by,
+                    "supporting_evidence_ref": supporting_evidence_ref.strip(),
+                    "resolution_note": resolution_note,
+                },
+                created_at=now,
+            )
+        )
     db.commit()
     db.refresh(row)
     return row
