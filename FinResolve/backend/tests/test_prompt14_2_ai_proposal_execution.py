@@ -179,6 +179,9 @@ def test_agent_proposal_respects_escalation_rejects_bad_evidence_and_executes_va
     prop_bad_ev = StructuredAgentRecoveryProposal(
         case_id=case_a.id,
         run_id="RUN-BADEV-01",
+        target_order_id="ORD-PROP-01",
+        target_payment_id="PAY-PROP-01",
+        expected_version=1,
         supporting_evidence_ids=[ev_b.id],
         proposed_command="REQUEST_ORDER_SYNC",
         action_params={"expected_version": 1},
@@ -195,6 +198,9 @@ def test_agent_proposal_respects_escalation_rejects_bad_evidence_and_executes_va
     prop_claim_only = StructuredAgentRecoveryProposal(
         case_id=case_a.id,
         run_id="RUN-CLAIM-01",
+        target_order_id="ORD-PROP-01",
+        target_payment_id="PAY-PROP-01",
+        expected_version=1,
         supporting_evidence_ids=[ev_claim.id],
         proposed_command="REQUEST_ORDER_SYNC",
         action_params={"expected_version": 1},
@@ -210,6 +216,9 @@ def test_agent_proposal_respects_escalation_rejects_bad_evidence_and_executes_va
     prop_valid = StructuredAgentRecoveryProposal(
         case_id=case_a.id,
         run_id="RUN-VALID-01",
+        target_order_id="ORD-PROP-01",
+        target_payment_id="PAY-PROP-01",
+        expected_version=1,
         supporting_evidence_ids=[ev_a.id],
         proposed_command="REQUEST_ORDER_SYNC",
         action_params={"expected_version": 1},
@@ -470,6 +479,7 @@ def test_prompt14_3_proposal_fencing_rejects_stale_run_expired_superseded_and_wr
                 run_id="RUN-CURR-01",
                 anomaly_id=obs.id,
                 target_order_id="ORD-FENCE-01",
+                target_payment_id="PAY-FENCE-01",
                 expected_version=1,
                 supporting_evidence_ids=[ev.id],
                 proposed_command="REQUEST_ORDER_SYNC",

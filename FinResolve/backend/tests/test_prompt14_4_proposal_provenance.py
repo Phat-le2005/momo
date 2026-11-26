@@ -449,3 +449,132 @@ def test_prompt14_5_fail_closed_worker_fencing_rejects_missing_job_token_or_leas
         )
     assert e_ls.value.status_code == 409
     assert "MISSING_WORKER_LEASE" in e_ls.value.message
+
+    # 4 (Prompt 14.5 Fix 3): Missing required targets & stale/unrelated evidence MUST fail closed!
+    # 4a. Missing target_order_id -> 403 MISSING_REQUIRED_PROPOSAL_TARGET
+    with pytest.raises(AppError) as e_noord:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=StructuredAgentRecoveryProposal(
+                case_id=case_obj.id,
+                run_id="RUN-FC-01",
+                anomaly_id=obs.id,
+                target_order_id=None,
+                target_payment_id="PAY-FC-01",
+                expected_version=1,
+                supporting_evidence_ids=[ev.id],
+                proposed_command="REQUEST_ORDER_SYNC",
+            ),
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-FC-01",
+        )
+    assert e_noord.value.status_code == 403
+    assert "MISSING_REQUIRED_PROPOSAL_TARGET" in e_noord.value.message
+
+    # 4b. Missing target_payment_id -> 403 MISSING_REQUIRED_PROPOSAL_TARGET
+    with pytest.raises(AppError) as e_nopay:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=StructuredAgentRecoveryProposal(
+                case_id=case_obj.id,
+                run_id="RUN-FC-01",
+                anomaly_id=obs.id,
+                target_order_id="ORD-FC-01",
+                target_payment_id=None,
+                expected_version=1,
+                supporting_evidence_ids=[ev.id],
+                proposed_command="REQUEST_ORDER_SYNC",
+            ),
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-FC-01",
+        )
+    assert e_nopay.value.status_code == 403
+    assert "MISSING_REQUIRED_PROPOSAL_TARGET" in e_nopay.value.message
+
+    # 4c. Missing expected_version -> 403 MISSING_EXPECTED_VERSION
+    with pytest.raises(AppError) as e_nover:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=StructuredAgentRecoveryProposal(
+                case_id=case_obj.id,
+                run_id="RUN-FC-01",
+                anomaly_id=obs.id,
+                target_order_id="ORD-FC-01",
+                target_payment_id="PAY-FC-01",
+                expected_version=None,
+                supporting_evidence_ids=[ev.id],
+                proposed_command="REQUEST_ORDER_SYNC",
+            ),
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-FC-01",
+        )
+    assert e_nover.value.status_code == 403
+    assert "MISSING_EXPECTED_VERSION" in e_nover.value.message
+
+    # 4d. Stale supporting evidence (> 24h old) -> 403 STALE_SUPPORTING_EVIDENCE
+    ev_stale = Evidence(
+        id=f"EVD-STALE-{uuid.uuid4().hex[:8].upper()}",
+        case_id=case_obj.id,
+        session_id=sid,
+        kind=EvidenceKind.OBSERVED_FACT.value,
+        source="MINI_STORE_COMMERCE_HTTP",
+        source_ref="/api/v1/service/orders/ORD-FC-01",
+        payload_json={"order_id": "ORD-FC-01"},
+        observed_at=now - timedelta(hours=48),
+    )
+    ev_other_ord = Evidence(
+        id=f"EVD-OTH-{uuid.uuid4().hex[:8].upper()}",
+        case_id=case_obj.id,
+        session_id=sid,
+        kind=EvidenceKind.OBSERVED_FACT.value,
+        source="MINI_STORE_COMMERCE_HTTP",
+        source_ref="/api/v1/service/orders/ORD-OTHER-99",
+        payload_json={"order_id": "ORD-OTHER-99"},
+        observed_at=now,
+    )
+    db.add_all([ev_stale, ev_other_ord])
+    db.commit()
+
+    with pytest.raises(AppError) as e_stale:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=StructuredAgentRecoveryProposal(
+                case_id=case_obj.id,
+                run_id="RUN-FC-01",
+                anomaly_id=obs.id,
+                target_order_id="ORD-FC-01",
+                target_payment_id="PAY-FC-01",
+                expected_version=1,
+                supporting_evidence_ids=[ev_stale.id],
+                proposed_command="REQUEST_ORDER_SYNC",
+            ),
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-FC-01",
+        )
+    assert e_stale.value.status_code == 403
+    assert "STALE_SUPPORTING_EVIDENCE" in e_stale.value.message
+
+    # 4e. Evidence referencing unrelated order -> 403 EVIDENCE_TARGET_MISMATCH
+    with pytest.raises(AppError) as e_evmis:
+        validate_and_execute_agent_proposal(
+            db,
+            proposal=StructuredAgentRecoveryProposal(
+                case_id=case_obj.id,
+                run_id="RUN-FC-01",
+                anomaly_id=obs.id,
+                target_order_id="ORD-FC-01",
+                target_payment_id="PAY-FC-01",
+                expected_version=1,
+                supporting_evidence_ids=[ev_other_ord.id],
+                proposed_command="REQUEST_ORDER_SYNC",
+            ),
+            binding=binding,
+            obs=obs,
+            expected_run_id="RUN-FC-01",
+        )
+    assert e_evmis.value.status_code == 403
+    assert "EVIDENCE_TARGET_MISMATCH" in e_evmis.value.message

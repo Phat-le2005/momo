@@ -14,7 +14,7 @@ current authoritative business state before proposing or executing any capabilit
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import httpx
@@ -505,10 +505,63 @@ def validate_and_execute_agent_proposal(
         )
 
     # Non-mutating Agent recommendations are respected directly (NO hidden auto-recovery!)
-    if norm_cmd in ("REQUEST_MANUAL_REVIEW", "WAIT_FOR_OBSERVATION", "COLLECT_MORE_EVIDENCE"):
+    if is_non_mutating:
         return proposal, None
 
-    # 3. Validate supporting_evidence_ids belong to this exact Case + session and are OBSERVED_FACT
+    # 3 (Prompt 14.5 Fix 3): Command-specific required target schema validation!
+    # NEVER silently substitute anomaly defaults when the Agent omits required targets!
+    eff_order_id = proposal.target_order_id or (
+        str(proposal.action_params["order_id"]).strip()
+        if proposal.action_params.get("order_id")
+        else None
+    )
+    eff_payment_id = proposal.target_payment_id or (
+        str(proposal.action_params["payment_id"]).strip()
+        if proposal.action_params.get("payment_id")
+        else None
+    )
+    eff_event_id = (
+        str(proposal.action_params["event_id"]).strip()
+        if proposal.action_params.get("event_id")
+        else None
+    )
+    expected_version = proposal.expected_version
+    if expected_version is None:
+        raw_v = proposal.action_params.get("expected_version")
+        if isinstance(raw_v, int):
+            expected_version = raw_v
+
+    if norm_cmd in ("REQUEST_ORDER_SYNC", "REQUEST_PAYMENT_RECONCILIATION"):
+        if not eff_order_id:
+            raise AppError(
+                ErrorCode.FORBIDDEN,
+                f"MISSING_REQUIRED_PROPOSAL_TARGET: '{norm_cmd}' requires explicit target_order_id",
+                status_code=403,
+            )
+        if not eff_payment_id:
+            raise AppError(
+                ErrorCode.FORBIDDEN,
+                f"MISSING_REQUIRED_PROPOSAL_TARGET: '{norm_cmd}' requires explicit "
+                "target_payment_id",
+                status_code=403,
+            )
+        if expected_version is None:
+            raise AppError(
+                ErrorCode.FORBIDDEN,
+                f"MISSING_EXPECTED_VERSION: '{norm_cmd}' requires explicit expected_version",
+                status_code=403,
+            )
+    elif norm_cmd == "REQUEST_EVENT_REDELIVERY":
+        if not eff_event_id and not eff_order_id:
+            raise AppError(
+                ErrorCode.FORBIDDEN,
+                "MISSING_REQUIRED_PROPOSAL_TARGET: 'REQUEST_EVENT_REDELIVERY' requires "
+                "explicit event_id or target_order_id",
+                status_code=403,
+            )
+
+    # 4. Validate supporting_evidence_ids belong to this exact Case + session, are OBSERVED_FACT,
+    # are fresh (<= 24h), and do not contradict the target order!
     if not proposal.supporting_evidence_ids:
         raise AppError(
             ErrorCode.FORBIDDEN,
@@ -534,12 +587,29 @@ def validate_and_execute_agent_proposal(
             status_code=403,
         )
 
+    freshness_cutoff = datetime.now(UTC) - timedelta(hours=24)
+    for ev_row in ev_rows:
+        obs_ts = ev_row.observed_at
+        if obs_ts is not None:
+            if obs_ts.tzinfo is None:
+                obs_ts = obs_ts.replace(tzinfo=UTC)
+            if obs_ts < freshness_cutoff:
+                raise AppError(
+                    ErrorCode.FORBIDDEN,
+                    f"STALE_SUPPORTING_EVIDENCE: evidence '{ev_row.id}' observed at "
+                    f"{obs_ts.isoformat()} exceeds freshness window",
+                    status_code=403,
+                )
+        ev_order = (ev_row.payload_json or {}).get("order_id")
+        if eff_order_id and ev_order and str(ev_order).strip() != eff_order_id:
+            raise AppError(
+                ErrorCode.FORBIDDEN,
+                f"EVIDENCE_TARGET_MISMATCH: evidence '{ev_row.id}' references order "
+                f"'{ev_order}', not '{eff_order_id}'",
+                status_code=403,
+            )
+
     reader = build_connector_for_binding(binding, service_key=read_key, transport=transport)
-    expected_version = proposal.expected_version
-    if expected_version is None:
-        raw_v = proposal.action_params.get("expected_version")
-        if isinstance(raw_v, int):
-            expected_version = raw_v
 
     if expected_version is not None and obs.affected_order_id:
         try:
