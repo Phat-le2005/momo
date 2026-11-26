@@ -347,6 +347,9 @@ def run_acceptance(
         assert recovered_d is True, (
             f"Expected order {order_d_id} to recover to CONFIRMED, got {ord_d_status}"
         )
+        assert causal_chain_verified is True, (
+            f"Experiment D causal chain incomplete: anomalies={matching_anoms}, cmds={matching_cmds}"
+        )
 
         # 8. Experiment E & F: Unsupported command rejected + unauthorized status lookup blocked
         r_unsup = client.post(
