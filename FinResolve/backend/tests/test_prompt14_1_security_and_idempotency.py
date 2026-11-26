@@ -387,10 +387,15 @@ def test_unknown_outcome_reconciliation_via_receiver_status_lookup(
             return httpx.Response(
                 200,
                 json={
+                    "command_id": "RCV-MOCK-REC-01",
                     "idempotency_key": idemp_key,
                     "command": "REQUEST_ORDER_SYNC",
                     "request_hash": captured["request_hash"],
+                    "merchant_id": binding.merchant_id,
+                    "commerce_session_id": binding.commerce_session_id,
                     "world_epoch": binding.commerce_world_epoch,
+                    "target_order_id": obs.affected_order_id,
+                    "target_payment_id": obs.affected_payment_id,
                     "status": "EXECUTED",
                     "http_status": 200,
                     "result": {"command": "REQUEST_ORDER_SYNC", "status": "SYNCED"},

@@ -392,8 +392,8 @@ def test_fix3_http200_complete_identity_verifies_execution() -> None:
                     "details": {"reason_code": "IDEMPOTENCY_KEY_CONFLICT"},
                 }
             },
-            "FAILED",
-            "CONFIRMED_REJECTED",
+            "UNKNOWN_OUTCOME",
+            "COMMAND_EXECUTION_UNKNOWN",
         ),
     ],
 )

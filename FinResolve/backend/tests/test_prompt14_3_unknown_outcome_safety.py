@@ -110,11 +110,16 @@ def test_transient_404_preserves_unknown_outcome_blocks_replan_and_reconciles_on
             return httpx.Response(
                 200,
                 json={
+                    "command_id": "RCV-MOCK-UNK-01",
                     "status": "EXECUTED",
                     "command": "REQUEST_ORDER_SYNC",
                     "idempotency_key": cmd.idempotency_key,
                     "request_hash": "sha256-exact-hash-01",
+                    "merchant_id": binding.merchant_id,
+                    "commerce_session_id": binding.commerce_session_id,
                     "world_epoch": 1,
+                    "target_order_id": cmd.target_order_id,
+                    "target_payment_id": cmd.target_payment_id,
                     "result": {"status": "SYNCED", "order_status": "CONFIRMED"},
                 },
             )
@@ -476,7 +481,16 @@ def test_prompt14_5_ambiguous_transport_502_identity_mismatch_and_semantic_rejec
                         json=mock_receiver_response(request, status="REJECTED"),
                     )
                 if mode == "HTTP_409":
-                    return httpx.Response(409, json={"error": "VERSION_MISMATCH"})
+                    return httpx.Response(
+                        409,
+                        json={
+                            "error": {
+                                "code": "CONFLICT",
+                                "message": "VERSION_MISMATCH",
+                                "details": {"reason_code": "VERSION_MISMATCH"},
+                            }
+                        },
+                    )
             return httpx.Response(404)
 
         return httpx.MockTransport(_h)

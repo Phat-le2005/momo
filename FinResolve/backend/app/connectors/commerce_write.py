@@ -57,53 +57,41 @@ SUPPORTED_ESCALATED_STATUSES: frozenset[str] = frozenset(
     {"ESCALATED_MANUAL_REVIEW", "MANUAL_REVIEW"}
 )
 
-# Prompt 14.6 Fix 4: Machine-readable 409 conflict codes that prove NO mutation occurred
+# Prompt 14.7 Fix 2: Machine-readable 409 conflict codes that prove NO mutation occurred.
+# NOTE: IDEMPOTENCY_KEY_CONFLICT / REQUEST_HASH_MISMATCH are intentionally EXCLUDED because an
+# idempotency hash conflict cannot prove that an earlier command never executed!
 CONFIRMED_409_REJECTION_CODES: frozenset[str] = frozenset(
     {
         "VERSION_MISMATCH",
         "STALE_VERSION",
         "STALE_WORLD_EPOCH",
-        "IDEMPOTENCY_KEY_CONFLICT",
-        "REQUEST_HASH_MISMATCH",
         "SCOPE_MISMATCH",
         "INVALID_AUTHORIZATION",
     }
 )
 
 
+def _is_strict_int(val: Any) -> bool:
+    return isinstance(val, int) and not isinstance(val, bool)
+
+
 def _extract_conflict_reason_code(resp_json: dict[str, Any]) -> str:
-    """Extract machine-readable conflict reason code from a receiver HTTP 409 body."""
+    """Extract ONLY documented machine-readable conflict reason_code from HTTP 409 body.
+
+    Prompt 14.7 Fix 2: Never infer confirmed rejection from free-text message prefixes!
+    """
     if not isinstance(resp_json, dict):
         return ""
     direct = str(resp_json.get("reason_code") or "").strip().upper()
     if direct:
         return direct
     err_obj = resp_json.get("error")
-    if isinstance(err_obj, str):
-        err_up = err_obj.strip().upper()
-        for code in CONFIRMED_409_REJECTION_CODES:
-            if err_up.startswith(code):
-                return code
-        if err_up.startswith("COMMAND_IN_FLIGHT") or err_up.startswith("COMMAND_IN_PROGRESS"):
-            return "COMMAND_IN_FLIGHT"
     if isinstance(err_obj, dict):
         details = err_obj.get("details")
         if isinstance(details, dict):
             rc = str(details.get("reason_code") or "").strip().upper()
             if rc:
                 return rc
-        msg = str(err_obj.get("message") or "").strip().upper()
-        for code in CONFIRMED_409_REJECTION_CODES:
-            if msg.startswith(code):
-                return code
-        if msg.startswith("COMMAND_IN_FLIGHT") or msg.startswith("COMMAND_IN_PROGRESS"):
-            return "COMMAND_IN_FLIGHT"
-    detail_str = str(resp_json.get("detail") or "").strip().upper()
-    for code in CONFIRMED_409_REJECTION_CODES:
-        if detail_str.startswith(code):
-            return code
-    if detail_str.startswith("COMMAND_IN_FLIGHT") or detail_str.startswith("COMMAND_IN_PROGRESS"):
-        return "COMMAND_IN_FLIGHT"
     return ""
 
 
@@ -114,20 +102,27 @@ def _validate_receiver_http200_identity(
     expected_command: str,
     expected_request_hash: str,
     expected_merchant_id: str,
+    expected_commerce_session_id: str,
     expected_world_epoch: int,
     expected_order_id: str | None,
+    expected_payment_id: str | None = None,
+    expected_event_id: str | None = None,
 ) -> tuple[bool, str]:
-    """Strictly verify mandatory receiver identity & semantic status on HTTP 200 (Prompt 14.6)."""
+    """Strictly verify complete receiver identity envelope & semantic status on HTTP 200."""
     if not isinstance(resp_json, dict) or not resp_json:
         return False, "EMPTY_OR_MALFORMED_RESPONSE_BODY"
 
+    resp_cmd_id = str(resp_json.get("command_id") or resp_json.get("id") or "").strip()
     resp_idemp = str(resp_json.get("idempotency_key") or "").strip()
     resp_cmd = str(resp_json.get("command") or "").strip().upper()
     resp_hash = str(resp_json.get("request_hash") or "").strip()
     resp_merchant = str(resp_json.get("merchant_id") or "").strip()
+    resp_csess = str(resp_json.get("commerce_session_id") or "").strip()
     resp_status = str(resp_json.get("status") or "").strip().upper()
     resp_epoch = resp_json.get("world_epoch")
 
+    if not resp_cmd_id:
+        return False, "MISSING_RECEIVER_COMMAND_ID"
     if not resp_idemp or resp_idemp != expected_idempotency_key:
         return False, "MISSING_OR_MISMATCHED_IDEMPOTENCY_KEY"
     if not resp_cmd or resp_cmd != expected_command:
@@ -136,15 +131,41 @@ def _validate_receiver_http200_identity(
         return False, "MISSING_OR_MISMATCHED_REQUEST_HASH"
     if not resp_merchant or resp_merchant != expected_merchant_id:
         return False, "MISSING_OR_MISMATCHED_MERCHANT_SCOPE"
-    if resp_epoch is not None and int(resp_epoch) != int(expected_world_epoch):
-        return False, "MISMATCHED_WORLD_EPOCH"
+    if not resp_csess or resp_csess != expected_commerce_session_id:
+        return False, "MISSING_OR_MISMATCHED_COMMERCE_SESSION"
+    if (
+        not isinstance(resp_epoch, int)
+        or isinstance(resp_epoch, bool)
+        or resp_epoch != int(expected_world_epoch)
+    ):
+        return False, "MISSING_OR_INVALID_WORLD_EPOCH"
+
+    resp_order = str(resp_json.get("order_id") or resp_json.get("target_order_id") or "").strip()
+    resp_payment = str(
+        resp_json.get("payment_id") or resp_json.get("target_payment_id") or ""
+    ).strip()
+    resp_event = str(resp_json.get("event_id") or resp_json.get("target_event_id") or "").strip()
+
     if expected_order_id and expected_command in (
         "REQUEST_ORDER_SYNC",
         "REQUEST_PAYMENT_RECONCILIATION",
     ):
-        resp_order = str(resp_json.get("order_id") or "").strip()
         if not resp_order or resp_order != expected_order_id:
             return False, "MISSING_OR_MISMATCHED_TARGET_ORDER"
+    elif resp_order and expected_order_id and resp_order != expected_order_id:
+        return False, "MISMATCHED_TARGET_ORDER"
+
+    if expected_payment_id and expected_command == "REQUEST_ORDER_SYNC":
+        if not resp_payment or resp_payment != expected_payment_id:
+            return False, "MISSING_OR_MISMATCHED_TARGET_PAYMENT"
+    elif resp_payment and expected_payment_id and resp_payment != expected_payment_id:
+        return False, "MISMATCHED_TARGET_PAYMENT"
+
+    if expected_event_id and expected_command == "REQUEST_EVENT_REDELIVERY":
+        if not resp_event or resp_event != expected_event_id:
+            return False, "MISSING_OR_MISMATCHED_TARGET_EVENT"
+    elif resp_event and expected_event_id and resp_event != expected_event_id:
+        return False, "MISMATCHED_TARGET_EVENT"
 
     all_supported = (
         SUPPORTED_EXECUTED_STATUSES | SUPPORTED_REJECTED_STATUSES | SUPPORTED_ESCALATED_STATUSES
@@ -758,8 +779,11 @@ def execute_and_verify_commerce_recovery(
         expected_command=norm_cmd,
         expected_request_hash=req_hash,
         expected_merchant_id=binding.merchant_id,
+        expected_commerce_session_id=binding.commerce_session_id,
         expected_world_epoch=binding.commerce_world_epoch,
         expected_order_id=obs.affected_order_id,
+        expected_payment_id=obs.affected_payment_id,
+        expected_event_id=str(target_event_id) if target_event_id else None,
     )
     if not identity_ok:
         cmd_row.state = "UNKNOWN_OUTCOME"
@@ -1087,21 +1111,20 @@ def reconcile_unknown_recovery_command(
         )
 
     remote_status = str(status_data.get("status") or "").upper()
-    remote_hash = str(status_data.get("request_hash") or "").strip()
-    remote_cmd = str(status_data.get("command") or "").strip().upper()
-    remote_idemp = str(status_data.get("idempotency_key") or "").strip()
-    remote_epoch = status_data.get("world_epoch")
-
-    # Prompt 14.3 Fix 5: ALL mandatory identity fields must be present and match cmd_row!
-    if (
-        not remote_hash
-        or remote_hash != cmd_row.request_hash
-        or not remote_cmd
-        or remote_cmd != cmd_row.command.upper()
-        or not remote_idemp
-        or remote_idemp != cmd_row.idempotency_key
-        or (remote_epoch is not None and int(remote_epoch) != int(cmd_row.world_epoch))
-    ):
+    # Prompt 14.7 Fix 2: Validate the same complete identity envelope during status reconciliation!
+    recon_ok, recon_detail = _validate_receiver_http200_identity(
+        resp_json=status_data if isinstance(status_data, dict) else {},
+        expected_idempotency_key=cmd_row.idempotency_key,
+        expected_command=cmd_row.command.upper(),
+        expected_request_hash=cmd_row.request_hash,
+        expected_merchant_id=cmd_row.merchant_id,
+        expected_commerce_session_id=cmd_row.commerce_session_id,
+        expected_world_epoch=cmd_row.world_epoch,
+        expected_order_id=cmd_row.target_order_id,
+        expected_payment_id=cmd_row.target_payment_id,
+        expected_event_id=cmd_row.target_event_id,
+    )
+    if not recon_ok:
         return RecoveryExecutionResult(
             command_id=cmd_row.id,
             command=cmd_row.command,
@@ -1111,8 +1134,8 @@ def reconcile_unknown_recovery_command(
             verdict=RecoveryVerdict.UNKNOWN_OUTCOME.value,
             recovery_source=None,
             detail=(
-                "Receiver status lookup missing or mismatched mandatory identity fields "
-                "(idempotency_key/request_hash/command/world_epoch); refusing reconciliation"
+                f"Receiver status lookup failed strict identity check ({recon_detail}); "
+                "refusing reconciliation and preserving UNKNOWN_OUTCOME"
             ),
             response_payload=status_data,
         )
