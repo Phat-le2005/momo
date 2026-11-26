@@ -162,13 +162,15 @@ def run_acceptance(
         r_ord_after = client.get(
             f"{commerce_url}/api/v1/store/orders/{order_a_id}", headers=cust_headers
         )
-        assert r_ord_after.status_code == 200
-        assert r_ord_after.json()["status"] == "CONFIRMED"
+        assert r_ord_after.status_code == 200, r_ord_after.text
+        ord_after_body = r_ord_after.json()
+        ord_after = ord_after_body.get("order") or ord_after_body
+        assert ord_after["status"] == "CONFIRMED", ord_after
         report["checks"]["experiment_a_healthy_commerce"] = {
             "order_id": order_a_id,
             "payment_id": pay_a["id"],
             "payment_status": pay_a["status"],
-            "order_status": r_ord_after.json()["status"],
+            "order_status": ord_after["status"],
         }
 
         # 4. Experiment C: Real rendered-pixel receipt upload -> Tesseract PIXEL_OCR
@@ -216,9 +218,10 @@ def run_acceptance(
         r_tel = client.get(
             f"{commerce_url}/api/v1/service/telemetry",
             headers={
-                "X-Service-Key": service_read_key,
+                "X-Commerce-Service-Key": service_read_key,
                 "X-Merchant-Id": "MERCHANT_FINSHOP_01",
                 "X-Commerce-Session-Id": "CSESS_FINSHOP_DEFAULT_01",
+                "X-World-Epoch": "1",
             },
         )
         assert r_tel.status_code == 200, r_tel.text
