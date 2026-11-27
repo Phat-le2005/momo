@@ -522,7 +522,9 @@ def execute_and_verify_commerce_recovery(
             "STALE_WORLD_EPOCH_AT_DISPATCH: dashboard world epoch changed before dispatch",
             status_code=409,
         )
-    if sup_state_now is None and (obs.world_epoch > 1 or fresh_binding.world_epoch != obs.world_epoch):
+    if sup_state_now is None and (
+        obs.world_epoch > 1 or fresh_binding.world_epoch != obs.world_epoch
+    ):
         raise AppError(
             ErrorCode.FORBIDDEN,
             "CONTROLLER_SUPERVISOR_STATE_MISSING: supervisor state missing for non-initial epoch",

@@ -453,7 +453,10 @@ def get_experience_overview(
         preview_msg_vi = (
             "Sandbox dùng chung đang được điều khiển bởi phiên khác (chế độ chỉ xem)."
             if other_owner_present
-            else "Phiên hiện tại đang ở chế độ chỉ xem (READ_ONLY_PREVIEW). Cần xác thực Operator để điều khiển."
+            else (
+                "Phiên hiện tại đang ở chế độ chỉ xem (READ_ONLY_PREVIEW). "
+                "Cần xác thực Operator để điều khiển."
+            )
         )
         return {
             "session_id": sid,

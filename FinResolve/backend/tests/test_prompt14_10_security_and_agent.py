@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -32,7 +33,6 @@ from app.models.cases import Case, CaseEvent, Evidence
 from app.models.enums import CaseState, EvidenceKind, SessionStatus
 from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
 from app.models.session import DemoSession
-from app.models.supervisor import SupervisorState
 from app.monitoring.service import ensure_commerce_binding
 from app.supervisor.service import ensure_supervisor_state
 
@@ -218,7 +218,7 @@ def test_commerce_write_dispatch_fails_closed_on_expired_session_or_revoked_bind
 
 
 def test_llm_adapter_retries_transient_503_and_falls_back_to_configured_model() -> None:
-    """LLMModelAdapter retries HTTP 503 with bounded backoff and falls back to MODEL_FALLBACK_NAME."""
+    """LLMModelAdapter retries HTTP 503 with bounded backoff and falls back safely."""
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -252,7 +252,7 @@ def test_llm_adapter_retries_transient_503_and_falls_back_to_configured_model() 
         model_provider="gemini",
         model_name="gemini-3.8-flash",
         model_fallback_name="gemini-3.5-flash-lite",
-        model_api_key="test-key-not-real",
+        model_api_key=SecretStr("test-key-not-real"),
         model_max_retries=1,
         model_timeout_seconds=10.0,
     )
@@ -445,7 +445,9 @@ def _run_replanning_test(
         def generate_structured_json(self, system_prompt: str, user_message: str) -> None:
             return None
 
-    rt = BoundedAgentRuntime(db_session, adapter=ReplanningFakeAdapter(), max_steps=6, max_replans=2)
+    rt = BoundedAgentRuntime(
+        db_session, adapter=ReplanningFakeAdapter(), max_steps=6, max_replans=2
+    )
     res = rt.investigate_case(case_id=case.id, session_id=sess.id)
 
     assert res.stop_reason == "ACTION_PROPOSED"

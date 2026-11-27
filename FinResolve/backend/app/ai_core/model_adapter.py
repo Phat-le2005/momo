@@ -204,7 +204,10 @@ class LLMModelAdapter:
                 for idx, active_model in enumerate(models_to_try):
                     if idx > 0 and last_exc is not None:
                         self._last_fallback_reason = sanitize_provider_error(last_exc)
-                    max_attempts = 1 + (self._max_retries if idx == 0 else min(1, self._max_retries))
+                    retry_budget = (
+                        self._max_retries if idx == 0 else min(1, self._max_retries)
+                    )
+                    max_attempts = 1 + retry_budget
                     for attempt in range(max_attempts):
                         try:
                             content, p_tok, c_tok, t_tok = self._dispatch_provider_once(
