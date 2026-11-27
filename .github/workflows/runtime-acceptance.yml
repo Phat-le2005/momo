@@ -63,12 +63,11 @@ jobs:
           mkdir -p /tmp/pw-runner
           cd /tmp/pw-runner
           npm init -y > /dev/null
-          npm install --no-save @playwright/test@1.52.0
-          npx playwright install chromium
-          sudo npx playwright install-deps chromium || true
-          printf 'module.exports = { testDir: ".", use: { browserName: "chromium", headless: true } };\n' > /tmp/pw-runner/playwright.config.js
+          npm install @playwright/test@1.52.0
+          ./node_modules/.bin/playwright install chromium
+          printf 'module.exports = { testDir: ".", timeout: 30000, use: { browserName: "chromium", headless: true } };\n' > /tmp/pw-runner/playwright.config.js
           cp "${GITHUB_WORKSPACE}/FinResolve/frontend/e2e/guardian-experience.spec.ts" /tmp/pw-runner/guardian-experience.spec.ts
-          FINRESOLVE_WEB_URL=http://localhost:3000 npx playwright test --reporter=list | tee "${GITHUB_WORKSPACE}/playwright-e2e-output.txt"
+          FINRESOLVE_WEB_URL=http://localhost:3000 ./node_modules/.bin/playwright test --reporter=list | tee "${GITHUB_WORKSPACE}/playwright-e2e-output.txt"
 
       - name: Capture final compose ps
         if: always()
