@@ -82,8 +82,10 @@ class Settings(BaseSettings):
 
     model_provider: str = ""
     model_name: str = ""
+    model_fallback_name: str = ""
     model_api_key: SecretStr = SecretStr("")
     model_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    model_max_retries: int = Field(default=2, ge=0, le=5)
     model_budget_tokens: int = Field(default=20000, ge=0)
 
     demo_max_scenario_runs_per_session: int = Field(default=10, ge=1, le=200)

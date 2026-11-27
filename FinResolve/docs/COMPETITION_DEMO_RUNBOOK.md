@@ -3,7 +3,7 @@
 ## 1. Prerequisites & Environment Configuration
 
 - Docker Desktop / Docker Engine with Compose v2
-- Optional (for Live AI mode): an authorized Google Gemini API key (`MODEL_PROVIDER=gemini`, `MODEL_NAME=gemini-3.1-flash-lite`, `MODEL_API_KEY=<your-key>`)
+- Optional (for Live AI mode): an authorized Google Gemini API key (`MODEL_PROVIDER=gemini`, `MODEL_NAME=gemini-3.5-flash-lite`, `MODEL_FALLBACK_NAME=gemini-3.1-flash-lite`, `MODEL_API_KEY=<your-key>`)
 - **Security rule**: Never commit `.env` or secret keys. VNPAY remains intentionally disabled (`LOCAL_MOCK` only).
 
 ### Step 1: Generate ephemeral 256-bit local secrets (including `EXPERIENCE_OPERATOR_TOKEN`)
@@ -13,7 +13,8 @@ python FinResolve/infra/init_local_secrets.py
 To enable **Live AI mode**, append your authorized model credentials to `FinResolve/infra/.env`:
 ```env
 MODEL_PROVIDER=gemini
-MODEL_NAME=gemini-3.1-flash-lite
+MODEL_NAME=gemini-3.5-flash-lite
+MODEL_FALLBACK_NAME=gemini-3.1-flash-lite
 MODEL_API_KEY=<YOUR_AUTHORIZED_KEY>
 ```
 *(If `MODEL_API_KEY` is omitted, FinResolve runs in transparent `DEMO_RULES` deterministic mode and displays `Chế độ DEMO_RULES` in the Command Center header.)*
@@ -40,8 +41,8 @@ docker compose --env-file FinResolve/infra/.env -f FinResolve/infra/docker-compo
 ## 3. Secure Shared Sandbox Ownership Procedure
 
 The competition stack operates a **controlled single-workspace shared sandbox (`SHARED_DEMO_SANDBOX`)**:
-1. Anonymous visitors without `EXPERIENCE_OPERATOR_TOKEN` automatically receive `workspace_role: READ_ONLY_PREVIEW` (zero private business data, `403` on scan/reset).
-2. An authorized operator claims `CONTROLLER` via `POST /api/v1/experience/bootstrap` with header `X-Operator-Token: <EXPERIENCE_OPERATOR_TOKEN>` (read from `FinResolve/infra/.env` on the presenter host — never embedded in frontend bundles).
+1. Anonymous visitors without `EXPERIENCE_OPERATOR_TOKEN` automatically receive `workspace_role: READ_ONLY_PREVIEW` (zero private business data, `403 CONTROLLER_AUTHORIZATION_REQUIRED` on `/scan`, `/reset`, and `/release`; mutation buttons disabled in UI).
+2. An authorized operator clicks **Kích hoạt Operator** in the Command Center top bar (or sends `POST /api/v1/experience/bootstrap` with header `X-Operator-Token: <EXPERIENCE_OPERATOR_TOKEN>` read from `FinResolve/infra/.env`). The raw operator secret is sent only to the backend and is never stored in browser storage.
 3. Reloading restores the same controller session via `X-Demo-Session`.
 4. To hand off control cleanly to another presenter session, call `POST /api/v1/experience/release` (blocked with `409 CONFLICT` if any unresolved `UNKNOWN_OUTCOME` recovery command exists).
 

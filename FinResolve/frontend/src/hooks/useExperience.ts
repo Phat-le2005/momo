@@ -28,6 +28,7 @@ export type UseExperienceState = {
   scanNow: () => Promise<void>;
   resetSandbox: () => Promise<void>;
   retryBootstrap: () => Promise<void>;
+  activateOperatorControl: (operatorToken: string) => Promise<boolean>;
 };
 
 export function useExperience(): UseExperienceState {
@@ -290,6 +291,52 @@ export function useExperience(): UseExperienceState {
     }
   }, [pushToast, refreshNow, resetting]);
 
+  const activateOperatorControl = useCallback(
+    async (operatorToken: string): Promise<boolean> => {
+      const trimmed = operatorToken.trim();
+      if (!trimmed) return false;
+      try {
+        // Never persist raw operator secret in sessionStorage/localStorage; send only to backend
+        const boot = await bootstrapExperience(tokenRef.current, undefined, trimmed);
+        if (!mountedRef.current) return false;
+        tokenRef.current = boot.session.token;
+        if (typeof window !== "undefined") {
+          window.sessionStorage.setItem(EXPERIENCE_TOKEN_STORAGE_KEY, boot.session.token);
+        }
+        setBootstrap(boot);
+        const granted = boot.session.workspace_role === "CONTROLLER";
+        if (granted) {
+          pushToast({
+            id: `op-ok-${Date.now()}`,
+            tone: "success",
+            title: "Đã kích hoạt quyền điều khiển Operator",
+            detail: "Phiên hiện tại đã được cấp quyền CONTROLLER để quét và reset sandbox.",
+          });
+        } else {
+          pushToast({
+            id: `op-deny-${Date.now()}`,
+            tone: "warning",
+            title: "Không thể cấp quyền CONTROLLER",
+            detail:
+              "Mã Operator không hợp lệ hoặc sandbox dùng chung đang có phiên khác điều khiển.",
+          });
+        }
+        await refreshNow();
+        return granted;
+      } catch (err) {
+        if (!mountedRef.current) return false;
+        pushToast({
+          id: `op-err-${Date.now()}`,
+          tone: "warning",
+          title: "Xác thực Operator thất bại",
+          detail: err instanceof Error ? err.message : "Lỗi kết nối API.",
+        });
+        return false;
+      }
+    },
+    [pushToast, refreshNow],
+  );
+
   return {
     loading,
     error,
@@ -303,5 +350,6 @@ export function useExperience(): UseExperienceState {
     scanNow,
     resetSandbox,
     retryBootstrap,
+    activateOperatorControl,
   };
 }

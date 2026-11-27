@@ -184,6 +184,65 @@ def _count_unresolved_guards_for_scope(
     )
 
 
+def _is_session_active(sess: DemoSession | None) -> bool:
+    if sess is None or sess.status != SessionStatus.ACTIVE.value:
+        return False
+    exp = sess.expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=UTC)
+    return exp > datetime.now(UTC)
+
+
+def _require_active_controller_binding(
+    db: Session,
+    *,
+    current_session: DemoSession,
+    sup_state: SupervisorState,
+) -> CommerceSourceBinding | None:
+    """Fail-closed controller authorization gate for mutating experience endpoints.
+
+    When Commerce sandbox is configured, the caller MUST already hold an active enabled
+    CommerceSourceBinding for `(current_session.id, sup_state.world_epoch)` and an active,
+    unexpired DemoSession. READ_ONLY_PREVIEW guests can NEVER self-elevate via `/reset`,
+    `/scan`, or `/release`.
+    """
+    if not _is_session_active(current_session):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="SESSION_EXPIRED_OR_INACTIVE",
+        )
+    settings = get_settings()
+    if not settings.commerce_service_base_url.strip():
+        return None
+
+    binding = db.scalar(
+        select(CommerceSourceBinding).where(
+            CommerceSourceBinding.session_id == current_session.id,
+            CommerceSourceBinding.world_epoch == sup_state.world_epoch,
+            CommerceSourceBinding.is_enabled.is_(True),
+        )
+    )
+    if binding is not None:
+        return binding
+
+    other_owner = _find_active_shared_sandbox_owner(
+        db,
+        merchant_id=settings.commerce_merchant_id,
+        commerce_session_id=settings.commerce_session_id,
+        commerce_world_epoch=settings.commerce_world_epoch,
+        exclude_session_id=current_session.id,
+    )
+    if other_owner is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="SHARED_SANDBOX_CONTROLLED_BY_ANOTHER_WORKSPACE",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="CONTROLLER_AUTHORIZATION_REQUIRED",
+    )
+
+
 def _resolve_existing_active_session(
     db: Session,
     session_token: str | None,
@@ -191,12 +250,7 @@ def _resolve_existing_active_session(
     if not session_token or not session_token.strip():
         return None
     sess = db.scalar(select(DemoSession).where(DemoSession.token == session_token.strip()))
-    if sess is None or sess.status != SessionStatus.ACTIVE.value:
-        return None
-    exp = sess.expires_at
-    if exp.tzinfo is None:
-        exp = exp.replace(tzinfo=UTC)
-    if exp <= datetime.now(UTC):
+    if not _is_session_active(sess):
         return None
     return sess
 
@@ -383,25 +437,29 @@ def get_experience_overview(
         .order_by(CommerceSourceBinding.created_at.desc())
         .limit(1)
     )
-    is_read_only_preview = (
-        binding is None
-        and bool(settings.commerce_service_base_url.strip())
-        and _sandbox_isolation_mode(settings.commerce_session_id) == "SHARED_DEMO_SANDBOX"
-        and _find_active_shared_sandbox_owner(
-            db,
-            merchant_id=settings.commerce_merchant_id,
-            commerce_session_id=settings.commerce_session_id,
-            commerce_world_epoch=settings.commerce_world_epoch,
-            exclude_session_id=sid,
-        )
-        is not None
-    )
+    is_read_only_preview = binding is None and bool(settings.commerce_service_base_url.strip())
     if is_read_only_preview:
+        other_owner_present = (
+            _sandbox_isolation_mode(settings.commerce_session_id) == "SHARED_DEMO_SANDBOX"
+            and _find_active_shared_sandbox_owner(
+                db,
+                merchant_id=settings.commerce_merchant_id,
+                commerce_session_id=settings.commerce_session_id,
+                commerce_world_epoch=settings.commerce_world_epoch,
+                exclude_session_id=sid,
+            )
+            is not None
+        )
+        preview_msg_vi = (
+            "Sandbox dùng chung đang được điều khiển bởi phiên khác (chế độ chỉ xem)."
+            if other_owner_present
+            else "Phiên hiện tại đang ở chế độ chỉ xem (READ_ONLY_PREVIEW). Cần xác thực Operator để điều khiển."
+        )
         return {
             "session_id": sid,
             "world_epoch": epoch,
             "workspace_role": "READ_ONLY_PREVIEW",
-            "sandbox_isolation_mode": "SHARED_DEMO_SANDBOX",
+            "sandbox_isolation_mode": _sandbox_isolation_mode(settings.commerce_session_id),
             "unresolved_uncertainty_guards": 0,
             "updated_at": datetime.now(UTC).isoformat(),
             "guardian": {
@@ -433,9 +491,7 @@ def get_experience_overview(
                 "outbox_lag": None,
                 "unsynced_payments": None,
                 "baseline_status": "WARMING_UP",
-                "baseline_message_vi": (
-                    "Sandbox dùng chung đang được điều khiển bởi phiên khác (chế độ chỉ xem)."
-                ),
+                "baseline_message_vi": preview_msg_vi,
                 "baselines": [],
             },
             "anomalies": [],
@@ -697,6 +753,7 @@ def get_experience_overview(
     return {
         "session_id": sid,
         "world_epoch": epoch,
+        "workspace_role": "CONTROLLER",
         "sandbox_isolation_mode": _sandbox_isolation_mode(
             binding.commerce_session_id if binding else settings.commerce_session_id
         ),
@@ -817,33 +874,13 @@ def trigger_experience_scan(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Run one bounded scan for the caller's own session binding (never crosses session scope)."""
+    """Run one bounded scan for the caller's own active controller binding."""
     sid = current_session.id
     sup_state = ensure_supervisor_state(db, sid)
-    binding = db.scalar(
-        select(CommerceSourceBinding).where(
-            CommerceSourceBinding.session_id == sid,
-            CommerceSourceBinding.world_epoch == sup_state.world_epoch,
-            CommerceSourceBinding.is_enabled.is_(True),
-        )
+    binding = _require_active_controller_binding(
+        db, current_session=current_session, sup_state=sup_state
     )
     if binding is None:
-        settings = get_settings()
-        if (
-            settings.commerce_service_base_url.strip()
-            and _find_active_shared_sandbox_owner(
-                db,
-                merchant_id=settings.commerce_merchant_id,
-                commerce_session_id=settings.commerce_session_id,
-                commerce_world_epoch=settings.commerce_world_epoch,
-                exclude_session_id=sid,
-            )
-            is not None
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="SHARED_SANDBOX_CONTROLLED_BY_ANOTHER_WORKSPACE",
-            )
         return {"scanned": False, "connectivity_status": "UNCONFIGURED"}
 
     summary = run_binding_scan(db, binding=binding, auto_create_cases=True)
@@ -868,7 +905,9 @@ def reset_experience_session(
 ) -> dict[str, Any]:
     """Increment dashboard world_epoch atomically under row lock without touching other sessions.
 
-    Prompt 14.8 Fix 2:
+    Prompt 14.8 + 14.10 Security Invariants:
+    - Fail-closed: caller MUST already hold an active enabled controller binding (READ_ONLY_PREVIEW
+      guests can NEVER call /reset to self-elevate to CONTROLLER).
     - Acquires SELECT ... FOR UPDATE on SupervisorState so concurrent resets never lose increments.
     - Cancels old PROPOSED and APPROVED (not yet executed) ActionProposals from prior epochs.
     - Cancels stale QUEUED SupervisorJobs from prior epochs.
@@ -878,20 +917,12 @@ def reset_experience_session(
     sid = current_session.id
     settings = get_settings()
 
-    # Enforce shared sandbox ownership on reset when commerce is configured
     if settings.commerce_service_base_url.strip():
-        other_owner = _find_active_shared_sandbox_owner(
-            db,
-            merchant_id=settings.commerce_merchant_id,
-            commerce_session_id=settings.commerce_session_id,
-            commerce_world_epoch=settings.commerce_world_epoch,
-            exclude_session_id=sid,
+        owner_lock_key = (
+            f"sandbox_owner:{settings.commerce_merchant_id}:"
+            f"{settings.commerce_session_id}:{settings.commerce_world_epoch}"
         )
-        if other_owner is not None:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="SHARED_SANDBOX_CONTROLLED_BY_ANOTHER_WORKSPACE",
-            )
+        db.execute(sa_text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": owner_lock_key})
 
     ensure_supervisor_state(db, sid)
     sup_state = db.scalar(
@@ -899,8 +930,18 @@ def reset_experience_session(
     )
     if sup_state is None:
         sup_state = ensure_supervisor_state(db, sid)
+
+    # Prompt 14.10 P0 Fix: Fail-closed controller verification BEFORE advancing epoch or binding!
+    existing_binding = _require_active_controller_binding(
+        db, current_session=current_session, sup_state=sup_state
+    )
     prev_epoch = sup_state.world_epoch
     now = datetime.now(UTC)
+
+    # Disable previous-epoch binding cleanly before creating the new epoch binding
+    if existing_binding is not None:
+        existing_binding.is_enabled = False
+        existing_binding.updated_at = now
 
     # Cancel old PROPOSED and APPROVED (undispatched) ActionProposals before advancing epoch
     old_props = list(
@@ -984,9 +1025,11 @@ def release_experience_ownership(
     current_session: DemoSession = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Release shared sandbox ownership ONLY when zero unresolved uncertain guards exist."""
+    """Release shared sandbox ownership ONLY for the active controller when zero guards exist."""
     sid = current_session.id
     settings = get_settings()
+    sup_state = ensure_supervisor_state(db, sid)
+    _require_active_controller_binding(db, current_session=current_session, sup_state=sup_state)
     unresolved = _count_unresolved_guards_for_scope(
         db,
         merchant_id=settings.commerce_merchant_id,

@@ -14,6 +14,7 @@ Hard Domain Invariants:
 from __future__ import annotations
 
 import json
+import random
 import time
 from typing import Any, Protocol
 
@@ -50,6 +51,8 @@ class ModelInvocationResult(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     latency_ms: int = 0
+    retry_count: int = 0
+    fallback_reason: str | None = None
 
 
 class StructuredJsonInvocationResult(BaseModel):
@@ -65,6 +68,8 @@ class StructuredJsonInvocationResult(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     latency_ms: int = 0
+    retry_count: int = 0
+    fallback_reason: str | None = None
 
 
 class ModelAdapter(Protocol):
@@ -94,9 +99,14 @@ class LLMModelAdapter:
         self._settings = settings or get_settings()
         self._provider = self._settings.model_provider.strip().lower()
         self._model_name = self._settings.model_name.strip()
+        self._fallback_model_name = self._settings.model_fallback_name.strip()
         self._api_key = self._settings.model_api_key.get_secret_value().strip()
         self._timeout = self._settings.model_timeout_seconds
+        self._max_retries = self._settings.model_max_retries
         self._http_client = http_client
+        self._last_used_model: str = self._model_name
+        self._last_retry_count: int = 0
+        self._last_fallback_reason: str | None = None
 
         if not self._provider or not self._model_name or not self._api_key:
             raise ValueError(
@@ -111,13 +121,50 @@ class LLMModelAdapter:
     def adapter_name(self) -> str:
         return f"LLMModelAdapter({self._provider}:{self._model_name})"
 
+    def _dispatch_provider_once(
+        self,
+        client: httpx.Client,
+        system_prompt: str,
+        user_message: str,
+        model_name: str,
+    ) -> tuple[str, int, int, int]:
+        orig_model = self._model_name
+        self._model_name = model_name
+        try:
+            if self._provider in ("gemini", "google", "google_gemini"):
+                return self._call_gemini(client, system_prompt, user_message)
+            if self._provider == "anthropic":
+                return self._call_anthropic(client, system_prompt, user_message)
+            return self._call_openai_compatible(client, system_prompt, user_message)
+        finally:
+            self._model_name = orig_model
+
+    @staticmethod
+    def _is_retryable_status(exc: Exception) -> tuple[bool, float | None]:
+        """Return (is_retryable, retry_after_seconds) for transient HTTP 429/500/503 or timeouts."""
+        if isinstance(exc, httpx.HTTPStatusError):
+            code = exc.response.status_code
+            if code in (429, 500, 502, 503, 504):
+                ra = exc.response.headers.get("retry-after")
+                if ra:
+                    try:
+                        return True, max(0.2, min(float(ra), 5.0))
+                    except ValueError:
+                        pass
+                return True, None
+            return False, None
+        if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+            return True, None
+        return False, None
+
     def _invoke_provider(
         self,
         system_prompt: str,
         user_message: str,
     ) -> tuple[str, int, int, int]:
-        """Single shared external LLM provider boundary protected by `llm_concurrency_guard()`
-        and session/worker `RuntimeExecutionContext` budgets and telemetry."""
+        """Single shared external LLM provider boundary protected by `llm_concurrency_guard()`,
+        bounded transient retry/backoff (429/500/503), optional verified fallback model, and
+        session/worker `RuntimeExecutionContext` budgets and telemetry."""
         exec_ctx = get_execution_context()
         if exec_ctx is not None:
             exec_ctx.before_llm_call()
@@ -133,29 +180,72 @@ class LLMModelAdapter:
                 exec_ctx.release_llm_reservation()
             raise
 
+        self._last_used_model = self._model_name
+        self._last_retry_count = 0
+        self._last_fallback_reason = None
+        deadline = time.monotonic() + max(self._timeout * 1.8, 15.0)
+
         try:
             client = self._http_client or httpx.Client(timeout=self._timeout)
             close_client = self._http_client is None
             try:
-                if self._provider in ("gemini", "google", "google_gemini"):
-                    content, p_tok, c_tok, t_tok = self._call_gemini(
-                        client, system_prompt, user_message
-                    )
-                elif self._provider == "anthropic":
-                    content, p_tok, c_tok, t_tok = self._call_anthropic(
-                        client, system_prompt, user_message
-                    )
-                else:
-                    content, p_tok, c_tok, t_tok = self._call_openai_compatible(
-                        client, system_prompt, user_message
-                    )
+                models_to_try = [self._model_name]
+                if (
+                    self._fallback_model_name
+                    and self._fallback_model_name != self._model_name
+                ):
+                    models_to_try.append(self._fallback_model_name)
+
+                last_exc: Exception | None = None
+                content = ""
+                p_tok = c_tok = t_tok = 0
+                succeeded = False
+
+                for idx, active_model in enumerate(models_to_try):
+                    if idx > 0 and last_exc is not None:
+                        self._last_fallback_reason = sanitize_provider_error(last_exc)
+                    max_attempts = 1 + (self._max_retries if idx == 0 else min(1, self._max_retries))
+                    for attempt in range(max_attempts):
+                        try:
+                            content, p_tok, c_tok, t_tok = self._dispatch_provider_once(
+                                client, system_prompt, user_message, active_model
+                            )
+                            self._last_used_model = active_model
+                            succeeded = True
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                            retryable, retry_after = self._is_retryable_status(exc)
+                            has_more_attempts = attempt + 1 < max_attempts
+                            remaining = deadline - time.monotonic()
+                            if retryable and has_more_attempts and remaining > 0.5:
+                                self._last_retry_count += 1
+                                base_delay = (
+                                    retry_after
+                                    if retry_after is not None
+                                    else min(0.6 * (2**attempt), 4.0)
+                                )
+                                jitter = random.uniform(0.05, 0.25)  # noqa: S311
+                                time.sleep(min(base_delay + jitter, max(0.1, remaining - 0.3)))
+                                continue
+                            break
+                    if succeeded:
+                        break
+                    # Only try fallback model on transient/overload/quota/not-found errors
+                    if last_exc is not None:
+                        retryable_fb, _ = self._is_retryable_status(last_exc)
+                        if not retryable_fb:
+                            break
+
+                if not succeeded and last_exc is not None:
+                    raise last_exc
             except Exception as exc:
                 if exec_ctx is not None:
                     is_timeout = isinstance(exc, (httpx.TimeoutException, TimeoutError))
                     exec_ctx.record_llm_outcome(
                         LlmInvocationRecord(
                             provider=self._provider,
-                            model_name=self._model_name,
+                            model_name=self._last_used_model,
                             succeeded=False,
                             timed_out=is_timeout,
                             is_fallback=False,
@@ -174,7 +264,7 @@ class LLMModelAdapter:
             exec_ctx.record_llm_outcome(
                 LlmInvocationRecord(
                     provider=self._provider,
-                    model_name=self._model_name,
+                    model_name=self._last_used_model,
                     succeeded=True,
                     timed_out=False,
                     is_fallback=False,
@@ -206,14 +296,16 @@ class LLMModelAdapter:
         return ModelInvocationResult(
             plan=validated_plan,
             model_mode=ModelMode.LLM_API,
-            adapter_name=self.adapter_name,
+            adapter_name=f"LLMModelAdapter({self._provider}:{self._last_used_model})",
             provider=self._provider,
-            model_name=self._model_name,
+            model_name=self._last_used_model,
             is_fallback=False,
             prompt_tokens=p_tok,
             completion_tokens=c_tok,
             total_tokens=t_tok,
             latency_ms=latency_ms,
+            retry_count=self._last_retry_count,
+            fallback_reason=self._last_fallback_reason,
         )
 
     def generate_structured_json(
@@ -230,14 +322,16 @@ class LLMModelAdapter:
         return StructuredJsonInvocationResult(
             data=parsed_obj,
             model_mode=ModelMode.LLM_API,
-            adapter_name=self.adapter_name,
+            adapter_name=f"LLMModelAdapter({self._provider}:{self._last_used_model})",
             provider=self._provider,
-            model_name=self._model_name,
+            model_name=self._last_used_model,
             is_fallback=False,
             prompt_tokens=p_tok,
             completion_tokens=c_tok,
             total_tokens=t_tok,
             latency_ms=latency_ms,
+            retry_count=self._last_retry_count,
+            fallback_reason=self._last_fallback_reason,
         )
 
     def _resolve_openai_url(self) -> str:
@@ -256,6 +350,8 @@ class LLMModelAdapter:
         client: httpx.Client,
         system_prompt: str,
         user_message: str,
+        *,
+        model_name: str | None = None,
     ) -> tuple[str, int, int, int]:
         url = self._resolve_openai_url()
         headers = {
@@ -263,7 +359,7 @@ class LLMModelAdapter:
             "Content-Type": "application/json",
         }
         payload: dict[str, Any] = {
-            "model": self._model_name,
+            "model": model_name or self._model_name,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
@@ -287,10 +383,13 @@ class LLMModelAdapter:
         client: httpx.Client,
         system_prompt: str,
         user_message: str,
+        *,
+        model_name: str | None = None,
     ) -> tuple[str, int, int, int]:
+        eff_model = model_name or self._model_name
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self._model_name}:generateContent"
+            f"{eff_model}:generateContent"
         )
         headers = {
             "Content-Type": "application/json",
@@ -320,6 +419,8 @@ class LLMModelAdapter:
         client: httpx.Client,
         system_prompt: str,
         user_message: str,
+        *,
+        model_name: str | None = None,
     ) -> tuple[str, int, int, int]:
         url = "https://api.anthropic.com/v1/messages"
         headers = {
@@ -328,7 +429,7 @@ class LLMModelAdapter:
             "Content-Type": "application/json",
         }
         payload: dict[str, Any] = {
-            "model": self._model_name,
+            "model": model_name or self._model_name,
             "max_tokens": 1024,
             "temperature": 0.1,
             "system": system_prompt,

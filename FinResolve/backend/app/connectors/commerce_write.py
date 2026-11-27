@@ -482,14 +482,35 @@ def execute_and_verify_commerce_recovery(
     )
     db.execute(sa_text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": target_lock_key})
 
-    # Re-verify controller binding authority & dashboard world_epoch inside the locked boundary
+    # Prompt 14.10 Fail-Closed Dispatch Fencing: verify active controller binding,
+    # active unexpired DemoSession, and matching SupervisorState world_epoch under lock!
+    from app.models.enums import SessionStatus
+    from app.models.session import DemoSession
+
     fresh_binding = db.scalar(
         select(CommerceSourceBinding).where(CommerceSourceBinding.id == binding.id)
     )
-    if fresh_binding is not None and not fresh_binding.is_enabled:
+    if fresh_binding is None or not fresh_binding.is_enabled:
         raise AppError(
             ErrorCode.FORBIDDEN,
-            "CONTROLLER_OWNERSHIP_REVOKED: binding is no longer active for mutation dispatch",
+            "CONTROLLER_OWNERSHIP_REVOKED: binding is missing or no longer active for dispatch",
+            status_code=403,
+        )
+    fresh_session = db.scalar(select(DemoSession).where(DemoSession.id == binding.session_id))
+    now_dispatch = datetime.now(UTC)
+    if fresh_session is None or fresh_session.status != SessionStatus.ACTIVE.value:
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            "CONTROLLER_SESSION_INACTIVE: session is missing or no longer active",
+            status_code=403,
+        )
+    sess_exp = fresh_session.expires_at
+    if sess_exp.tzinfo is None:
+        sess_exp = sess_exp.replace(tzinfo=UTC)
+    if sess_exp <= now_dispatch:
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            "CONTROLLER_SESSION_EXPIRED: session has expired before mutation dispatch",
             status_code=403,
         )
     sup_state_now = db.scalar(
@@ -500,6 +521,12 @@ def execute_and_verify_commerce_recovery(
             ErrorCode.CONFLICT,
             "STALE_WORLD_EPOCH_AT_DISPATCH: dashboard world epoch changed before dispatch",
             status_code=409,
+        )
+    if sup_state_now is None and (obs.world_epoch > 1 or fresh_binding.world_epoch != obs.world_epoch):
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            "CONTROLLER_SUPERVISOR_STATE_MISSING: supervisor state missing for non-initial epoch",
+            status_code=403,
         )
 
     target_match_clauses: list[Any] = []

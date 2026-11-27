@@ -65,6 +65,13 @@ function connectivityBadge(status: string): { label: string; cls: string; dot: s
       dot: "bg-[#10B981]",
     };
   }
+  if (status === "READ_ONLY_PREVIEW") {
+    return {
+      label: "Chế độ chỉ xem",
+      cls: "bg-[#FFFBEB] text-[#B45309] border-[#FDE68A]",
+      dot: "bg-[#F59E0B]",
+    };
+  }
   if (status === "UNCONFIGURED") {
     return {
       label: "Chưa cấu hình",
@@ -93,6 +100,7 @@ export function ExperienceCommandCenter() {
     scanNow,
     resetSandbox,
     retryBootstrap,
+    activateOperatorControl,
   } = useExperience();
 
   const [view, setView] = useState<WorkspaceView>("guardian");
@@ -100,6 +108,9 @@ export function ExperienceCommandCenter() {
   const [selectedAnomaly, setSelectedAnomaly] = useState<ExperienceAnomaly | null>(null);
   const [expandedTraces, setExpandedTraces] = useState<Record<string, boolean>>({});
   const [confirmResetOpen, setConfirmResetOpen] = useState(false);
+  const [operatorModalOpen, setOperatorModalOpen] = useState(false);
+  const [operatorTokenInput, setOperatorTokenInput] = useState("");
+  const [activatingOperator, setActivatingOperator] = useState(false);
 
   const toggleTrace = (id: string) => {
     setExpandedTraces((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -124,6 +135,12 @@ export function ExperienceCommandCenter() {
   const modelName = guardian?.model_name ?? bootstrap?.guardian.model_name ?? "deterministic-demo";
   const storefrontUrl = bootstrap?.sandbox.storefront_url ?? "http://localhost:3100";
   const envName = bootstrap?.sandbox.environment_name ?? "FinShop LIVE Sandbox (MOCK)";
+  const workspaceRole =
+    overview?.workspace_role ??
+    bootstrap?.session.workspace_role ??
+    bootstrap?.sandbox.workspace_role ??
+    "CONTROLLER";
+  const isReadOnlyPreview = workspaceRole === "READ_ONLY_PREVIEW";
 
   const navItems = useMemo(
     () => [
@@ -188,6 +205,62 @@ export function ExperienceCommandCenter() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Operator Authentication Modal (Never stores raw secret in browser storage) */}
+      {operatorModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="operator-dialog-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs"
+        >
+          <div className="w-full max-w-md rounded-2xl border border-[#E2E8F0] bg-white p-6 shadow-xl">
+            <h2 id="operator-dialog-title" className="text-base font-bold text-[#0F172A]">
+              Kích hoạt quyền điều khiển Operator
+            </h2>
+            <p className="mt-2 text-sm leading-relaxed text-[#64748B]">
+              Nhập mã xác thực Operator để nhận quyền <span className="font-mono text-xs">CONTROLLER</span>.
+              Mã chỉ được gửi trực tiếp tới Backend để xác thực và không lưu trữ trong trình duyệt.
+            </p>
+            <input
+              type="password"
+              value={operatorTokenInput}
+              onChange={(e) => setOperatorTokenInput(e.target.value)}
+              placeholder="Nhập X-Operator-Token..."
+              aria-label="Mã xác thực Operator"
+              className="mt-4 w-full rounded-xl border border-[#CBD5E1] px-3.5 py-2.5 text-sm text-[#0F172A] focus:border-[#2563EB] focus:outline-none"
+            />
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setOperatorTokenInput("");
+                  setOperatorModalOpen(false);
+                }}
+                className="rounded-lg border border-[#E2E8F0] bg-white px-4 py-2 text-sm font-medium text-[#475569] hover:bg-[#F8FAFC]"
+              >
+                Đóng
+              </button>
+              <button
+                type="button"
+                disabled={activatingOperator || !operatorTokenInput.trim()}
+                onClick={async () => {
+                  setActivatingOperator(true);
+                  const ok = await activateOperatorControl(operatorTokenInput);
+                  setActivatingOperator(false);
+                  setOperatorTokenInput("");
+                  if (ok) {
+                    setOperatorModalOpen(false);
+                  }
+                }}
+                className="rounded-lg bg-[#2563EB] px-4 py-2 text-sm font-semibold text-white hover:bg-[#1D4ED8] disabled:opacity-60"
+              >
+                {activatingOperator ? "Đang xác thực..." : "Xác thực Operator"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -520,19 +593,38 @@ export function ExperienceCommandCenter() {
                   ))}
                 </div>
 
+                {isReadOnlyPreview && (
+                  <button
+                    type="button"
+                    onClick={() => setOperatorModalOpen(true)}
+                    className="rounded-xl border border-[#FDE68A] bg-[#FFFBEB] px-3 py-2 text-xs font-semibold text-[#B45309] transition hover:bg-[#FEF3C7]"
+                  >
+                    Kích hoạt Operator
+                  </button>
+                )}
                 <button
                   type="button"
-                  disabled={scanning || loading}
+                  disabled={scanning || loading || isReadOnlyPreview}
+                  title={
+                    isReadOnlyPreview
+                      ? "Phiên đang ở chế độ chỉ xem (READ_ONLY_PREVIEW). Cần quyền Operator."
+                      : "Kích hoạt một lượt quan sát mới"
+                  }
                   onClick={() => void scanNow()}
-                  className="rounded-xl bg-[#2563EB] px-3.5 py-2 text-xs font-semibold text-white shadow-xs transition hover:bg-[#1D4ED8] disabled:opacity-60"
+                  className="rounded-xl bg-[#2563EB] px-3.5 py-2 text-xs font-semibold text-white shadow-xs transition hover:bg-[#1D4ED8] disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   {scanning ? "Đang quét..." : "Quét ngay"}
                 </button>
                 <button
                   type="button"
-                  disabled={resetting || loading}
+                  disabled={resetting || loading || isReadOnlyPreview}
+                  title={
+                    isReadOnlyPreview
+                      ? "Phiên đang ở chế độ chỉ xem (READ_ONLY_PREVIEW). Cần quyền Operator."
+                      : "Làm mới phiên trải nghiệm hiện tại"
+                  }
                   onClick={() => setConfirmResetOpen(true)}
-                  className="rounded-xl border border-[#E2E8F0] bg-white px-3 py-2 text-xs font-semibold text-[#475569] transition hover:bg-[#F8FAFC] disabled:opacity-60"
+                  className="rounded-xl border border-[#E2E8F0] bg-white px-3 py-2 text-xs font-semibold text-[#475569] transition hover:bg-[#F8FAFC] disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   Reset phiên
                 </button>

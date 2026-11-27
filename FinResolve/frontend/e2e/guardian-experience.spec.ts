@@ -71,10 +71,16 @@ test.describe("FinResolve Unified Guardian Experience E2E", () => {
     await page.getByRole("tab", { name: "Guardian" }).click();
     await expect(page.getByText("Hoạt động AI Guardian trực tiếp").first()).toBeVisible();
 
-    // Verify Reset confirmation modal opens cleanly
-    await page.getByRole("button", { name: "Reset phiên" }).click();
-    await expect(page.getByRole("dialog")).toBeVisible();
-    await page.getByRole("button", { name: "Hủy bỏ" }).click();
+    // Verify Reset confirmation modal opens cleanly when CONTROLLER, or is disabled in READ_ONLY_PREVIEW
+    const resetBtn = page.getByRole("button", { name: "Reset phiên" });
+    const isDisabled = await resetBtn.isDisabled();
+    if (!isDisabled) {
+      await resetBtn.click();
+      await expect(page.getByRole("dialog")).toBeVisible();
+      await page.getByRole("button", { name: "Hủy bỏ" }).click();
+    } else {
+      await expect(page.getByRole("button", { name: /Kích hoạt Operator/i })).toBeVisible();
+    }
 
     // Reload preserves session via sessionStorage
     await page.reload({ waitUntil: "domcontentloaded" });

@@ -17,14 +17,17 @@ export type ExperienceBootstrapResponse = {
     status: string;
     expires_at: string;
     world_epoch: number;
+    workspace_role?: "CONTROLLER" | "READ_ONLY_PREVIEW" | string;
   };
   sandbox: {
     environment_name: string;
+    sandbox_isolation_mode?: string;
+    workspace_role?: "CONTROLLER" | "READ_ONLY_PREVIEW" | string;
     merchant_id: string;
     commerce_session_id: string;
     commerce_world_epoch: number;
     binding_id: string | null;
-    connectivity_status: "CONNECTED" | "DISCONNECTED" | "UNCONFIGURED" | string;
+    connectivity_status: "CONNECTED" | "DISCONNECTED" | "UNCONFIGURED" | "READ_ONLY_PREVIEW" | string;
     storefront_url: string;
     vnpay_enabled: boolean;
   };
@@ -98,6 +101,9 @@ export type ExperienceTimelineItem = {
 export type ExperienceOverviewResponse = {
   session_id: string;
   world_epoch: number;
+  workspace_role?: "CONTROLLER" | "READ_ONLY_PREVIEW" | string;
+  sandbox_isolation_mode?: string;
+  unresolved_uncertainty_guards?: number;
   updated_at: string;
   guardian: {
     visual_state: GuardianVisualState;
@@ -168,6 +174,7 @@ async function expFetch<T>(
   options: {
     method?: "GET" | "POST";
     token?: string | null;
+    operatorToken?: string | null;
     body?: Record<string, unknown>;
     signal?: AbortSignal;
   } = {},
@@ -177,6 +184,9 @@ async function expFetch<T>(
   };
   if (options.token && options.token.trim()) {
     headers["X-Demo-Session"] = options.token.trim();
+  }
+  if (options.operatorToken && options.operatorToken.trim()) {
+    headers["X-Operator-Token"] = options.operatorToken.trim();
   }
   if (options.body !== undefined) {
     headers["Content-Type"] = "application/json";
@@ -213,10 +223,12 @@ async function expFetch<T>(
 export function bootstrapExperience(
   existingToken?: string | null,
   signal?: AbortSignal,
+  operatorToken?: string | null,
 ): Promise<ExperienceBootstrapResponse> {
   return expFetch<ExperienceBootstrapResponse>("/api/v1/experience/bootstrap", {
     method: "POST",
     token: existingToken ?? undefined,
+    operatorToken: operatorToken ?? undefined,
     body: { ttl_minutes: 60 },
     signal,
   });

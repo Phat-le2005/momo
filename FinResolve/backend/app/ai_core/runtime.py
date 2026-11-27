@@ -988,7 +988,8 @@ class BoundedAgentRuntime:
                 action_name = str(plan.next_step.action_type or plan.next_step.tool_name)
                 if (
                     case.source_system == "COMMERCE_HTTP"
-                    and action_name in ("propose_order_sync", "ORDER_SYNC")
+                    and action_name
+                    in ("propose_order_sync", "ORDER_SYNC", "propose_refund", "REFUND_EXECUTE")
                     and replans_used < self._max_replans
                 ):
                     has_ord_tool = any(
@@ -999,13 +1000,43 @@ class BoundedAgentRuntime:
                         and t.tool_name in ("get_payment_record", "find_payment_candidates")
                         for t in tool_observations
                     )
-                    if not (has_ord_tool and has_pay_tool):
-                        missing_tool = "get_payment_record" if not has_pay_tool else "get_order"
+                    replan_reason: str | None = None
+                    if not has_ord_tool:
+                        replan_reason = (
+                            f"MISSING_EVIDENCE_CATEGORY(order): Before proposing {action_name}, "
+                            "execute READ_TOOL 'get_order' in this investigation run to observe "
+                            "authoritative order status, total_vnd, and version."
+                        )
+                    elif not has_pay_tool:
+                        replan_reason = (
+                            f"MISSING_EVIDENCE_CATEGORY(payment): Before proposing {action_name}, "
+                            "execute READ_TOOL 'get_payment_record' (or 'find_payment_candidates') "
+                            "in this investigation run to verify authoritative payment status and "
+                            "order_id linkage."
+                        )
+                    elif action_name in ("propose_order_sync", "ORDER_SYNC") and (
+                        plan.next_step.args.get("expected_order_version") is None
+                        and plan.next_step.args.get("expected_version") is None
+                    ):
+                        replan_reason = (
+                            "MISSING_REQUIRED_ARGUMENT(expected_order_version): Include the exact "
+                            "integer `expected_order_version` from your `get_order` observation "
+                            "in `next_step.args` before proposing ORDER_SYNC."
+                        )
+
+                    if replan_reason is not None:
                         replans_used += 1
-                        validation_feedback = (
-                            f"Before proposing {action_name}, you MUST first execute READ_TOOL "
-                            f"'{missing_tool}' in this investigation run so both order and payment "
-                            "have authoritative current-run provenance."
+                        validation_feedback = replan_reason
+                        self._record_event(
+                            case=case,
+                            event_type="PLAN_REVISED",
+                            payload={
+                                "run_id": effective_run_id,
+                                "step": steps_executed,
+                                "replan_attempt": replans_used,
+                                "max_replans": self._max_replans,
+                                "reason": replan_reason,
+                            },
                         )
                         expected_case_version = case.version
                         self._maybe_commit()
