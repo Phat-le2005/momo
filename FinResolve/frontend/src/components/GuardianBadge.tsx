@@ -2,6 +2,7 @@
 
 export type GuardianVisualState =
   | "MONITORING"
+  | "ANOMALY_DETECTED"
   | "INVESTIGATING"
   | "RECOVERING"
   | "WAITING_APPROVAL"
@@ -21,22 +22,29 @@ const STATE_CONFIG: Record<
 > = {
   MONITORING: {
     label: "Đang giám sát",
-    ringClass: "border-blue-200 bg-blue-50/80",
-    badgeClass: "bg-blue-50 text-blue-700 border-blue-200",
+    ringClass: "border-blue-200 bg-[#EAF3FF]",
+    badgeClass: "bg-[#EAF3FF] text-[#1D4ED8] border-[#BFDBFE]",
     stroke: "#2563EB",
+    animatePulse: true,
+  },
+  ANOMALY_DETECTED: {
+    label: "Phát hiện bất thường",
+    ringClass: "border-red-200 bg-red-50",
+    badgeClass: "bg-red-50 text-red-700 border-red-200",
+    stroke: "#EF4444",
     animatePulse: true,
   },
   INVESTIGATING: {
     label: "AI đang điều tra",
     ringClass: "border-sky-300 bg-sky-50",
-    badgeClass: "bg-sky-50 text-sky-700 border-sky-200",
-    stroke: "#0EA5E9",
+    badgeClass: "bg-sky-50 text-[#0284C7] border-sky-200",
+    stroke: "#0284C7",
     animateSpin: true,
   },
   RECOVERING: {
     label: "Đang phục hồi an toàn",
-    ringClass: "border-blue-300 bg-blue-50",
-    badgeClass: "bg-blue-50 text-blue-700 border-blue-300",
+    ringClass: "border-blue-300 bg-[#EAF3FF]",
+    badgeClass: "bg-[#EAF3FF] text-[#1D4ED8] border-[#93C5FD]",
     stroke: "#2563EB",
     animateSpin: true,
   },
@@ -84,7 +92,7 @@ export function GuardianBadge({
         {cfg.animateSpin && (
           <span
             aria-hidden="true"
-            className="fr-spin-slow absolute inset-0 rounded-full border-2 border-transparent border-t-blue-600"
+            className="fr-spin-medium absolute inset-0 rounded-full border-2 border-transparent border-t-[#2563EB]"
           />
         )}
         <svg

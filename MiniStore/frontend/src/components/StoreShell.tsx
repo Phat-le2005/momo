@@ -82,6 +82,9 @@ export function StoreShell({
               <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold tracking-wide text-slate-600">
                 MOCK SANDBOX
               </span>
+              <span className="ml-1.5 hidden rounded-full border border-blue-200 bg-[#eaf3ff] px-2 py-0.5 text-[10px] font-semibold text-[#1d4ed8] lg:inline-block">
+                Protected by FinResolve AI
+              </span>
             </div>
           </Link>
 

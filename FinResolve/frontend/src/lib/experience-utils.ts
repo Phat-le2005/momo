@@ -2,6 +2,7 @@
 
 export type GuardianVisualStateValue =
   | "MONITORING"
+  | "ANOMALY_DETECTED"
   | "INVESTIGATING"
   | "RECOVERING"
   | "WAITING_APPROVAL"

@@ -3,6 +3,8 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { GuardianBadge } from "@/components/GuardianBadge";
+import { GuardianFocusMode } from "@/components/GuardianFocusMode";
+import { LivingBusinessNetwork } from "@/components/LivingBusinessNetwork";
 import { useExperience } from "@/hooks/useExperience";
 import {
   formatMetricOrEmpty,
@@ -111,6 +113,8 @@ export function ExperienceCommandCenter() {
   const [operatorModalOpen, setOperatorModalOpen] = useState(false);
   const [operatorTokenInput, setOperatorTokenInput] = useState("");
   const [activatingOperator, setActivatingOperator] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [focusMode, setFocusMode] = useState(false);
 
   const toggleTrace = (id: string) => {
     setExpandedTraces((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -206,6 +210,21 @@ export function ExperienceCommandCenter() {
             </div>
           ))}
         </div>
+      )}
+
+      {/* Guardian Live Experience — Full-Screen Focus Mode */}
+      {focusMode && (
+        <GuardianFocusMode
+          overview={overview}
+          visualState={visualState}
+          storefrontUrl={storefrontUrl}
+          isReadOnlyPreview={isReadOnlyPreview}
+          scanning={scanning}
+          onScanNow={scanNow}
+          onSelectAnomaly={(a) => setSelectedAnomaly(a)}
+          onOpenOperatorModal={() => setOperatorModalOpen(true)}
+          onExit={() => setFocusMode(false)}
+        />
       )}
 
       {/* Operator Authentication Modal (Never stores raw secret in browser storage) */}
@@ -434,18 +453,32 @@ export function ExperienceCommandCenter() {
       )}
 
       <div className="flex min-h-screen">
-        {/* Desktop Sidebar (232px) */}
-        <aside className="hidden w-[232px] shrink-0 flex-col border-r border-[#E2E8F0] bg-white lg:flex">
-          <div className="flex items-center gap-2.5 border-b border-[#E2E8F0] px-5 py-4">
-            <Link href="/" className="flex items-center gap-2.5">
-              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#2563EB] text-sm font-bold text-white shadow-xs">
+        {/* Collapsible Minimalist Desktop Sidebar */}
+        <aside
+          className={`hidden shrink-0 flex-col border-r border-[#DBEAFE]/80 bg-white transition-all duration-200 lg:flex ${
+            sidebarCollapsed ? "w-[72px]" : "w-[236px]"
+          }`}
+        >
+          <div className="flex items-center justify-between gap-2 border-b border-[#EFF6FF] px-4 py-4">
+            <Link href="/" className="flex items-center gap-2.5 overflow-hidden">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-[#2563EB] to-[#0284C7] text-sm font-bold text-white shadow-xs">
                 FR
               </span>
-              <div>
-                <p className="text-sm font-bold tracking-tight text-[#0F172A]">FinResolve AI</p>
-                <p className="text-[11px] text-[#64748B]">Guardian Command</p>
-              </div>
+              {!sidebarCollapsed && (
+                <div>
+                  <p className="text-sm font-bold tracking-tight text-[#0B1739]">FinResolve AI</p>
+                  <p className="text-[11px] text-[#64748B]">Guardian Command</p>
+                </div>
+              )}
             </Link>
+            <button
+              type="button"
+              onClick={() => setSidebarCollapsed((c) => !c)}
+              aria-label={sidebarCollapsed ? "Mở rộng thanh điều hướng" : "Thu gọn thanh điều hướng"}
+              className="rounded-lg border border-[#E2E8F0] px-1.5 py-1 text-[11px] font-semibold text-[#64748B] hover:bg-[#F8FAFF] hover:text-[#0B1739]"
+            >
+              {sidebarCollapsed ? "»" : "«"}
+            </button>
           </div>
 
           <nav aria-label="Điều hướng Command Center" className="flex-1 space-y-1 p-3">
@@ -593,6 +626,13 @@ export function ExperienceCommandCenter() {
                   ))}
                 </div>
 
+                <button
+                  type="button"
+                  onClick={() => setFocusMode(true)}
+                  className="rounded-xl border border-[#BFDBFE] bg-[#EAF3FF] px-3 py-2 text-xs font-semibold text-[#1D4ED8] transition hover:bg-[#DBEAFE]"
+                >
+                  Focus Mode
+                </button>
                 {isReadOnlyPreview && (
                   <button
                     type="button"
@@ -870,89 +910,120 @@ export function ExperienceCommandCenter() {
             ) : (
               /* ==================== GUARDIAN VIEW (DEFAULT) ==================== */
               <>
-                {/* Hero Status Strip with Guardian Visual Identity */}
-                <section className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-[#E2E8F0] bg-white p-5 shadow-xs">
-                  <GuardianBadge state={visualState} />
-                  <div className="flex flex-wrap items-center gap-6 text-xs">
-                    <div>
-                      <p className="text-[#64748B]">Hàng đợi điều tra</p>
-                      <p className="mt-0.5 text-base font-bold text-[#0F172A]">
-                        {guardian?.queued_jobs ?? 0} tác vụ
-                      </p>
-                    </div>
-                    <div>
-                      <p className="text-[#64748B]">Lần quét gần nhất</p>
-                      <p className="mt-0.5 text-base font-bold text-[#0F172A]">
-                        {formatShortTime(guardian?.last_scan_at)}
-                      </p>
-                    </div>
-                    <div>
-                      <p className="text-[#64748B]">Trạng thái Baseline</p>
-                      <p className="mt-0.5 text-sm font-semibold text-[#2563EB]">
-                        {health?.baseline_status === "ESTABLISHED"
-                          ? "Đã thiết lập"
-                          : "Đang học mẫu thực"}
-                      </p>
-                    </div>
+                {/* Primary Hero Focal Stage: Living Business Network (7 cols) + Live Investigation Story (5 cols) */}
+                <div className="grid gap-6 lg:grid-cols-12">
+                  <div className="lg:col-span-7">
+                    <LivingBusinessNetwork
+                      overview={overview}
+                      visualState={visualState}
+                      onSelectAnomaly={(a) => setSelectedAnomaly(a)}
+                    />
                   </div>
-                </section>
 
-                {/* 6 Real KPI Cards */}
-                <section aria-label="Chỉ số vận hành thực">
-                  <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-                    {[
-                      {
-                        label: "Đơn hàng quan sát",
-                        value: formatMetricOrEmpty(kpis?.orders_observed),
-                        accent: "text-[#0F172A]",
-                      },
-                      {
-                        label: "Thanh toán quan sát",
-                        value: formatMetricOrEmpty(kpis?.payments_observed),
-                        accent: "text-[#0F172A]",
-                      },
-                      {
-                        label: "Bất thường đang mở",
-                        value: formatMetricOrEmpty(kpis?.active_anomalies ?? 0),
-                        accent:
-                          (kpis?.active_anomalies ?? 0) > 0
-                            ? "text-[#D97706]"
-                            : "text-[#0F172A]",
-                      },
-                      {
-                        label: "Phục hồi xác minh",
-                        value: formatMetricOrEmpty(kpis?.verified_recoveries ?? 0),
-                        accent:
-                          (kpis?.verified_recoveries ?? 0) > 0
-                            ? "text-[#059669]"
-                            : "text-[#0F172A]",
-                      },
-                      {
-                        label: "Chờ phê duyệt",
-                        value: formatMetricOrEmpty(kpis?.pending_approvals ?? 0),
-                        accent:
-                          (kpis?.pending_approvals ?? 0) > 0
-                            ? "text-[#2563EB]"
-                            : "text-[#0F172A]",
-                      },
-                      {
-                        label: "Tổng hồ sơ (Cases)",
-                        value: formatMetricOrEmpty(kpis?.total_cases ?? 0),
-                        accent: "text-[#0F172A]",
-                      },
-                    ].map((kpi) => (
-                      <div
-                        key={kpi.label}
-                        className="rounded-2xl border border-[#E2E8F0] bg-white p-4 shadow-xs"
-                      >
-                        <p className="text-xs font-medium text-[#64748B]">{kpi.label}</p>
-                        <p className={`mt-2 text-2xl font-bold tracking-tight ${kpi.accent}`}>
-                          {kpi.value}
-                        </p>
+                  {/* Supporting Status & Quick Narrative Summary */}
+                  <div className="flex flex-col gap-4 lg:col-span-5">
+                    <section className="rounded-3xl border border-[#DBEAFE] bg-white p-5 shadow-xs">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <GuardianBadge state={visualState} />
+                        <span className="font-mono text-[11px] text-[#64748B]">
+                          Quét: {formatShortTime(guardian?.last_scan_at)}
+                        </span>
                       </div>
-                    ))}
+                      <div className="mt-4 grid grid-cols-3 gap-2.5 text-xs">
+                        <div className="rounded-xl border border-[#F1F5F9] bg-[#F8FAFF] p-2.5">
+                          <p className="text-[11px] text-[#64748B]">Đơn quan sát</p>
+                          <p className="mt-0.5 text-base font-bold text-[#0B1739]">
+                            {formatMetricOrEmpty(kpis?.orders_observed)}
+                          </p>
+                        </div>
+                        <div className="rounded-xl border border-[#F1F5F9] bg-[#F8FAFF] p-2.5">
+                          <p className="text-[11px] text-[#64748B]">Bất thường</p>
+                          <p
+                            className={`mt-0.5 text-base font-bold ${
+                              (kpis?.active_anomalies ?? 0) > 0
+                                ? "text-[#EF4444]"
+                                : "text-[#0B1739]"
+                            }`}
+                          >
+                            {formatMetricOrEmpty(kpis?.active_anomalies ?? 0)}
+                          </p>
+                        </div>
+                        <div className="rounded-xl border border-[#F1F5F9] bg-[#F8FAFF] p-2.5">
+                          <p className="text-[11px] text-[#64748B]">Đã xác minh</p>
+                          <p
+                            className={`mt-0.5 text-base font-bold ${
+                              (kpis?.verified_recoveries ?? 0) > 0
+                                ? "text-[#10B981]"
+                                : "text-[#0B1739]"
+                            }`}
+                          >
+                            {formatMetricOrEmpty(kpis?.verified_recoveries ?? 0)}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-[#F1F5F9] pt-3 text-xs text-[#64748B]">
+                        <span>
+                          Hàng đợi: <strong className="text-[#0B1739]">{guardian?.queued_jobs ?? 0}</strong> ·
+                          Duyệt: <strong className="text-[#2563EB]">{kpis?.pending_approvals ?? 0}</strong> ·
+                          Cases: <strong className="text-[#0B1739]">{kpis?.total_cases ?? 0}</strong>
+                        </span>
+                        <span className="font-semibold text-[#1D4ED8]">
+                          {health?.baseline_status === "ESTABLISHED"
+                            ? "Baseline sẵn sàng"
+                            : "Đang học mẫu thực"}
+                        </span>
+                      </div>
+                    </section>
+
+                    {/* Real-Time Visual Story Highlight Card */}
+                    <section className="flex-1 rounded-3xl border border-[#E2E8F0] bg-white p-5 shadow-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <h2 className="text-sm font-bold text-[#0B1739]">
+                          Câu chuyện vận hành hiện tại
+                        </h2>
+                        <button
+                          type="button"
+                          onClick={() => setFocusMode(true)}
+                          className="text-xs font-semibold text-[#2563EB] hover:underline"
+                        >
+                          Toàn màn hình →
+                        </button>
+                      </div>
+                      {overview && overview.anomalies.length > 0 ? (
+                        <div className="mt-3 space-y-2.5 text-xs">
+                          <div className="rounded-2xl border border-[#DBEAFE] bg-[#F8FAFF] p-3.5">
+                            <p className="font-semibold text-[#0B1739]">
+                              {overview.anomalies[0].anomaly_type}
+                            </p>
+                            <p className="mt-1 leading-relaxed text-[#475569]">
+                              {overview.anomalies[0].rationale}
+                            </p>
+                            <div className="mt-2.5 flex items-center justify-between gap-2">
+                              <span className="font-mono text-[11px] text-[#2563EB]">
+                                {overview.anomalies[0].affected_order_id ??
+                                  overview.anomalies[0].detector_code}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setSelectedAnomaly(overview.anomalies[0])}
+                                className="rounded-lg bg-[#2563EB] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#1D4ED8]"
+                              >
+                                Xem chi tiết bằng chứng
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <p className="mt-3 rounded-2xl border border-dashed border-[#CBD5E1] bg-[#F8FAFF] p-4 text-xs leading-relaxed text-[#64748B]">
+                          Hệ thống đang hoạt động bình thường. Hãy mở tab{" "}
+                          <strong className="text-[#0B1739]">Khách hàng</strong> để tạo đơn trên
+                          FinShop LIVE hoặc nhấn <strong className="text-[#0B1739]">Quét ngay</strong>{" "}
+                          để quan sát luồng tín hiệu trực tiếp.
+                        </p>
+                      )}
+                    </section>
                   </div>
-                </section>
+                </div>
 
                 {/* Business Health + AI Guardian Live Activity */}
                 <div className="grid gap-6 lg:grid-cols-12">

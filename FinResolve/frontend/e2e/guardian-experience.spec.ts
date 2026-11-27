@@ -24,10 +24,12 @@ test.describe("FinResolve Unified Guardian Experience E2E", () => {
     page.on("pageerror", (err) => errors.push(err.message));
 
     await page.goto(BASE_URL, { waitUntil: "domcontentloaded" });
-    await expect(page.getByText("Doanh nghiệp vận hành.").first()).toBeVisible({ timeout: 15000 });
+    await expect(page.getByText("Doanh nghiệp không ngừng vận hành.").first()).toBeVisible({
+      timeout: 15000,
+    });
     await expect(page.getByText("Minh họa sản phẩm").first()).toBeVisible();
 
-    await page.getByRole("link", { name: /Trải nghiệm ngay/i }).first().click();
+    await page.getByRole("link", { name: /Trải nghiệm Guardian/i }).first().click();
     await page.waitForURL("**/experience", { timeout: 15000 });
     await expect(page.getByText("FinShop LIVE Sandbox (MOCK)").first()).toBeVisible({
       timeout: 15000,

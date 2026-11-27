@@ -2,34 +2,64 @@
 
 :root {
   color-scheme: light;
-  --fr-primary: #2563eb;
-  --fr-primary-hover: #1d4ed8;
-  --fr-secondary-blue: #0ea5e9;
-  --fr-light-blue: #eff6ff;
-  --fr-bg: #f8fafc;
-  --fr-surface: #ffffff;
-  --fr-text-primary: #0f172a;
-  --fr-text-secondary: #64748b;
+  /* FinResolve AI — Premium Futuristic Fintech (Light Blue Edition) */
+  --fr-electric-blue: #2563eb;
+  --fr-royal-blue: #1d4ed8;
+  --fr-ocean-blue: #0284c7;
+  --fr-sky-blue: #38bdf8;
+  --fr-ice-blue: #eaf3ff;
+  --fr-cloud-white: #f8faff;
+  --fr-pure-white: #ffffff;
+  --fr-deep-navy: #0b1739;
+  --fr-muted-slate: #64748b;
   --fr-border: #e2e8f0;
-  --fr-success: #10b981;
-  --fr-warning: #f59e0b;
-  --fr-danger: #ef4444;
+  --fr-border-blue: rgba(37, 99, 235, 0.14);
+
+  /* Semantic Status Colors */
+  --fr-emerald: #10b981;
+  --fr-amber: #f59e0b;
+  --fr-coral-red: #ef4444;
+
+  /* Backward-compatible aliases */
+  --fr-primary: var(--fr-electric-blue);
+  --fr-primary-hover: var(--fr-royal-blue);
+  --fr-secondary-blue: var(--fr-sky-blue);
+  --fr-light-blue: var(--fr-ice-blue);
+  --fr-bg: var(--fr-cloud-white);
+  --fr-surface: var(--fr-pure-white);
+  --fr-text-primary: var(--fr-deep-navy);
+  --fr-text-secondary: var(--fr-muted-slate);
+  --fr-success: var(--fr-emerald);
+  --fr-warning: var(--fr-amber);
+  --fr-danger: var(--fr-coral-red);
+}
+
+html {
+  scroll-behavior: smooth;
 }
 
 body {
-  background-color: var(--fr-bg);
-  color: var(--fr-text-primary);
+  background-color: var(--fr-cloud-white);
+  color: var(--fr-deep-navy);
+  font-family: var(--font-be-vietnam-pro), ui-sans-serif, system-ui, -apple-system, sans-serif;
   @apply antialiased;
 }
 
 :focus-visible {
-  outline: 2px solid var(--fr-primary);
+  outline: 2px solid var(--fr-electric-blue);
   outline-offset: 2px;
 }
 
+/* Signature Motion Keyframes (GPU-accelerated transform/opacity/SVG dash) */
 @keyframes fr-guardian-spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes fr-guardian-spin-reverse {
+  to {
+    transform: rotate(-360deg);
   }
 }
 
@@ -40,22 +70,113 @@ body {
     transform: scale(1);
   }
   50% {
-    opacity: 0.65;
+    opacity: 0.72;
+    transform: scale(1.045);
+  }
+}
+
+@keyframes fr-ambient-breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.85;
     transform: scale(1.06);
   }
 }
 
+@keyframes fr-signal-flow {
+  0% {
+    stroke-dashoffset: 36;
+  }
+  100% {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes fr-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fr-verify-ripple {
+  0% {
+    opacity: 0.7;
+    transform: scale(0.92);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.28);
+  }
+}
+
 .fr-spin-slow {
-  animation: fr-guardian-spin 3.2s linear infinite;
+  animation: fr-guardian-spin 14s linear infinite;
+}
+
+.fr-spin-medium {
+  animation: fr-guardian-spin 4.2s linear infinite;
+}
+
+.fr-spin-reverse-slow {
+  animation: fr-guardian-spin-reverse 20s linear infinite;
 }
 
 .fr-pulse-soft {
-  animation: fr-guardian-pulse 2.2s ease-in-out infinite;
+  animation: fr-guardian-pulse 2.6s ease-in-out infinite;
+}
+
+.fr-ambient-glow {
+  animation: fr-ambient-breathe 5.5s ease-in-out infinite;
+}
+
+.fr-signal-line {
+  stroke-dasharray: 6 12;
+  animation: fr-signal-flow 1.8s linear infinite;
+}
+
+.fr-signal-line-fast {
+  stroke-dasharray: 8 10;
+  animation: fr-signal-flow 0.9s linear infinite;
+}
+
+.fr-fade-up {
+  animation: fr-fade-up 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.fr-verify-ring {
+  animation: fr-verify-ripple 1.8s ease-out infinite;
+}
+
+/* Subtle architectural grid background for Light Blue Edition */
+.fr-grid-surface {
+  background-image:
+    radial-gradient(circle at 1px 1px, rgba(37, 99, 235, 0.08) 1px, transparent 0);
+  background-size: 24px 24px;
 }
 
 @media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
   .fr-spin-slow,
-  .fr-pulse-soft {
-    animation: none;
+  .fr-spin-medium,
+  .fr-spin-reverse-slow,
+  .fr-pulse-soft,
+  .fr-ambient-glow,
+  .fr-signal-line,
+  .fr-signal-line-fast,
+  .fr-fade-up,
+  .fr-verify-ring {
+    animation: none !important;
+    transition: none !important;
   }
 }
