@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from collections.abc import Iterator
 
 import pytest
@@ -17,6 +18,8 @@ os.environ["COMMERCE_APP_ENV"] = "test"
 os.environ["COMMERCE_DATABASE_URL"] = TEST_DB_URL
 os.environ["COMMERCE_WEB_ORIGIN"] = "http://localhost:3100"
 os.environ["COMMERCE_SOURCE_MODE"] = "MOCK"
+os.environ.setdefault("COMMERCE_COMMAND_AUTH_SIGNING_SECRET", secrets.token_hex(32))
+os.environ.setdefault("COMMERCE_SERVICE_WRITE_API_KEY", secrets.token_hex(32))
 
 
 def _clear_caches() -> None:
@@ -44,6 +47,7 @@ def clean_commerce_db() -> Iterator[None]:
                 "service_credentials, customers, products, product_variants, "
                 "inventories, inventory_reservations, carts, cart_items, vouchers, "
                 "voucher_redemptions, orders, order_items, payments, provider_notifications, "
+                "payment_query_attempts, reconciliation_records, "
                 "refund_requests, refund_transactions, live_sessions, live_products, "
                 "live_comments, complaints, commerce_events, event_outbox CASCADE"
             )

@@ -344,6 +344,17 @@ class ActionExecutor:
                 )
                 .with_for_update()
             )
+            # Prompt 12 Section 14: NEVER execute simulator mutations on a MiniStore Commerce Case!
+            if case_obj is not None and case_obj.source_system == "COMMERCE_HTTP":
+                raise AppError(
+                    ErrorCode.FORBIDDEN,
+                    (
+                        "FORBIDDEN_SIMULATOR_EXECUTION_ON_COMMERCE_CASE: "
+                        "MiniStore Commerce cases are read-only by default in FinResolve. "
+                        "Simulator ActionExecutor cannot mutate external Commerce state."
+                    ),
+                    status_code=403,
+                )
 
         executed_exec = self._db.scalar(
             select(ActionExecution)
@@ -444,6 +455,17 @@ class ActionExecutor:
                 )
                 .with_for_update()
             )
+            # Prompt 12 Section 14: NEVER execute simulator mutations on a MiniStore Commerce Case!
+            if case_obj is not None and case_obj.source_system == "COMMERCE_HTTP":
+                raise AppError(
+                    ErrorCode.FORBIDDEN,
+                    (
+                        "FORBIDDEN_SIMULATOR_EXECUTION_ON_COMMERCE_CASE: "
+                        "MiniStore Commerce cases are read-only by default in FinResolve. "
+                        "Simulator ActionExecutor cannot mutate external Commerce state."
+                    ),
+                    status_code=403,
+                )
 
         # 2. Check existing executions (Idempotency, Recovery, Anti-Replay & UNKNOWN lockout)
         existing_executions = list(

@@ -1,38 +1,224 @@
-"""Hardened background business processes (Prompt 10.1):
-1. Asynchronous Order Synchronization after `Payment(SUCCEEDED)` (separate from payment capture!).
+"""Hardened background business processes (Prompt 11):
+1. Asynchronous Order Synchronization after `Payment(SUCCEEDED)` (with exact OrderItem vs
+   InventoryReservation quantity validation and safe pre-sync refund reservation release).
 2. Expired `InventoryReservation` release & cancellation of unpaid expired orders.
-
-Safety Invariants:
-- NEVER confirms or fulfills an order whose payment is already `REFUNDED`.
-- NEVER resurrects a `CANCELLED` order or deducts already-released inventory on late payment;
-  instead marks `reconciliation_required=True` and emits `PAYMENT_RECONCILIATION_REQUIRED`.
-- Validates `Inventory.reserved_qty` and `on_hand_qty` strictly without silent clamping.
-- Moves `LiveProduct.flash_sale_reserved_qty -> flash_sale_sold_qty` upon order confirmation.
-- Marks `RECONCILIATION_REQUIRED` if an order expires while payment status is `UNKNOWN`.
+3. Bounded VNPAY Sandbox QueryDr background reconciliation for pending/unknown payments.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import uuid
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session, selectinload
 
+from app.core.config import get_settings
 from app.models.entities import (
     Inventory,
     InventoryReservation,
     LiveProduct,
     Order,
     Payment,
+    PaymentQueryAttempt,
 )
 from app.models.enums import (
     OrderStatus,
+    PaymentProvider,
     PaymentStatus,
     ReconciliationStatus,
     ReservationStatus,
 )
 from app.services.checkout import release_order_reservations_and_voucher
 from app.services.events import record_commerce_event
+
+
+def sync_single_confirmed_payment_to_order(
+    db: Session,
+    *,
+    order_id: str,
+    payment_id: str,
+    merchant_id: str,
+    commerce_session_id: str,
+    world_epoch: int,
+    expected_version: int | None = None,
+    sync_source: str = "FINRESOLVE_RECOVERY_COMMAND",
+    commit: bool = True,
+) -> tuple[Order, Payment, str]:
+    """Target-specific, transactionally idempotent order sync for ONE authorized order/payment.
+
+    P0.1 Invariant: NEVER touches or mutates any unrelated order or payment!
+    Enforces merchant/session/world scope, expected_version under row lock, LOCAL_MOCK-only
+    or verified payment status, amount match, and full ACTIVE reservation validation.
+    """
+    from app.core.errors import CommerceError, ErrorCode
+
+    now = datetime.now(UTC)
+    # Canonical lock order: Order -> Payment
+    order = db.scalar(
+        select(Order)
+        .options(selectinload(Order.items))
+        .where(
+            Order.id == order_id,
+            Order.merchant_id == merchant_id,
+            Order.commerce_session_id == commerce_session_id,
+            Order.world_epoch == world_epoch,
+        )
+        .with_for_update()
+    )
+    if order is None:
+        raise CommerceError(
+            ErrorCode.NOT_FOUND, "Order not found in authorized write scope", status_code=404
+        )
+    pay = db.scalar(
+        select(Payment)
+        .where(
+            Payment.id == payment_id,
+            Payment.order_id == order.id,
+            Payment.merchant_id == merchant_id,
+            Payment.commerce_session_id == commerce_session_id,
+        )
+        .with_for_update()
+    )
+    if pay is None:
+        raise CommerceError(
+            ErrorCode.NOT_FOUND, "Payment not found for order in write scope", status_code=404
+        )
+    if expected_version is not None and order.version != expected_version:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            f"VERSION_MISMATCH: expected {expected_version}, got {order.version}",
+            status_code=409,
+        )
+    if order.status == OrderStatus.CANCELLED.value:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            "CANNOT_RESURRECT_CANCELLED_ORDER: cancelled orders require refund/manual review",
+            status_code=409,
+        )
+    if pay.status != PaymentStatus.SUCCEEDED.value:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            f"PAYMENT_NOT_CONFIRMED: cannot sync order while payment status is '{pay.status}'",
+            status_code=409,
+        )
+    if pay.amount_vnd != order.total_vnd:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            f"AMOUNT_MISMATCH: payment {pay.amount_vnd} != order total {order.total_vnd}",
+            status_code=409,
+        )
+
+    # Idempotent replay if already confirmed and synced
+    if order.status == OrderStatus.CONFIRMED.value and pay.is_synced_to_order:
+        return order, pay, "ALREADY_SYNCED"
+
+    if order.status != OrderStatus.PENDING_PAYMENT.value:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            f"Order in status '{order.status}' cannot be synced from PENDING_PAYMENT",
+            status_code=409,
+        )
+
+    reservations = list(
+        db.scalars(
+            select(InventoryReservation)
+            .where(
+                InventoryReservation.order_id == order.id,
+                InventoryReservation.status == ReservationStatus.ACTIVE.value,
+            )
+            .order_by(InventoryReservation.variant_id.asc())
+            .with_for_update()
+        ).all()
+    )
+    expected_qty: dict[str, int] = {}
+    for oi in order.items:
+        expected_qty[oi.variant_id] = expected_qty.get(oi.variant_id, 0) + oi.quantity
+    reserved_qty: dict[str, int] = {}
+    for r in reservations:
+        reserved_qty[r.variant_id] = reserved_qty.get(r.variant_id, 0) + r.quantity
+
+    if not reservations or expected_qty != reserved_qty:
+        reason = (
+            "ACTIVE inventory reservations do not match OrderItems at targeted sync "
+            f"(expected={expected_qty}, reserved={reserved_qty})."
+        )
+        pay.reconciliation_required = True
+        pay.reconciliation_note = reason
+        order.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
+        order.reconciliation_reason = reason
+        order.updated_at = now
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+        return order, pay, "RECONCILIATION_REQUIRED"
+
+    inv_pairs: list[tuple[InventoryReservation, Inventory]] = []
+    for res in reservations:
+        inv = db.scalar(
+            select(Inventory).where(Inventory.variant_id == res.variant_id).with_for_update()
+        )
+        if inv is None or inv.reserved_qty < res.quantity or inv.on_hand_qty < res.quantity:
+            reason = f"Inventory integrity failure on targeted sync for variant {res.variant_id}"
+            pay.reconciliation_required = True
+            pay.reconciliation_note = reason
+            order.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
+            order.reconciliation_reason = reason
+            order.updated_at = now
+            if commit:
+                db.commit()
+            else:
+                db.flush()
+            return order, pay, "RECONCILIATION_REQUIRED"
+        inv_pairs.append((res, inv))
+
+    for res, inv in inv_pairs:
+        inv.reserved_qty -= res.quantity
+        inv.on_hand_qty -= res.quantity
+        inv.version += 1
+        inv.updated_at = now
+        res.status = ReservationStatus.CONFIRMED.value
+        res.updated_at = now
+        if res.live_product_id:
+            lp = db.scalar(
+                select(LiveProduct).where(LiveProduct.id == res.live_product_id).with_for_update()
+            )
+            if lp is not None:
+                if lp.flash_sale_reserved_qty >= res.quantity:
+                    lp.flash_sale_reserved_qty -= res.quantity
+                lp.flash_sale_sold_qty += res.quantity
+
+    order.status = OrderStatus.CONFIRMED.value
+    order.payment_status = pay.status
+    order.version += 1
+    order.updated_at = now
+    pay.is_synced_to_order = True
+    pay.updated_at = now
+
+    record_commerce_event(
+        db,
+        merchant_id=order.merchant_id,
+        commerce_session_id=order.commerce_session_id,
+        world_epoch=order.world_epoch,
+        event_type="ORDER_UPDATED",
+        order_id=order.id,
+        payment_id=pay.id,
+        correlation_id=order.correlation_id,
+        payload={
+            "previous_status": OrderStatus.PENDING_PAYMENT.value,
+            "new_status": OrderStatus.CONFIRMED.value,
+            "payment_status": pay.status,
+            "sync_source": sync_source,
+        },
+    )
+    if commit:
+        db.commit()
+        db.refresh(order)
+        db.refresh(pay)
+    else:
+        db.flush()
+    return order, pay, "EXECUTED"
 
 
 def sync_confirmed_payments_to_orders(db: Session, *, limit: int = 25) -> int:
@@ -64,7 +250,10 @@ def sync_confirmed_payments_to_orders(db: Session, *, limit: int = 25) -> int:
 
         # Canonical lock order: Order -> Payment
         order = db.scalar(
-            select(Order).where(Order.id == pay_ref.order_id).with_for_update(skip_locked=True)
+            select(Order)
+            .options(selectinload(Order.items))
+            .where(Order.id == pay_ref.order_id)
+            .with_for_update(skip_locked=True)
         )
         if order is None:
             continue
@@ -74,11 +263,20 @@ def sync_confirmed_payments_to_orders(db: Session, *, limit: int = 25) -> int:
         if pay is None or pay.is_synced_to_order:
             continue
 
-        # Case 1: Payment was already fully REFUNDED before order sync -> NEVER confirm!
+        # Case 1 (Section 5.3): Payment fully REFUNDED before sync -> NEVER confirm or fulfill!
+        # Release eligible ACTIVE reservations & voucher capacity exactly once.
         if pay.status == PaymentStatus.REFUNDED.value:
+            released = 0
+            if order.status == OrderStatus.PENDING_PAYMENT.value:
+                released = release_order_reservations_and_voucher(
+                    db, order=order, reason_status=ReservationStatus.RELEASED
+                )
+                order.status = OrderStatus.CANCELLED.value
+                order.version += 1
+
             reason = (
                 "Payment was fully REFUNDED before order synchronization completed. "
-                "Order was NOT confirmed or fulfilled; manual reconciliation required."
+                f"Order was NOT confirmed/fulfilled; released {released} active reservation(s)."
             )
             pay.is_synced_to_order = True
             pay.reconciliation_required = True
@@ -100,6 +298,7 @@ def sync_confirmed_payments_to_orders(db: Session, *, limit: int = 25) -> int:
                 payload={
                     "payment_status": pay.status,
                     "order_status": order.status,
+                    "released_reservations": released,
                     "reason": reason,
                 },
             )
@@ -138,7 +337,7 @@ def sync_confirmed_payments_to_orders(db: Session, *, limit: int = 25) -> int:
             synced += 1
             continue
 
-        # Case 3: Normal confirmation from PENDING_PAYMENT with ACTIVE reservations
+        # Case 3 (Section 5.1): Normal confirmation from PENDING_PAYMENT with FULL reservation match
         if order.status == OrderStatus.PENDING_PAYMENT.value:
             reservations = list(
                 db.scalars(
@@ -151,9 +350,18 @@ def sync_confirmed_payments_to_orders(db: Session, *, limit: int = 25) -> int:
                     .with_for_update()
                 ).all()
             )
-            if not reservations:
+            # Verify ALL order item quantities are covered by ACTIVE reservations
+            expected_qty: dict[str, int] = {}
+            for oi in order.items:
+                expected_qty[oi.variant_id] = expected_qty.get(oi.variant_id, 0) + oi.quantity
+            reserved_qty: dict[str, int] = {}
+            for r in reservations:
+                reserved_qty[r.variant_id] = reserved_qty.get(r.variant_id, 0) + r.quantity
+
+            if not reservations or expected_qty != reserved_qty:
                 reason = (
-                    "No ACTIVE inventory reservations remain for PENDING_PAYMENT order at sync. "
+                    "ACTIVE inventory reservations do not match OrderItems at sync "
+                    f"(expected={expected_qty}, reserved={reserved_qty}). "
                     "Order NOT confirmed; manual reconciliation required."
                 )
                 pay.is_synced_to_order = True
@@ -341,3 +549,151 @@ def expire_stale_reservations(db: Session, *, limit: int = 25) -> int:
     if processed > 0:
         db.commit()
     return processed
+
+
+def reconcile_pending_vnpay_payments(
+    db: Session,
+    *,
+    limit: int = 10,
+    http_client: object | None = None,
+    worker_id: str = "querydr-worker",
+    lease_seconds: int = 30,
+) -> int:
+    """Bounded background QueryDr reconciliation with 3-phase durable lease claiming.
+
+    P2.1: Multi-worker safe via `FOR UPDATE SKIP LOCKED` + durable claim token/lease.
+    P2.2: Exhausted & backoff-ineligible payments are filtered in SQL BEFORE `.limit(limit)`
+          so they can never starve newer eligible payments.
+    """
+    settings = get_settings()
+    if not settings.is_vnpay_configured:
+        return 0
+
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(seconds=settings.vnpay_querydr_min_age_seconds)
+    max_attempts = settings.vnpay_querydr_max_attempts
+    lease_until = now + timedelta(seconds=max(5, lease_seconds))
+
+    # Phase 1 (short transaction): claim eligible payments with FOR UPDATE SKIP LOCKED
+    claim_stmt = (
+        select(Payment)
+        .where(
+            Payment.provider == PaymentProvider.VNPAY_SANDBOX.value,
+            Payment.status.in_(
+                [
+                    PaymentStatus.INITIATED.value,
+                    PaymentStatus.PENDING.value,
+                    PaymentStatus.UNKNOWN.value,
+                ]
+            ),
+            Payment.created_at <= cutoff,
+            Payment.querydr_exhausted.is_(False),
+            or_(
+                Payment.querydr_next_attempt_at.is_(None),
+                Payment.querydr_next_attempt_at <= now,
+            ),
+            or_(
+                Payment.querydr_locked_until.is_(None),
+                Payment.querydr_locked_until <= now,
+            ),
+        )
+        .order_by(Payment.querydr_next_attempt_at.asc().nullsfirst(), Payment.created_at.asc())
+        .with_for_update(skip_locked=True)
+        .limit(limit)
+    )
+    claimed_rows = list(db.scalars(claim_stmt).all())
+    if not claimed_rows:
+        return 0
+
+    claimed_pairs: list[tuple[str, str]] = []
+    for pay in claimed_rows:
+        token = f"QCLAIM-{uuid.uuid4().hex[:12].upper()}"
+        pay.querydr_claim_token = token
+        pay.querydr_claimed_by = worker_id
+        pay.querydr_locked_until = lease_until
+        pay.updated_at = now
+        claimed_pairs.append((pay.id, token))
+    db.commit()
+
+    from app.payments.vnpay.adapter import VNPaySandboxAdapter
+    from app.payments.vnpay.client import VNPayHttpClient
+
+    client_obj = http_client if isinstance(http_client, VNPayHttpClient) else None
+    adapter = VNPaySandboxAdapter(http_client=client_obj)
+    queried = 0
+
+    # Phase 2 & 3: QueryDr outside DB locks, then release lease & update schedule under fence
+    for pay_id, token in claimed_pairs:
+        try:
+            adapter.query_payment_status(db, payment_id=pay_id, expected_claim_token=token)
+            queried += 1
+        except Exception:  # noqa: BLE001
+            db.rollback()
+
+        now2 = datetime.now(UTC)
+        pay_ref = db.get(Payment, pay_id)
+        if pay_ref is None:
+            continue
+        order_row = db.scalar(select(Order).where(Order.id == pay_ref.order_id).with_for_update())
+        locked_pay = db.scalar(select(Payment).where(Payment.id == pay_id).with_for_update())
+        if locked_pay is None:
+            db.commit()
+            continue
+
+        # Fencing check: only the current claim holder may update schedule / release lease
+        if locked_pay.querydr_claim_token != token:
+            db.commit()
+            continue
+
+        attempt_count = int(
+            db.scalar(
+                select(func.count(PaymentQueryAttempt.id)).where(
+                    PaymentQueryAttempt.payment_id == locked_pay.id
+                )
+            )
+            or 0
+        )
+
+        locked_pay.querydr_claim_token = None
+        locked_pay.querydr_claimed_by = None
+        locked_pay.querydr_locked_until = None
+        locked_pay.updated_at = now2
+
+        is_still_pending = locked_pay.status in (
+            PaymentStatus.INITIATED.value,
+            PaymentStatus.PENDING.value,
+            PaymentStatus.UNKNOWN.value,
+        )
+        if is_still_pending and attempt_count >= max_attempts:
+            reason = (
+                f"VNPAY QueryDr exhausted after {attempt_count} attempt(s) with payment still "
+                f"in status '{locked_pay.status}'; manual reconciliation required."
+            )
+            locked_pay.querydr_exhausted = True
+            locked_pay.querydr_next_attempt_at = None
+            locked_pay.reconciliation_required = True
+            locked_pay.reconciliation_note = reason
+            if order_row is not None:
+                order_row.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
+                order_row.reconciliation_reason = reason
+                order_row.updated_at = now2
+            record_commerce_event(
+                db,
+                merchant_id=locked_pay.merchant_id,
+                commerce_session_id=locked_pay.commerce_session_id,
+                world_epoch=order_row.world_epoch if order_row else 1,
+                event_type="PAYMENT_RECONCILIATION_REQUIRED",
+                order_id=locked_pay.order_id,
+                payment_id=locked_pay.id,
+                correlation_id=locked_pay.correlation_id,
+                payload={"reason": reason, "attempt_count": attempt_count},
+            )
+        elif is_still_pending:
+            backoff_s = min(300, 15 * (2 ** min(attempt_count, 4)))
+            locked_pay.querydr_next_attempt_at = now2 + timedelta(seconds=backoff_s)
+        else:
+            locked_pay.querydr_next_attempt_at = None
+
+        db.commit()
+
+    return queried

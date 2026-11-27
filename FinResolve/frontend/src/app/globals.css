@@ -2,12 +2,60 @@
 
 :root {
   color-scheme: light;
+  --fr-primary: #2563eb;
+  --fr-primary-hover: #1d4ed8;
+  --fr-secondary-blue: #0ea5e9;
+  --fr-light-blue: #eff6ff;
+  --fr-bg: #f8fafc;
+  --fr-surface: #ffffff;
+  --fr-text-primary: #0f172a;
+  --fr-text-secondary: #64748b;
+  --fr-border: #e2e8f0;
+  --fr-success: #10b981;
+  --fr-warning: #f59e0b;
+  --fr-danger: #ef4444;
 }
 
 body {
-  @apply bg-slate-50 text-slate-900 antialiased;
+  background-color: var(--fr-bg);
+  color: var(--fr-text-primary);
+  @apply antialiased;
 }
 
 :focus-visible {
-  @apply outline-2 outline-offset-2 outline-indigo-600;
+  outline: 2px solid var(--fr-primary);
+  outline-offset: 2px;
+}
+
+@keyframes fr-guardian-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes fr-guardian-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.65;
+    transform: scale(1.06);
+  }
+}
+
+.fr-spin-slow {
+  animation: fr-guardian-spin 3.2s linear infinite;
+}
+
+.fr-pulse-soft {
+  animation: fr-guardian-pulse 2.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fr-spin-slow,
+  .fr-pulse-soft {
+    animation: none;
+  }
 }

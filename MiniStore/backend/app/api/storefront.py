@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
@@ -50,6 +51,9 @@ from app.models.enums import (
     RefundRequestStatus,
 )
 from app.payments.adapter import MockPaymentAdapter
+from app.payments.registry import list_payment_methods
+from app.payments.vnpay.adapter import VNPaySandboxAdapter
+from app.payments.vnpay.signing import verify_vnpay_params_signature
 from app.schemas.commerce import (
     ApplyVoucherRequest,
     CartItemAddRequest,
@@ -102,7 +106,16 @@ def _to_payment_response(p: Payment) -> PaymentResponse:
         order_id=p.order_id,
         merchant_id=p.merchant_id,
         provider=p.provider,
+        provider_environment=p.provider_environment,
         provider_ref=p.provider_ref,
+        provider_txn_no=p.provider_txn_no,
+        provider_txn_date=p.provider_txn_date,
+        provider_response_code=p.provider_response_code,
+        provider_transaction_status=p.provider_transaction_status,
+        observation_source=p.observation_source,
+        signature_verified=p.signature_verified,
+        last_observed_at=p.last_observed_at,
+        redirect_url=p.redirect_url,
         correlation_id=p.correlation_id,
         amount_vnd=p.amount_vnd,
         refunded_amount_vnd=p.refunded_amount_vnd,
@@ -313,18 +326,7 @@ def store_bootstrap(db: Session = Depends(get_db)) -> dict[str, Any]:
             "world_epoch": csess.world_epoch if csess else 1,
         },
         "categories": categories,
-        "payment_methods": [
-            {
-                "id": "LOCAL_MOCK",
-                "label_vi": "Thanh toán thử nghiệm nội bộ (LOCAL_MOCK)",
-                "available": True,
-            },
-            {
-                "id": "VNPAY_SANDBOX",
-                "label_vi": "VNPAY Sandbox (Sắp ra mắt ở Prompt 11 — chưa khả dụng)",
-                "available": False,
-            },
-        ],
+        "payment_methods": list_payment_methods(),
     }
 
 
@@ -850,6 +852,7 @@ def remove_cart_voucher(
 )
 def checkout_order(
     payload: CheckoutRequest,
+    request: Request,
     response: Response,
     idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"),
     _rl: None = Depends(enforce_checkout_rate_limit),
@@ -875,6 +878,9 @@ def checkout_order(
         if not eff_voucher:
             eff_voucher = cart.applied_voucher_code
 
+    forwarded_for = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    client_ip = forwarded_for or (request.client.host if request.client else "127.0.0.1")
+
     order, payment, replay = create_order_from_items(
         db,
         customer=principal.customer,
@@ -889,6 +895,7 @@ def checkout_order(
         direct_items=direct_items,
         clear_cart=cart if direct_items is None else None,
         expected_total_vnd=payload.expected_total_vnd,
+        client_ip=client_ip,
     )
     if replay:
         response.status_code = status.HTTP_200_OK
@@ -1103,6 +1110,258 @@ def submit_order_complaint(
     )
 
 
+class ReceiptClaimUploadRequest(BaseModel):
+    content_base64: str = Field(..., min_length=4, max_length=7_000_000)
+    content_type: str = Field(..., min_length=5, max_length=64)
+    claimed_txn_ref: str | None = Field(default=None, max_length=128)
+    claimed_amount_vnd: int | None = Field(default=None, ge=0)
+    note: str = Field(default="", max_length=1000)
+
+
+_ALLOWED_RECEIPT_MIMES: frozenset[str] = frozenset({"image/png", "image/jpeg", "image/webp"})
+_MAX_RECEIPT_UPLOAD_BYTES = 5 * 1024 * 1024
+_MAX_RECEIPT_DIM = 8000
+_MAX_RECEIPT_PIXELS = 25_000_000
+
+
+def _validate_receipt_image_bytes(raw: bytes, content_type: str) -> tuple[int, int]:
+    import struct
+
+    norm = content_type.strip().lower().split(";")[0]
+    if norm not in _ALLOWED_RECEIPT_MIMES:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST,
+            f"UNSUPPORTED_MEDIA_TYPE: '{norm}' not permitted for receipt upload",
+            status_code=400,
+        )
+    if not raw or len(raw) > _MAX_RECEIPT_UPLOAD_BYTES:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST,
+            "INVALID_RECEIPT_SIZE: receipt image must be 1 byte to 5 MB",
+            status_code=400,
+        )
+    if norm == "image/png":
+        if not raw.startswith(b"\x89PNG\r\n\x1a\n") or len(raw) < 24 or raw[12:16] != b"IHDR":
+            raise CommerceError(ErrorCode.BAD_REQUEST, "INVALID_PNG_HEADER", status_code=400)
+        w, h = struct.unpack(">II", raw[16:24])
+    elif norm == "image/jpeg":
+        if not raw.startswith(b"\xff\xd8\xff"):
+            raise CommerceError(ErrorCode.BAD_REQUEST, "INVALID_JPEG_HEADER", status_code=400)
+        w, h = 1, 1
+        idx = 2
+        while idx + 4 <= len(raw):
+            if raw[idx] != 0xFF:
+                idx += 1
+                continue
+            marker = raw[idx + 1]
+            if marker in (0xC0, 0xC1, 0xC2) and idx + 9 <= len(raw):
+                h, w = struct.unpack(">HH", raw[idx + 5 : idx + 9])
+                break
+            if marker in (0xD8, 0xD9, 0x01) or (0xD0 <= marker <= 0xD7):
+                idx += 2
+                continue
+            seg_len = struct.unpack(">H", raw[idx + 2 : idx + 4])[0]
+            if seg_len < 2:
+                break
+            idx += 2 + seg_len
+    else:
+        if not (raw.startswith(b"RIFF") and b"WEBP" in raw[:16]):
+            raise CommerceError(ErrorCode.BAD_REQUEST, "INVALID_WEBP_HEADER", status_code=400)
+        w, h = 1, 1
+    if (
+        w <= 0
+        or h <= 0
+        or w > _MAX_RECEIPT_DIM
+        or h > _MAX_RECEIPT_DIM
+        or (w * h) > _MAX_RECEIPT_PIXELS
+    ):
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST,
+            f"DECOMPRESSION_BOMB_BLOCKED: dimensions {w}x{h} exceed limits",
+            status_code=400,
+        )
+    return int(w), int(h)
+
+
+def _extract_receipt_from_image_bytes(raw: bytes, content_type: str) -> dict[str, Any]:
+    """Decode image safely and run real pixel-based Tesseract OCR (Prompt 14.3 Fix 3).
+
+    NEVER treats PNG tEXt/iTXt metadata as visible pixel OCR!
+    """
+    from app.core.ocr import extract_receipt_with_pixel_ocr
+
+    try:
+        return extract_receipt_with_pixel_ocr(raw, content_type)
+    except ValueError as exc:
+        raise CommerceError(ErrorCode.BAD_REQUEST, str(exc), status_code=400) from exc
+
+
+@router.post(
+    "/store/orders/{order_id}/receipt-claim",
+    status_code=status.HTTP_201_CREATED,
+)
+def upload_order_receipt_claim(
+    order_id: str,
+    payload: ReceiptClaimUploadRequest,
+    principal: CustomerPrincipal = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Authenticated customer receipt upload with image decoding, extraction & CLAIM storage."""
+    import base64
+    import hashlib
+
+    from app.core.ocr import resolve_private_receipt_dir
+
+    order = db.scalar(
+        select(Order).where(
+            Order.id == order_id,
+            Order.customer_id == principal.customer.id,
+            Order.merchant_id == principal.merchant_id,
+        )
+    )
+    if order is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Không tìm thấy đơn hàng", status_code=404)
+
+    try:
+        raw_bytes = base64.b64decode(payload.content_base64, validate=True)
+    except Exception as exc:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST, "INVALID_BASE64_RECEIPT", status_code=400
+        ) from exc
+
+    width, height = _validate_receipt_image_bytes(raw_bytes, payload.content_type)
+    extracted_info = _extract_receipt_from_image_bytes(raw_bytes, payload.content_type)
+    sha256_hex = hashlib.sha256(raw_bytes).hexdigest()
+
+    # Detect contradiction between customer-entered fields and visible PIXEL_OCR fields
+    cust_pixel_contradiction = False
+    pix_ref = extracted_info.get("extracted_txn_ref")
+    pix_amt = extracted_info.get("extracted_amount_vnd")
+    if payload.claimed_txn_ref and pix_ref:
+        if payload.claimed_txn_ref.strip().upper() != str(pix_ref).strip().upper():
+            cust_pixel_contradiction = True
+    if payload.claimed_amount_vnd is not None and pix_amt is not None:
+        if int(payload.claimed_amount_vnd) != int(pix_amt):
+            cust_pixel_contradiction = True
+    extracted_info["customer_pixel_contradiction"] = cust_pixel_contradiction
+
+    try:
+        private_dir = resolve_private_receipt_dir(order.merchant_id)
+    except ValueError as exc:
+        raise CommerceError(ErrorCode.BAD_REQUEST, str(exc), status_code=400) from exc
+
+    comp_id = f"CMP-{uuid.uuid4().hex[:10].upper()}"
+    ext = payload.content_type.split("/")[-1].split(";")[0].lower()
+    if ext not in ("png", "jpeg", "webp"):
+        ext = "bin"
+    stored_path = (private_dir / f"{comp_id}.{ext}").resolve()
+    try:
+        stored_path.relative_to(private_dir)
+    except ValueError as exc:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST, "PATH_TRAVERSAL_BLOCKED", status_code=400
+        ) from exc
+
+    effective_ref = (
+        payload.claimed_txn_ref.strip()
+        if payload.claimed_txn_ref
+        else extracted_info.get("extracted_txn_ref")
+    )
+    claim_desc = (
+        f"[PAYMENT_RECEIPT_CLAIM] sha256={sha256_hex[:16]} dims={width}x{height} "
+        f"extraction={extracted_info['extraction_status']} "
+        f"customer_amount={payload.claimed_amount_vnd} "
+        f"extracted_amount={extracted_info.get('extracted_amount_vnd')} "
+        f"note={payload.note.strip()}"
+    )
+    comp = Complaint(
+        id=comp_id,
+        order_id=order.id,
+        merchant_id=order.merchant_id,
+        commerce_session_id=order.commerce_session_id,
+        customer_id=principal.customer.id,
+        category="PAYMENT_RECEIPT_CLAIM",
+        description=claim_desc,
+        claimed_receipt_ref=str(effective_ref) if effective_ref else None,
+        evidence_kind="CLAIM",
+        status=ComplaintStatus.OPEN.value,
+    )
+    stored_path.write_bytes(raw_bytes)
+    try:
+        db.add(comp)
+        record_commerce_event(
+            db,
+            merchant_id=order.merchant_id,
+            commerce_session_id=order.commerce_session_id,
+            world_epoch=order.world_epoch,
+            event_type="PAYMENT_RECEIPT_CLAIM_SUBMITTED",
+            order_id=order.id,
+            correlation_id=order.correlation_id,
+            payload={
+                "complaint_id": comp.id,
+                "evidence_kind": "CLAIM",
+                "customer_entered": {
+                    "claimed_txn_ref": payload.claimed_txn_ref,
+                    "claimed_amount_vnd": payload.claimed_amount_vnd,
+                    "note": payload.note.strip(),
+                },
+                "image_extracted": extracted_info,
+                "receipt_sha256": sha256_hex,
+                "image_dimensions": [width, height],
+                "ocr_extraction_status": extracted_info["extraction_status"],
+            },
+        )
+        db.commit()
+    except Exception:
+        # Prevent orphaned receipt files if database commit fails
+        stored_path.unlink(missing_ok=True)
+        db.rollback()
+        raise
+    return {
+        "complaint_id": comp.id,
+        "order_id": order.id,
+        "evidence_kind": "CLAIM",
+        "status": comp.status,
+        "receipt_sha256": sha256_hex,
+        "image_dimensions": [width, height],
+        "ocr_extraction_status": extracted_info["extraction_status"],
+        "image_extracted": extracted_info,
+    }
+
+
+@router.delete("/store/orders/{order_id}/complaints/{complaint_id}")
+def delete_order_receipt_claim(
+    order_id: str,
+    complaint_id: str,
+    principal: CustomerPrincipal = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Retention & deletion control: customer may delete their own uploaded receipt file."""
+    from app.core.ocr import resolve_private_receipt_dir
+
+    comp = db.scalar(
+        select(Complaint).where(
+            Complaint.id == complaint_id,
+            Complaint.order_id == order_id,
+            Complaint.customer_id == principal.customer.id,
+            Complaint.merchant_id == principal.merchant_id,
+        )
+    )
+    if comp is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Không tìm thấy khiếu nại", status_code=404)
+
+    private_dir = resolve_private_receipt_dir(comp.merchant_id)
+    deleted_files = 0
+    if private_dir.exists():
+        for p in private_dir.glob(f"{comp.id}.*"):
+            p.unlink(missing_ok=True)
+            deleted_files += 1
+    comp.status = ComplaintStatus.CLOSED.value
+    comp.description = "[RECEIPT_DELETED_BY_CUSTOMER]"
+    db.commit()
+    return {"complaint_id": comp.id, "deleted_files": deleted_files, "status": comp.status}
+
+
 @router.post(
     "/store/orders/{order_id}/refund-requests",
     response_model=RefundRequestResponse,
@@ -1233,6 +1492,15 @@ def customer_mock_pay_order(
             ErrorCode.CONFLICT, "Đơn hàng chưa có giao dịch thanh toán", status_code=409
         )
     pay = order.payments[0]
+    if pay.provider != "LOCAL_MOCK":
+        raise CommerceError(
+            ErrorCode.FORBIDDEN,
+            (
+                "CROSS_PROVIDER_MUTATION_BLOCKED: Không thể dùng mock-pay cho giao dịch "
+                f"của cổng thanh toán '{pay.provider}'"
+            ),
+            status_code=403,
+        )
     adapter = MockPaymentAdapter()
     notif_id = f"MOCK-CUST-{uuid.uuid4().hex[:12].upper()}"
     updated_pay, is_dup = adapter.process_provider_notification(
@@ -1293,4 +1561,87 @@ def mock_payment_provider_notify(
         "payment": _to_payment_response(payment).model_dump(),
         "is_duplicate_notification": is_duplicate,
         "orders_synced": synced_count,
+    }
+
+
+# --- Official VNPAY Sandbox IPN & Read-Only ReturnURL Verification ---
+@router.get(
+    "/payments/vnpay/ipn",
+    summary="Official VNPAY Sandbox IPN Server-to-Server Callback (API 2.1.0)",
+)
+def vnpay_sandbox_ipn(
+    request: Request,
+    _rl: None = Depends(enforce_payment_rate_limit),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    """Receive and verify VNPAY Sandbox IPN callback.
+
+    Fails closed when VNPAY credentials are unavailable. Never runs LLM reasoning and never
+    blocks on FinResolve. Returns official VNPAY `{"RspCode": "...", "Message": "..."}`.
+    """
+    raw_items = list(request.query_params.multi_items())
+    adapter = VNPaySandboxAdapter()
+    return adapter.process_ipn(db, raw_query_items=raw_items)
+
+
+@router.get(
+    "/store/payments/vnpay/return-verify",
+    summary="Customer-authenticated ReturnURL status lookup (READ-ONLY — never confirms payment)",
+)
+def vnpay_return_verify(
+    request: Request,
+    principal: CustomerPrincipal = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Validate VNPAY ReturnURL signature server-side and return persisted payment/order status.
+
+    HARD INVARIANT: ReturnURL NEVER mutates Payment or Order status! Authoritative confirmation
+    comes ONLY from verified IPN or verified QueryDr.
+    """
+    params = dict(request.query_params.items())
+    txn_ref = params.get("vnp_TxnRef", "").strip()
+    if not txn_ref:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST, "Thiếu mã tham chiếu vnp_TxnRef", status_code=400
+        )
+
+    payment = db.scalar(
+        select(Payment).where(
+            Payment.provider_ref == txn_ref,
+            Payment.provider == "VNPAY_SANDBOX",
+            Payment.merchant_id == principal.merchant_id,
+        )
+    )
+    if payment is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Không tìm thấy giao dịch VNPAY", status_code=404)
+
+    order = db.scalar(
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.payments))
+        .where(
+            Order.id == payment.order_id,
+            Order.customer_id == principal.customer.id,
+            Order.merchant_id == principal.merchant_id,
+        )
+    )
+    if order is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Không tìm thấy đơn hàng", status_code=404)
+
+    settings = get_settings()
+    hash_secret = settings.vnpay_hash_secret.get_secret_value().strip()
+    return_sig_valid = (
+        verify_vnpay_params_signature(params, hash_secret=hash_secret)
+        if hash_secret and params.get("vnp_SecureHash")
+        else False
+    )
+
+    return {
+        "return_signature_valid": return_sig_valid,
+        "return_response_code": params.get("vnp_ResponseCode"),
+        "authoritative_note_vi": (
+            "Kết quả trang ReturnURL chỉ mang tính hiển thị tạm thời. Trạng thái thanh toán "
+            "chính thức được xác nhận bởi IPN có chữ ký hợp lệ hoặc truy vấn QueryDr từ hệ thống."
+        ),
+        "order": _to_order_response(order).model_dump(),
+        "payment": _to_payment_response(payment).model_dump(),
     }

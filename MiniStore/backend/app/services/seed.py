@@ -37,6 +37,7 @@ DEFAULT_SESSION_ID = "CSESS_FINSHOP_DEFAULT_01"
 DEFAULT_LIVE_SESSION_ID = "LIVE_FINSHOP_01"
 DEFAULT_MERCHANT_ACCOUNT_ID = "MACC_FINSHOP_OWNER_01"
 DEFAULT_SERVICE_CREDENTIAL_ID = "SCRED_FINRESOLVE_READ_01"
+DEFAULT_SERVICE_WRITE_CREDENTIAL_ID = "SCRED_FINRESOLVE_WRITE_01"
 DEFAULT_CUSTOMER_1_ID = "CUST_MINH_01"
 DEFAULT_CUSTOMER_2_ID = "CUST_LINH_02"
 
@@ -338,6 +339,39 @@ def seed_commerce_data(db: Session) -> dict[str, Any]:
     elif scred.key_hash != expected_key_hash:
         scred.key_hash = expected_key_hash
         db.flush()
+
+    # Seed dedicated scoped WRITE ServiceCredential only when explicit write key is configured
+    raw_write_key = settings.service_write_api_key.get_secret_value().strip()
+    if raw_write_key:
+        expected_write_hash = hash_token(raw_write_key)
+        wcred = db.get(ServiceCredential, DEFAULT_SERVICE_WRITE_CREDENTIAL_ID)
+        if wcred is None:
+            existing_w_by_hash = db.scalar(
+                select(ServiceCredential).where(ServiceCredential.key_hash == expected_write_hash)
+            )
+            if existing_w_by_hash is None:
+                wcred = ServiceCredential(
+                    id=DEFAULT_SERVICE_WRITE_CREDENTIAL_ID,
+                    service_name="FINRESOLVE_WRITE_RECOVERY",
+                    key_hash=expected_write_hash,
+                    merchant_id=DEFAULT_MERCHANT_ID,
+                    commerce_session_id=DEFAULT_SESSION_ID,
+                    allowed_scopes_json=[
+                        "recovery:REQUEST_ORDER_SYNC",
+                        "recovery:REQUEST_EVENT_REDELIVERY",
+                        "recovery:REQUEST_PAYMENT_RECONCILIATION",
+                        "recovery:REQUEST_MANUAL_REVIEW",
+                    ],
+                    is_active=True,
+                    expires_at=None,
+                    revoked_at=None,
+                    created_at=now,
+                )
+                db.add(wcred)
+                db.flush()
+        elif wcred.key_hash != expected_write_hash:
+            wcred.key_hash = expected_write_hash
+            db.flush()
 
     # Seed sample test customers with cryptographically random expiring tokens (never public)
     cust_ttl = timedelta(seconds=settings.customer_session_ttl_seconds)

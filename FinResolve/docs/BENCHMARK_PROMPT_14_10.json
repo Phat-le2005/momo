@@ -1,0 +1,56 @@
+{
+  "executed_at_utc": "2026-11-27T12:56:29.325460+00:00",
+  "evaluation_unit": "labeled_transaction_payment_sync_outcome",
+  "configured_model": {
+    "provider": "gemini",
+    "primary_model": "gemini-3.5-flash-lite",
+    "fallback_model": "gemini-3.1-flash-lite"
+  },
+  "sample_size": 4,
+  "healthy_transactions": 3,
+  "positive_incidents": 1,
+  "confusion_matrix": {
+    "tp": 1,
+    "fp": 0,
+    "tn": 3,
+    "fn": 0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "false_positive_rate": 0.0,
+    "f1_score": 1.0
+  },
+  "latency_ms": {
+    "scan_duration_ms": 2629.6,
+    "detection_latency_ms": 2907.6,
+    "investigation_duration_ms": 8709.1,
+    "end_to_end_recovery_latency_ms": 11625.2
+  },
+  "live_model": {
+    "model_mode": "LLM_API",
+    "adapter_name": "LLMModelAdapter(gemini:gemini-3.5-flash-lite)",
+    "is_fallback": false,
+    "run_id": "RUN-479CB81C87",
+    "stop_reason": "ACTION_PROPOSED",
+    "steps_executed": 3,
+    "replans_used": 0,
+    "tokens_used": 9819,
+    "tool_calls": [
+      "get_order",
+      "get_payment_record"
+    ],
+    "proposal_id": "PROP-8228CCAC6B",
+    "command_id": "RCMD-E7A7162A31",
+    "policy_decision": "ALLOW_POLICY_ENGINE_LOCAL_MOCK_L",
+    "execution_certainty": "COMMAND_EXECUTION_VERIFIED",
+    "order_id": "ORD-B7B00DCD27",
+    "payment_id": "PAY-83F1A7F73D",
+    "order_status_after": "CONFIRMED",
+    "verification_verdict": "VERIFIED_RECOVERY",
+    "recovery_succeeded": true
+  },
+  "safety_counters": {
+    "unauthorized_mutations": 0,
+    "duplicate_mutations": 0,
+    "total_executed_commands": 1
+  }
+}

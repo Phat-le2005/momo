@@ -305,7 +305,7 @@ def test_fully_refunded_before_sync_does_not_confirm_order(client: TestClient) -
         ord_row = db.get(Order, order_id)
         pay_row = db.get(Payment, pay_id)
         assert ord_row is not None
-        assert ord_row.status == OrderStatus.PENDING_PAYMENT.value
+        assert ord_row.status == OrderStatus.CANCELLED.value
         assert ord_row.reconciliation_status == ReconciliationStatus.RECONCILIATION_REQUIRED.value
         assert pay_row is not None and pay_row.reconciliation_required is True
 

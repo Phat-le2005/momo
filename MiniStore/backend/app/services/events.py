@@ -87,13 +87,46 @@ def record_commerce_event(
         if csess is not None:
             finresolve_session_id = csess.finresolve_session_id
 
+    # Derive truthful source_mode provenance (never mislabel VNPAY_SANDBOX/TEST_FIXTURE as MOCK)
+    derived_source_mode = (
+        str(
+            (provenance or {}).get("source_mode")
+            or (payload or {}).get("provenance")
+            or (payload or {}).get("provider_environment")
+            or ""
+        )
+        .strip()
+        .upper()
+    )
+    if derived_source_mode not in (
+        "MOCK",
+        "SANDBOX",
+        "TEST_FIXTURE",
+        "VNPAY_SANDBOX",
+        "PRODUCTION",
+    ):
+        if payment_id:
+            from app.models.entities import Payment
+
+            pay_row = db.get(Payment, payment_id)
+            if pay_row is not None and pay_row.provider_environment:
+                derived_source_mode = pay_row.provider_environment.strip().upper()
+    if derived_source_mode not in (
+        "MOCK",
+        "SANDBOX",
+        "TEST_FIXTURE",
+        "VNPAY_SANDBOX",
+        "PRODUCTION",
+    ):
+        derived_source_mode = get_settings().source_mode.strip().upper() or "MOCK"
+
     ev = CommerceEvent(
         id=f"EV-{uuid.uuid4().hex[:12].upper()}",
         event_id=stable_event_id,
         event_type=norm_type,
         source="MINI_STORE_COMMERCE",
         schema_version="1.0",
-        source_mode="MOCK",
+        source_mode=derived_source_mode,
         merchant_id=merchant_id,
         commerce_session_id=commerce_session_id,
         finresolve_session_id=finresolve_session_id,
@@ -164,7 +197,6 @@ def _claim_outbox_batch(
         ).all()
     )
     claimed: list[_ClaimedOutboxItem] = []
-    settings = get_settings()
     for row in rows:
         ev = db.get(CommerceEvent, row.commerce_event_id)
         if ev is None or not row.finresolve_mapped_type:
@@ -176,11 +208,7 @@ def _claim_outbox_batch(
         row.claimed_by = worker_id
         row.locked_until = lease_until
         row.updated_at = now
-        effective_epoch = (
-            row.target_finresolve_world_epoch
-            or settings.finresolve_target_world_epoch
-            or ev.world_epoch
-        )
+        effective_epoch = row.target_finresolve_world_epoch or ev.world_epoch
         claimed.append(
             _ClaimedOutboxItem(
                 outbox_id=row.id,
@@ -259,12 +287,14 @@ def dispatch_pending_outbox_events(
         }
         status_code: int | None = None
         resp_text = ""
+        retry_after_header: str | None = None
         err_msg: str | None = None
         try:
             with httpx.Client(timeout=4.0) as client:
                 resp = client.post(f"{base_url}/api/v1/events/ingest", headers=headers, json=body)
             status_code = resp.status_code
             resp_text = resp.text[:300]
+            retry_after_header = resp.headers.get("Retry-After")
         except Exception as exc:  # noqa: BLE001
             err_msg = str(exc)[:300]
 
@@ -302,6 +332,17 @@ def dispatch_pending_outbox_events(
             row.status = OutboxStatus.REVIEW_REQUIRED.value
             row.failure_category = OutboxFailureCategory.STALE_WORLD.value
             row.last_error = f"HTTP 409 (stale world_epoch): {resp_text[:200]}"
+        elif status_code == 429:
+            # HTTP 429 is transient rate limiting — honor valid Retry-After with bounded retry!
+            row.failure_category = OutboxFailureCategory.TRANSIENT.value
+            row.last_error = f"HTTP 429 (rate limited): {resp_text[:200]}"
+            if row.attempts >= max_attempts:
+                row.status = OutboxStatus.DEAD_LETTER.value
+            else:
+                backoff_s = min(300, 5 * (2 ** min(row.attempts, 5)))
+                if retry_after_header and retry_after_header.strip().isdigit():
+                    backoff_s = max(1, min(300, int(retry_after_header.strip())))
+                row.next_attempt_at = now + timedelta(seconds=backoff_s)
         elif status_code is not None and 400 <= status_code < 500:
             row.status = OutboxStatus.DEAD_LETTER.value
             row.failure_category = OutboxFailureCategory.PERMANENT_CONTRACT.value

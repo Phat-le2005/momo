@@ -395,6 +395,7 @@ def create_order_from_items(
     direct_items: list[tuple[str, int, str | None]] | None = None,
     clear_cart: Cart | None = None,
     expected_total_vnd: int | None = None,
+    client_ip: str = "127.0.0.1",
 ) -> tuple[Order, Payment, bool]:
     """Atomically reserve inventory, redeem voucher, create Order + Payment + Outbox events."""
     clean_key = idempotency_key.strip()
@@ -405,14 +406,23 @@ def create_order_from_items(
             status_code=400,
         )
     norm_pm = payment_method.strip().upper()
-    if norm_pm != "LOCAL_MOCK":
+    if norm_pm not in {"LOCAL_MOCK", "VNPAY_SANDBOX"}:
         raise CommerceError(
             ErrorCode.BAD_REQUEST,
             (
-                "Chỉ hỗ trợ phương thức thanh toán LOCAL_MOCK ở phiên bản này "
-                "(VNPAY Sandbox sẽ ra mắt ở Prompt 11)."
+                f"Phương thức thanh toán '{payment_method}' không được hỗ trợ. "
+                "Hỗ trợ: LOCAL_MOCK, VNPAY_SANDBOX."
             ),
             status_code=400,
+        )
+    if norm_pm == "VNPAY_SANDBOX" and not get_settings().is_vnpay_configured:
+        raise CommerceError(
+            ErrorCode.BAD_REQUEST,
+            (
+                "VNPAY_NOT_CONFIGURED: Cổng VNPAY Sandbox chưa được cấu hình khóa merchant "
+                "nên tạm thời chưa khả dụng."
+            ),
+            status_code=503,
         )
 
     raw_items: list[tuple[str, int, str | None]] = []
@@ -590,7 +600,7 @@ def create_order_from_items(
         recipient_phone=recipient_phone.strip(),
         shipping_address=shipping_address.strip(),
         customer_note=customer_note.strip()[:500],
-        payment_method="LOCAL_MOCK",
+        payment_method=norm_pm,
         version=1,
         created_at=now,
         updated_at=now,
@@ -697,13 +707,14 @@ def create_order_from_items(
             )
         )
 
-    from app.payments.adapter import MockPaymentAdapter
+    from app.payments.registry import get_payment_adapter
 
-    adapter = MockPaymentAdapter()
+    adapter = get_payment_adapter(norm_pm)
     payment = adapter.create_payment(
         db,
         order=order,
         correlation_id=corr_id,
+        client_ip=client_ip,
     )
 
     record_commerce_event(

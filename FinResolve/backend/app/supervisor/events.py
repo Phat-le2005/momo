@@ -55,6 +55,22 @@ NORMAL_OBSERVATION_EVENT_TYPES: frozenset[str] = frozenset(
         "ORDER_UPDATED",
         "PAYMENT_INITIATED",
         "INVENTORY_UPDATED",
+        # Prompt 12: extended MiniStore Commerce domain observation events (0 false Cases)
+        "PAYMENT_SUCCEEDED",
+        "PAYMENT_FAILED",
+        "PAYMENT_STATUS_UNKNOWN",
+        "PAYMENT_QUERY_COMPLETED",
+        "INVENTORY_RESERVED",
+        "INVENTORY_RELEASED",
+        "REFUND_REQUESTED",
+        "REFUND_PENDING",
+        "REFUND_COMPLETED",
+        "REFUND_STATUS_UNKNOWN",
+        "COMPLAINT_SUBMITTED",
+        "PAYMENT_RECONCILIATION_REQUIRED",
+        "INVENTORY_INCONSISTENCY_DETECTED",
+        "LIVE_SESSION_STARTED",
+        "FLASH_SALE_STARTED",
     }
 )
 ANOMALY_INVESTIGATION_EVENT_TYPES: frozenset[str] = frozenset(
@@ -108,15 +124,14 @@ class IngestEventResponse(BaseModel):
 
 def _compute_canonical_event_hash(event: NormalizedBusinessEvent, norm_type: str) -> str:
     canonical = {
+        "event_id": event.event_id.strip(),
         "event_type": norm_type,
-        "schema_version": event.schema_version.strip(),
         "merchant_id": event.merchant_id.strip(),
         "order_id": event.order_id,
         "payment_id": event.payment_id,
-        "correlation_id": event.correlation_id,
-        "payload": event.payload,
+        "payload": event.payload or {},
     }
-    raw = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    raw = json.dumps(canonical, sort_keys=True, default=str).encode("utf-8")
     if len(raw) > MAX_EVENT_PAYLOAD_BYTES:
         raise AppError(
             ErrorCode.BAD_REQUEST,
@@ -343,6 +358,22 @@ def ingest_normalized_business_event(
             f"Điều tra sự kiện {norm_type} "
             f"(order={event.order_id or 'N/A'}, payment={event.payment_id or 'N/A'})"
         )
+        # Bind Case to CommerceSourceBinding when event comes from authenticated MiniStore Commerce
+        from app.models.monitoring import CommerceSourceBinding
+
+        source_sys = "SIMULATOR"
+        source_bid: str | None = None
+        if verified_source == "MINI_STORE_COMMERCE":
+            matched_binding = db.scalar(
+                select(CommerceSourceBinding).where(
+                    CommerceSourceBinding.session_id == session_obj.id,
+                    CommerceSourceBinding.merchant_id == event.merchant_id.strip(),
+                )
+            )
+            if matched_binding is not None:
+                source_sys = "COMMERCE_HTTP"
+                source_bid = matched_binding.id
+
         case_obj = Case(
             id=case_id,
             session_id=session_obj.id,
@@ -351,6 +382,8 @@ def ingest_normalized_business_event(
             state=CaseState.NEW.value,
             version=1,
             owner="supervisor",
+            source_system=source_sys,
+            source_binding_id=source_bid,
             created_at=now,
             updated_at=now,
         )

@@ -25,6 +25,7 @@ class ActionProposal(Base):
     session_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("demo_sessions.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    investigation_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     action_type: Mapped[str] = mapped_column(String(64), nullable=False)
     params_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     evidence_refs: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)

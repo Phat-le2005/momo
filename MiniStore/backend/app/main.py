@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -12,11 +13,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from app.api.chaos import router as chaos_router
 from app.api.merchant import router as merchant_router
 from app.api.service_read import router as service_read_router
+from app.api.service_write import router as service_write_router
 from app.api.storefront import router as storefront_router
 from app.core.config import get_settings
 from app.core.errors import CommerceError
+from app.core.telemetry import get_telemetry_collector
 from app.db.session import get_engine, get_sessionmaker
 from app.services.seed import seed_commerce_data
 
@@ -65,6 +69,18 @@ def create_app() -> FastAPI:
             )
         return await call_next(request)
 
+    @app.middleware("http")
+    async def _measure_operational_telemetry(request: Request, call_next: Any) -> Any:
+        t0 = time.perf_counter()
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        get_telemetry_collector().record_http_request(
+            path=request.url.path,
+            status_code=response.status_code,
+            duration_ms=elapsed_ms,
+        )
+        return response
+
     @app.exception_handler(CommerceError)
     async def _handle_commerce_error(_request: Request, exc: CommerceError) -> JSONResponse:
         return JSONResponse(
@@ -83,15 +99,34 @@ def create_app() -> FastAPI:
         return {"status": "ok", "service": settings.app_name, "source_mode": settings.source_mode}
 
     @app.get("/readyz", tags=["health"])
-    def readyz() -> dict[str, str]:
+    def readyz() -> dict[str, Any]:
+        from app.core.ocr import get_ocr_readiness, verify_receipt_storage_writable
+
         engine = get_engine()
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        return {"status": "ready", "database": "connected", "source_mode": settings.source_mode}
+        ocr_info = get_ocr_readiness()
+        storage_info = verify_receipt_storage_writable()
+        return {
+            "status": "ready" if storage_info["writable"] else "degraded",
+            "database": "connected",
+            "source_mode": settings.source_mode,
+            "ocr_ready": bool(ocr_info["ocr_ready"]),
+            "ocr": ocr_info,
+            "receipt_storage_writable": bool(storage_info["writable"]),
+        }
+
+    @app.get("/api/v1/health/ocr", tags=["health"])
+    def health_ocr() -> dict[str, Any]:
+        from app.core.ocr import get_ocr_readiness
+
+        return get_ocr_readiness()
 
     app.include_router(storefront_router, prefix="/api/v1")
     app.include_router(merchant_router, prefix="/api/v1")
     app.include_router(service_read_router, prefix="/api/v1")
+    app.include_router(service_write_router, prefix="/api/v1")
+    app.include_router(chaos_router, prefix="/api/v1")
     return app
 
 

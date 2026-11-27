@@ -29,13 +29,16 @@ from app.models.entities import (
     Complaint,
     EventOutbox,
     Inventory,
+    InventoryReservation,
     LiveProduct,
     LiveSession,
     MerchantAccount,
     Order,
     Payment,
+    PaymentQueryAttempt,
     Product,
     ProductVariant,
+    ReconciliationRecord,
     RefundRequest,
     Voucher,
 )
@@ -45,9 +48,10 @@ from app.models.enums import (
     PaymentStatus,
     ReconciliationStatus,
     RefundRequestStatus,
+    ReservationStatus,
     can_transition_order,
 )
-from app.payments.adapter import MockPaymentAdapter
+from app.payments.registry import get_payment_adapter
 from app.schemas.commerce import (
     CommerceEventItemResponse,
     ComplaintResponse,
@@ -63,8 +67,10 @@ from app.schemas.commerce import (
     MerchantUpdateOrderStatusRequest,
     MerchantUpdateProductRequest,
     OrderResponse,
+    PaymentQueryAttemptResponse,
     PaymentResponse,
     ProductResponse,
+    ReconciliationRecordResponse,
     ReconciliationResolveRequest,
     RefundRequestResponse,
     VoucherResponse,
@@ -551,6 +557,92 @@ def merchant_list_orders(
     return [_to_order_response(o) for o in db.scalars(stmt).all()]
 
 
+@router.post(
+    "/orders/{order_id}/reconciliation/acknowledge",
+    response_model=ReconciliationRecordResponse,
+    summary="Record operator acknowledgment/investigation note without prematurely resolving",
+)
+def merchant_acknowledge_reconciliation(
+    order_id: str,
+    payload: ReconciliationResolveRequest,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> ReconciliationRecordResponse:
+    order = db.scalar(
+        select(Order)
+        .options(selectinload(Order.payments))
+        .where(Order.id == order_id, Order.merchant_id == principal.merchant_id)
+        .with_for_update()
+    )
+    if order is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Order not found", status_code=404)
+    pay = order.payments[0] if order.payments else None
+    rec = ReconciliationRecord(
+        id=f"RREC-{uuid.uuid4().hex[:10].upper()}",
+        order_id=order.id,
+        payment_id=pay.id if pay else None,
+        merchant_id=order.merchant_id,
+        operator_id=principal.operator_id,
+        action_type="ACKNOWLEDGE",
+        note=payload.resolution_note.strip(),
+        evidence_json={
+            "order_status": order.status,
+            "payment_status": pay.status if pay else None,
+            "reconciliation_status": order.reconciliation_status,
+        },
+        verified_postconditions=False,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return ReconciliationRecordResponse(
+        id=rec.id,
+        order_id=rec.order_id,
+        payment_id=rec.payment_id,
+        operator_id=rec.operator_id,
+        action_type=rec.action_type,
+        note=rec.note,
+        evidence_json=dict(rec.evidence_json or {}),
+        verified_postconditions=rec.verified_postconditions,
+        created_at=rec.created_at,
+    )
+
+
+@router.get(
+    "/orders/{order_id}/reconciliation/history",
+    response_model=list[ReconciliationRecordResponse],
+)
+def merchant_reconciliation_history(
+    order_id: str,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> list[ReconciliationRecordResponse]:
+    rows = list(
+        db.scalars(
+            select(ReconciliationRecord)
+            .where(
+                ReconciliationRecord.order_id == order_id,
+                ReconciliationRecord.merchant_id == principal.merchant_id,
+            )
+            .order_by(ReconciliationRecord.created_at.desc())
+        ).all()
+    )
+    return [
+        ReconciliationRecordResponse(
+            id=r.id,
+            order_id=r.order_id,
+            payment_id=r.payment_id,
+            operator_id=r.operator_id,
+            action_type=r.action_type,
+            note=r.note,
+            evidence_json=dict(r.evidence_json or {}),
+            verified_postconditions=r.verified_postconditions,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+
 @router.post("/orders/{order_id}/reconciliation/resolve", response_model=OrderResponse)
 def merchant_resolve_reconciliation(
     order_id: str,
@@ -558,6 +650,11 @@ def merchant_resolve_reconciliation(
     principal: MerchantPrincipal = Depends(get_current_merchant),
     db: Session = Depends(get_db),
 ) -> OrderResponse:
+    """Evidence-based reconciliation resolution (Section 5.2).
+
+    Re-reads authoritative order, payment, and reservation states and refuses to mark RESOLVED
+    if concrete financial postconditions remain inconsistent!
+    """
     from app.api.storefront import _to_order_response
 
     order = db.scalar(
@@ -569,6 +666,75 @@ def merchant_resolve_reconciliation(
     if order is None:
         raise CommerceError(ErrorCode.NOT_FOUND, "Order not found", status_code=404)
 
+    pay = order.payments[0] if order.payments else None
+    active_res_count = int(
+        db.scalar(
+            select(func.count(InventoryReservation.id)).where(
+                InventoryReservation.order_id == order.id,
+                InventoryReservation.status == ReservationStatus.ACTIVE.value,
+            )
+        )
+        or 0
+    )
+
+    # Verify concrete financial postconditions before allowing RESOLVED
+    inconsistencies: list[str] = []
+    if pay is not None:
+        if pay.status == PaymentStatus.UNKNOWN.value:
+            inconsistencies.append(
+                "Payment status is still UNKNOWN — verify via provider QueryDr before resolving."
+            )
+        if order.status == OrderStatus.CANCELLED.value and pay.status in (
+            PaymentStatus.SUCCEEDED.value,
+            PaymentStatus.PARTIALLY_REFUNDED.value,
+        ):
+            inconsistencies.append(
+                "Order is CANCELLED while payment is still captured (not fully REFUNDED) — "
+                "complete full refund before marking reconciliation resolved."
+            )
+        if order.status == OrderStatus.PENDING_PAYMENT.value and pay.status in (
+            PaymentStatus.SUCCEEDED.value,
+            PaymentStatus.REFUNDED.value,
+        ):
+            inconsistencies.append(
+                f"Order is still PENDING_PAYMENT while payment is {pay.status} — "
+                "synchronize or cancel order first."
+            )
+    if order.status == OrderStatus.CANCELLED.value and active_res_count > 0:
+        inconsistencies.append(
+            f"Cancelled order still has {active_res_count} ACTIVE inventory reservation(s)."
+        )
+
+    evidence = {
+        "order_status": order.status,
+        "payment_status": pay.status if pay else None,
+        "payment_refunded_vnd": pay.refunded_amount_vnd if pay else 0,
+        "active_reservations": active_res_count,
+        "inconsistencies": inconsistencies,
+    }
+
+    if inconsistencies:
+        db.add(
+            ReconciliationRecord(
+                id=f"RREC-{uuid.uuid4().hex[:10].upper()}",
+                order_id=order.id,
+                payment_id=pay.id if pay else None,
+                merchant_id=order.merchant_id,
+                operator_id=principal.operator_id,
+                action_type="RESOLVE_REJECTED",
+                note=payload.resolution_note.strip(),
+                evidence_json=evidence,
+                verified_postconditions=False,
+            )
+        )
+        db.commit()
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            "RECONCILIATION_POSTCONDITION_FAILED: " + " ".join(inconsistencies),
+            status_code=409,
+            details=evidence,
+        )
+
     now = datetime.now(UTC)
     order.reconciliation_status = ReconciliationStatus.RESOLVED.value
     order.reconciliation_reason = payload.resolution_note.strip()
@@ -578,6 +744,19 @@ def merchant_resolve_reconciliation(
         p.reconciliation_note = payload.resolution_note.strip()
         p.updated_at = now
 
+    db.add(
+        ReconciliationRecord(
+            id=f"RREC-{uuid.uuid4().hex[:10].upper()}",
+            order_id=order.id,
+            payment_id=pay.id if pay else None,
+            merchant_id=order.merchant_id,
+            operator_id=principal.operator_id,
+            action_type="RESOLVE",
+            note=payload.resolution_note.strip(),
+            evidence_json=evidence,
+            verified_postconditions=True,
+        )
+    )
     record_commerce_event(
         db,
         merchant_id=order.merchant_id,
@@ -589,6 +768,7 @@ def merchant_resolve_reconciliation(
         payload={
             "reconciliation_status": ReconciliationStatus.RESOLVED.value,
             "resolution_note": payload.resolution_note.strip(),
+            "verified_postconditions": True,
             "actor": f"merchant:{principal.operator_id}",
         },
     )
@@ -623,13 +803,45 @@ def merchant_update_order_status(
             ErrorCode.BAD_REQUEST, f"Invalid status '{payload.status}'", status_code=400
         ) from err
 
+    # Section 5.1: Prevent bypassing payment/inventory confirmation & cancellation workflows!
+    if target == OrderStatus.CONFIRMED:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            (
+                "MANUAL_CONFIRMATION_BLOCKED: Không thể xác nhận thủ công đơn hàng. "
+                "Đơn chỉ được CONFIRMED tự động sau khi thanh toán SUCCEEDED và đồng bộ kho."
+            ),
+            status_code=409,
+        )
+    if target == OrderStatus.CANCELLED:
+        raise CommerceError(
+            ErrorCode.CONFLICT,
+            (
+                "GENERIC_CANCEL_BLOCKED: Không thể hủy đơn qua endpoint cập nhật trạng thái chung "
+                "(phải qua quy trình hủy/hoàn trả giữ chỗ chuyên biệt)."
+            ),
+            status_code=409,
+        )
+
     if not can_transition_order(curr, target):
         raise CommerceError(
             ErrorCode.INVALID_STATE_TRANSITION,
             f"Invalid order transition: {curr.value} -> {target.value}",
             status_code=409,
         )
+
     if target in (OrderStatus.PROCESSING, OrderStatus.SHIPPED, OrderStatus.DELIVERED):
+        if order.reconciliation_status == ReconciliationStatus.RECONCILIATION_REQUIRED.value or any(
+            p.reconciliation_required for p in order.payments
+        ):
+            raise CommerceError(
+                ErrorCode.CONFLICT,
+                (
+                    "RECONCILIATION_REQUIRED_BLOCKS_FULFILLMENT: "
+                    "Đơn hàng đang cần đối soát thanh toán, không thể đóng gói/giao hàng."
+                ),
+                status_code=409,
+            )
         if order.payment_status not in (
             PaymentStatus.SUCCEEDED.value,
             PaymentStatus.PARTIALLY_REFUNDED.value,
@@ -667,20 +879,98 @@ def merchant_update_order_status(
 
 @router.get("/payments", response_model=list[PaymentResponse])
 def merchant_list_payments(
+    provider: str | None = Query(default=None, max_length=32),
     principal: MerchantPrincipal = Depends(get_current_merchant),
     db: Session = Depends(get_db),
 ) -> list[PaymentResponse]:
     from app.api.storefront import _to_payment_response
 
+    stmt = (
+        select(Payment)
+        .where(Payment.merchant_id == principal.merchant_id)
+        .order_by(Payment.created_at.desc())
+        .limit(100)
+    )
+    if provider and provider.strip():
+        stmt = stmt.where(Payment.provider == provider.strip().upper())
+    rows = list(db.scalars(stmt).all())
+    return [_to_payment_response(p) for p in rows]
+
+
+@router.post("/payments/{payment_id}/querydr")
+def merchant_querydr_payment(
+    payment_id: str,
+    request: Request,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Authorized manual QueryDr reconciliation trigger for a merchant's payment."""
+    payment = db.scalar(
+        select(Payment).where(
+            Payment.id == payment_id,
+            Payment.merchant_id == principal.merchant_id,
+        )
+    )
+    if payment is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Payment not found", status_code=404)
+
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    client_ip = forwarded or (request.client.host if request.client else "127.0.0.1")
+    adapter = get_payment_adapter(payment.provider)
+    obs = adapter.query_payment_status(db, payment_id=payment.id, client_ip=client_ip)
+    synced = sync_confirmed_payments_to_orders(db, limit=10)
+    return {
+        "payment_id": obs.payment_id,
+        "provider": obs.provider,
+        "provider_environment": obs.provider_environment,
+        "status": obs.status,
+        "provider_response_code": obs.provider_response_code,
+        "provider_transaction_status": obs.provider_transaction_status,
+        "signature_verified": obs.signature_verified,
+        "reconciliation_required": obs.reconciliation_required,
+        "orders_synced": synced,
+    }
+
+
+@router.get(
+    "/payments/{payment_id}/query-history",
+    response_model=list[PaymentQueryAttemptResponse],
+)
+def merchant_payment_query_history(
+    payment_id: str,
+    principal: MerchantPrincipal = Depends(get_current_merchant),
+    db: Session = Depends(get_db),
+) -> list[PaymentQueryAttemptResponse]:
     rows = list(
         db.scalars(
-            select(Payment)
-            .where(Payment.merchant_id == principal.merchant_id)
-            .order_by(Payment.created_at.desc())
-            .limit(100)
+            select(PaymentQueryAttempt)
+            .where(
+                PaymentQueryAttempt.payment_id == payment_id,
+                PaymentQueryAttempt.merchant_id == principal.merchant_id,
+            )
+            .order_by(PaymentQueryAttempt.created_at.desc())
+            .limit(50)
         ).all()
     )
-    return [_to_payment_response(p) for p in rows]
+    return [
+        PaymentQueryAttemptResponse(
+            id=r.id,
+            payment_id=r.payment_id,
+            order_id=r.order_id,
+            provider=r.provider,
+            request_id=r.request_id,
+            command=r.command,
+            http_status=r.http_status,
+            provider_response_code=r.provider_response_code,
+            provider_transaction_status=r.provider_transaction_status,
+            signature_verified=r.signature_verified,
+            mapped_payment_status=r.mapped_payment_status,
+            observation_provenance=r.observation_provenance,
+            error_message=r.error_message,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
 
 
 @router.post("/payments/sync-now")
@@ -754,11 +1044,15 @@ def merchant_decide_refund(
         db.commit()
         return {"refund_request_id": req.id, "status": req.status, "refund_transaction_id": None}
 
-    adapter = MockPaymentAdapter()
+    pay = db.get(Payment, req.payment_id)
+    if pay is None:
+        raise CommerceError(ErrorCode.NOT_FOUND, "Payment not found", status_code=404)
+    adapter = get_payment_adapter(pay.provider)
     txn = adapter.request_refund(
         db,
         refund_request=req,
         idempotency_key=f"IDEMP-REF-{req.id}",
+        operator_id=principal.operator_id,
     )
     return {
         "refund_request_id": req.id,

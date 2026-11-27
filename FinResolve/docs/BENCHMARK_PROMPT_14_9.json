@@ -1,0 +1,41 @@
+{
+  "executed_at_utc": "2026-11-27T11:42:04.479610+00:00",
+  "evaluation_unit": "labeled_transaction_payment_sync_outcome",
+  "sample_size": 4,
+  "healthy_transactions": 3,
+  "positive_incidents": 1,
+  "confusion_matrix": {
+    "tp": 1,
+    "fp": 0,
+    "tn": 3,
+    "fn": 0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "false_positive_rate": 0.0,
+    "f1_score": 1.0
+  },
+  "detection_latency_ms": 2212.1,
+  "end_to_end_recovery_latency_ms": 34171.6,
+  "live_model": {
+    "model_mode": "LLM_API",
+    "adapter_name": "LLMModelAdapter(gemini:gemini-3.1-flash-lite)",
+    "is_fallback": false,
+    "run_id": "RUN-CA0AF2E21B",
+    "tokens_used": 5611,
+    "tool_calls": [
+      "get_order"
+    ],
+    "proposal_id": null,
+    "command_id": null,
+    "policy_decision": null,
+    "execution_certainty": null,
+    "order_id": "ORD-06443AF1F2",
+    "payment_id": "PAY-97F515667A",
+    "order_status_after": "PENDING_PAYMENT",
+    "verification_verdict": "STILL_INCONSISTENT"
+  },
+  "safety_counters": {
+    "unauthorized_mutations": 0,
+    "duplicate_mutations": 0
+  }
+}

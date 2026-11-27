@@ -7,6 +7,7 @@ to merchant_id & commerce_session_id) + `X-Merchant-Id` + `X-Commerce-Session-Id
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -20,17 +21,70 @@ from app.models.entities import (
     CommerceEvent,
     EventOutbox,
     Inventory,
+    InventoryReservation,
     LiveSession,
     Order,
     Payment,
+    PaymentQueryAttempt,
     ProductVariant,
     RefundTransaction,
     VoucherRedemption,
 )
 from app.models.enums import OrderStatus, OutboxStatus, PaymentStatus, ReconciliationStatus
-from app.payments.adapter import MockPaymentAdapter
+from app.payments.adapter import build_payment_observation
 
 router = APIRouter(prefix="/service", tags=["service-read-connectors"])
+
+
+@router.get("/orders")
+def service_list_orders(
+    status: str | None = Query(default=None, max_length=32),
+    reconciliation_status: str | None = Query(default=None, max_length=32),
+    after_id: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=50, ge=1, le=200),
+    principal: ServicePrincipal = Depends(get_service_principal),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    from app.api.storefront import _to_order_response
+
+    stmt = (
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.payments))
+        .where(
+            Order.merchant_id == principal.merchant_id,
+            Order.commerce_session_id == principal.commerce_session_id,
+            Order.world_epoch == principal.world_epoch,
+        )
+    )
+    if status:
+        stmt = stmt.where(Order.status == status.strip().upper())
+    if reconciliation_status:
+        stmt = stmt.where(Order.reconciliation_status == reconciliation_status.strip().upper())
+    if after_id:
+        anchor = db.scalar(
+            select(Order).where(
+                Order.id == after_id,
+                Order.merchant_id == principal.merchant_id,
+                Order.commerce_session_id == principal.commerce_session_id,
+                Order.world_epoch == principal.world_epoch,
+            )
+        )
+        if anchor is None:
+            raise CommerceError(
+                ErrorCode.BAD_REQUEST,
+                f"Invalid order cursor after_id '{after_id}'",
+                status_code=400,
+            )
+        stmt = stmt.where(
+            or_(
+                Order.created_at > anchor.created_at,
+                and_(Order.created_at == anchor.created_at, Order.id > anchor.id),
+            )
+        )
+    rows = list(
+        db.scalars(stmt.order_by(Order.created_at.asc(), Order.id.asc()).limit(limit)).all()
+    )
+    return [_to_order_response(o).model_dump() for o in rows]
 
 
 @router.get("/orders/{order_id}")
@@ -48,6 +102,7 @@ def service_get_order(
             Order.id == order_id,
             Order.merchant_id == principal.merchant_id,
             Order.commerce_session_id == principal.commerce_session_id,
+            Order.world_epoch == principal.world_epoch,
         )
     )
     if order is None:
@@ -57,6 +112,94 @@ def service_get_order(
     return _to_order_response(order).model_dump()
 
 
+@router.get("/payments")
+def service_list_payments(
+    status: str | None = Query(default=None, max_length=32),
+    is_synced: bool | None = Query(default=None),
+    reconciliation_required: bool | None = Query(default=None),
+    after_id: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=50, ge=1, le=200),
+    principal: ServicePrincipal = Depends(get_service_principal),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    stmt = (
+        select(Payment)
+        .join(Order, Payment.order_id == Order.id)
+        .where(
+            Payment.merchant_id == principal.merchant_id,
+            Payment.commerce_session_id == principal.commerce_session_id,
+            Order.world_epoch == principal.world_epoch,
+        )
+    )
+    if status:
+        stmt = stmt.where(Payment.status == status.strip().upper())
+    if is_synced is not None:
+        stmt = stmt.where(Payment.is_synced_to_order.is_(is_synced))
+    if reconciliation_required is not None:
+        stmt = stmt.where(Payment.reconciliation_required.is_(reconciliation_required))
+    if after_id:
+        anchor = db.scalar(
+            select(Payment)
+            .join(Order, Payment.order_id == Order.id)
+            .where(
+                Payment.id == after_id,
+                Payment.merchant_id == principal.merchant_id,
+                Payment.commerce_session_id == principal.commerce_session_id,
+                Order.world_epoch == principal.world_epoch,
+            )
+        )
+        if anchor is None:
+            raise CommerceError(
+                ErrorCode.BAD_REQUEST,
+                f"Invalid payment cursor after_id '{after_id}'",
+                status_code=400,
+            )
+        stmt = stmt.where(
+            or_(
+                Payment.created_at > anchor.created_at,
+                and_(Payment.created_at == anchor.created_at, Payment.id > anchor.id),
+            )
+        )
+    rows = list(
+        db.scalars(stmt.order_by(Payment.created_at.asc(), Payment.id.asc()).limit(limit)).all()
+    )
+    result: list[dict[str, Any]] = []
+    for payment in rows:
+        obs = build_payment_observation(db, payment=payment)
+        result.append(
+            {
+                "payment_id": obs.payment_id,
+                "order_id": obs.order_id,
+                "merchant_id": obs.merchant_id,
+                "provider": obs.provider,
+                "provider_environment": obs.provider_environment,
+                "provider_ref": obs.provider_ref,
+                "provider_txn_no": obs.provider_txn_no,
+                "provider_txn_date": obs.provider_txn_date,
+                "provider_response_code": obs.provider_response_code,
+                "provider_transaction_status": obs.provider_transaction_status,
+                "observation_source": obs.observation_source,
+                "signature_verified": obs.signature_verified,
+                "status": obs.status,
+                "amount_vnd": obs.amount_vnd,
+                "refunded_amount_vnd": obs.refunded_amount_vnd,
+                "pending_refund_amount_vnd": obs.pending_refund_amount_vnd,
+                "unknown_refund_amount_vnd": obs.unknown_refund_amount_vnd,
+                "refundable_remaining_vnd": obs.refundable_remaining_vnd,
+                "is_synced_to_order": obs.is_synced_to_order,
+                "reconciliation_required": obs.reconciliation_required,
+                "reconciliation_note": obs.reconciliation_note,
+                "confirmed_at": obs.confirmed_at.isoformat() if obs.confirmed_at else None,
+                "last_observed_at": (
+                    obs.last_observed_at.isoformat() if obs.last_observed_at else None
+                ),
+                "observed_at": obs.observed_at.isoformat(),
+                "authoritative_provenance": obs.authoritative_provenance,
+            }
+        )
+    return result
+
+
 @router.get("/payments/{payment_id}")
 def service_get_payment_observation(
     payment_id: str,
@@ -64,23 +207,33 @@ def service_get_payment_observation(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     payment = db.scalar(
-        select(Payment).where(
+        select(Payment)
+        .join(Order, Payment.order_id == Order.id)
+        .where(
             Payment.id == payment_id,
             Payment.merchant_id == principal.merchant_id,
             Payment.commerce_session_id == principal.commerce_session_id,
+            Order.world_epoch == principal.world_epoch,
         )
     )
     if payment is None:
         raise CommerceError(
             ErrorCode.NOT_FOUND, "Payment not found in service scope", status_code=404
         )
-    obs = MockPaymentAdapter().get_authoritative_observation(db, payment_id=payment.id)
+    obs = build_payment_observation(db, payment=payment)
     return {
         "payment_id": obs.payment_id,
         "order_id": obs.order_id,
         "merchant_id": obs.merchant_id,
         "provider": obs.provider,
+        "provider_environment": obs.provider_environment,
         "provider_ref": obs.provider_ref,
+        "provider_txn_no": obs.provider_txn_no,
+        "provider_txn_date": obs.provider_txn_date,
+        "provider_response_code": obs.provider_response_code,
+        "provider_transaction_status": obs.provider_transaction_status,
+        "observation_source": obs.observation_source,
+        "signature_verified": obs.signature_verified,
         "status": obs.status,
         "amount_vnd": obs.amount_vnd,
         "refunded_amount_vnd": obs.refunded_amount_vnd,
@@ -91,9 +244,85 @@ def service_get_payment_observation(
         "reconciliation_required": obs.reconciliation_required,
         "reconciliation_note": obs.reconciliation_note,
         "confirmed_at": obs.confirmed_at.isoformat() if obs.confirmed_at else None,
+        "last_observed_at": obs.last_observed_at.isoformat() if obs.last_observed_at else None,
         "observed_at": obs.observed_at.isoformat(),
         "authoritative_provenance": obs.authoritative_provenance,
     }
+
+
+@router.get("/payments/{payment_id}/queries")
+def service_get_payment_query_history(
+    payment_id: str,
+    principal: ServicePrincipal = Depends(get_service_principal),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    rows = list(
+        db.scalars(
+            select(PaymentQueryAttempt)
+            .join(Order, PaymentQueryAttempt.order_id == Order.id)
+            .where(
+                PaymentQueryAttempt.payment_id == payment_id,
+                PaymentQueryAttempt.merchant_id == principal.merchant_id,
+                Order.commerce_session_id == principal.commerce_session_id,
+                Order.world_epoch == principal.world_epoch,
+            )
+            .order_by(PaymentQueryAttempt.created_at.desc())
+            .limit(50)
+        ).all()
+    )
+    return [
+        {
+            "id": r.id,
+            "payment_id": r.payment_id,
+            "order_id": r.order_id,
+            "provider": r.provider,
+            "request_id": r.request_id,
+            "command": r.command,
+            "http_status": r.http_status,
+            "provider_response_code": r.provider_response_code,
+            "provider_transaction_status": r.provider_transaction_status,
+            "signature_verified": r.signature_verified,
+            "mapped_payment_status": r.mapped_payment_status,
+            "observation_provenance": r.observation_provenance,
+            "error_message": r.error_message,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]
+
+
+@router.get("/orders/{order_id}/reservations")
+def service_get_order_reservations(
+    order_id: str,
+    principal: ServicePrincipal = Depends(get_service_principal),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    rows = list(
+        db.scalars(
+            select(InventoryReservation)
+            .join(Order, InventoryReservation.order_id == Order.id)
+            .where(
+                InventoryReservation.order_id == order_id,
+                InventoryReservation.merchant_id == principal.merchant_id,
+                InventoryReservation.commerce_session_id == principal.commerce_session_id,
+                Order.world_epoch == principal.world_epoch,
+            )
+            .order_by(InventoryReservation.variant_id.asc())
+        ).all()
+    )
+    return [
+        {
+            "id": r.id,
+            "order_id": r.order_id,
+            "variant_id": r.variant_id,
+            "live_product_id": r.live_product_id,
+            "quantity": r.quantity,
+            "status": r.status,
+            "expires_at": r.expires_at.isoformat(),
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]
 
 
 @router.get("/payments/{payment_id}/refunds")
@@ -105,13 +334,52 @@ def service_get_refund_history(
     rows = list(
         db.scalars(
             select(RefundTransaction)
+            .join(Payment, RefundTransaction.payment_id == Payment.id)
+            .join(Order, Payment.order_id == Order.id)
             .where(
                 RefundTransaction.payment_id == payment_id,
                 RefundTransaction.merchant_id == principal.merchant_id,
+                Order.commerce_session_id == principal.commerce_session_id,
+                Order.world_epoch == principal.world_epoch,
             )
             .order_by(RefundTransaction.created_at.asc())
         ).all()
     )
+    return [
+        {
+            "id": r.id,
+            "refund_request_id": r.refund_request_id,
+            "payment_id": r.payment_id,
+            "provider": r.provider,
+            "provider_refund_ref": r.provider_refund_ref,
+            "amount_vnd": r.amount_vnd,
+            "status": r.status,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]
+
+
+@router.get("/refunds")
+def service_list_refunds(
+    status: str | None = Query(default=None, max_length=32),
+    limit: int = Query(default=50, ge=1, le=200),
+    principal: ServicePrincipal = Depends(get_service_principal),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    stmt = (
+        select(RefundTransaction)
+        .join(Payment, RefundTransaction.payment_id == Payment.id)
+        .join(Order, Payment.order_id == Order.id)
+        .where(
+            RefundTransaction.merchant_id == principal.merchant_id,
+            Order.commerce_session_id == principal.commerce_session_id,
+            Order.world_epoch == principal.world_epoch,
+        )
+    )
+    if status:
+        stmt = stmt.where(RefundTransaction.status == status.strip().upper())
+    rows = list(db.scalars(stmt.order_by(RefundTransaction.created_at.desc()).limit(limit)).all())
     return [
         {
             "id": r.id,
@@ -151,6 +419,7 @@ def service_get_inventory(
             "available_qty": i.available_qty,
             "low_stock_threshold": i.low_stock_threshold,
             "version": i.version,
+            "scope": "MERCHANT_SHARED",
         }
         for i in rows
     ]
@@ -159,22 +428,30 @@ def service_get_inventory(
 @router.get("/events")
 def service_get_recent_events(
     after_id: str | None = Query(default=None, max_length=64),
+    since: datetime | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     principal: ServicePrincipal = Depends(get_service_principal),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Cursor-based paginated commerce event stream ordered stably by `(occurred_at, id)`."""
+    """Cursor-based paginated commerce event stream ordered stably by `(occurred_at, id)`.
+
+    Supports `since` (bounded timestamp overlap window) alongside `after_id` so pull collectors
+    can recover late-committed out-of-order rows safely using durable deduplication.
+    """
     stmt = select(CommerceEvent).where(
         CommerceEvent.merchant_id == principal.merchant_id,
         CommerceEvent.commerce_session_id == principal.commerce_session_id,
         CommerceEvent.world_epoch == principal.world_epoch,
     )
-    if after_id:
+    if since is not None:
+        stmt = stmt.where(CommerceEvent.occurred_at >= since)
+    elif after_id:
         anchor = db.scalar(
             select(CommerceEvent).where(
                 CommerceEvent.id == after_id,
                 CommerceEvent.merchant_id == principal.merchant_id,
                 CommerceEvent.commerce_session_id == principal.commerce_session_id,
+                CommerceEvent.world_epoch == principal.world_epoch,
             )
         )
         if anchor is None:
@@ -209,6 +486,8 @@ def service_get_recent_events(
                 "event_id": e.event_id,
                 "event_type": e.event_type,
                 "source": e.source,
+                "source_mode": e.source_mode,
+                "world_epoch": e.world_epoch,
                 "order_id": e.order_id,
                 "payment_id": e.payment_id,
                 "correlation_id": e.correlation_id,
@@ -235,6 +514,7 @@ def service_get_order_timeline(
                 CommerceEvent.order_id == order_id,
                 CommerceEvent.merchant_id == principal.merchant_id,
                 CommerceEvent.commerce_session_id == principal.commerce_session_id,
+                CommerceEvent.world_epoch == principal.world_epoch,
             )
             .order_by(CommerceEvent.occurred_at.asc(), CommerceEvent.id.asc())
         ).all()
@@ -381,4 +661,24 @@ def service_get_operational_metrics(
         "succeeded_payments": succeeded_payments,
         "unsynced_payments": unsynced_payments,
         "outbox_lag_count": outbox_lag_count,
+    }
+
+
+@router.get("/telemetry")
+def service_get_operational_telemetry(
+    principal: ServicePrincipal = Depends(get_service_principal),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Authenticated rolling-window HTTP & queue telemetry measured from real requests."""
+    from app.core.telemetry import get_telemetry_collector
+
+    metrics = service_get_operational_metrics(principal=principal, db=db)
+    tel = get_telemetry_collector().snapshot_all()
+    return {
+        "merchant_id": principal.merchant_id,
+        "commerce_session_id": principal.commerce_session_id,
+        "world_epoch": principal.world_epoch,
+        "measured_from_real_requests": True,
+        "windows": tel["windows"],
+        "queue_metrics": metrics,
     }

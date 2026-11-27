@@ -31,6 +31,8 @@ FORBIDDEN_REPO_EXAMPLE_SECRETS: frozenset[str] = frozenset(
         "replace_with_strong_random_32_plus_char_hmac_secret_key",
         "replace-with-strong-random-32-plus-char-hmac-secret-key",
         "finresolve-dev-only-hmac-approval-secret-2026-change-me",
+        "finresolve-local-only-command-auth-hmac-secret-2026-change-me",
+        "finshop-local-only-service-write-key-2026-change-me",
     }
 )
 LOCAL_DEV_ENVIRONMENTS: frozenset[str] = frozenset({"local", "test", "dev", "development"})
@@ -80,8 +82,10 @@ class Settings(BaseSettings):
 
     model_provider: str = ""
     model_name: str = ""
+    model_fallback_name: str = ""
     model_api_key: SecretStr = SecretStr("")
     model_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    model_max_retries: int = Field(default=2, ge=0, le=5)
     model_budget_tokens: int = Field(default=20000, ge=0)
 
     demo_max_scenario_runs_per_session: int = Field(default=10, ge=1, le=200)
@@ -96,6 +100,39 @@ class Settings(BaseSettings):
     worker_heartbeat_ttl_seconds: int = Field(default=15, ge=3, le=300)
     supervisor_job_lease_seconds: int = Field(default=30, ge=3, le=600)
     supervisor_heartbeat_interval_seconds: float = Field(default=5.0, gt=0.1, le=120.0)
+
+    # Prompt 12 — Autonomous Continuous Commerce Monitor
+    continuous_monitor_enabled: bool = False
+    commerce_service_base_url: str = ""
+    commerce_service_key: SecretStr = SecretStr("")
+    commerce_merchant_id: str = "MERCHANT_FINSHOP_01"
+    commerce_session_id: str = "CSESS_FINSHOP_DEFAULT_01"
+    commerce_world_epoch: int = Field(default=1, ge=1)
+    monitor_poll_interval_seconds: float = Field(default=5.0, ge=0.5, le=300.0)
+    monitor_reconcile_interval_seconds: float = Field(default=15.0, ge=1.0, le=600.0)
+    monitor_batch_size: int = Field(default=50, ge=1, le=200)
+    monitor_lease_seconds: int = Field(default=30, ge=5, le=300)
+    monitor_payment_sync_grace_seconds: int = Field(default=30, ge=0, le=3600)
+    monitor_order_stall_seconds: int = Field(default=1800, ge=5, le=86400 * 7)
+    monitor_max_concurrent_investigations: int = Field(default=5, ge=1, le=50)
+    monitor_outbox_lag_threshold: int = Field(default=10, ge=1, le=10000)
+    monitor_unsynced_backlog_threshold: int = Field(default=5, ge=1, le=10000)
+    commerce_connector_timeout_seconds: float = Field(default=5.0, gt=0.1, le=60.0)
+    commerce_connector_id: str = "default_ministore"
+    commerce_allowed_hosts: str = "localhost,127.0.0.1,commerce-api"
+    commerce_public_storefront_url: str = "http://localhost:3100"
+    experience_operator_token: SecretStr = SecretStr("")
+    sandbox_dedicated_mode: bool = False
+    autonomous_recovery_enabled: bool = True
+    commerce_write_key: SecretStr = SecretStr("")
+    command_auth_signing_secret: SecretStr = SecretStr("")
+    command_auth_key_id: str = "finresolve-policy-hmac-v1"
+    command_auth_ttl_seconds: int = Field(default=120, ge=10, le=900)
+    judge_admin_secret: SecretStr = SecretStr(
+        "finresolve-judge-lab-local-only-secret-2026-change-me"
+    )
+    monitor_max_pages_per_tick: int = Field(default=10, ge=1, le=100)
+    monitor_max_scan_seconds: float = Field(default=25.0, ge=1.0, le=300.0)
 
     @field_validator("web_origin")
     @classmethod
@@ -147,6 +184,55 @@ class Settings(BaseSettings):
                     f"Deployed environment (APP_ENV='{self.app_env}') requires an explicit, "
                     "strong DEMO_APPROVAL_SECRET (>= 32 chars, not a repository example or default)"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_recovery_and_signing_secrets(self) -> Settings:
+        env_norm = self.app_env.strip().lower()
+        sign_sec = self.command_auth_signing_secret.get_secret_value().strip()
+        write_key = self.commerce_write_key.get_secret_value().strip()
+        read_key = self.commerce_service_key.get_secret_value().strip()
+
+        # Always reject known rotated/example signing or write secrets in EVERY environment
+        for name, val in (
+            ("COMMAND_AUTH_SIGNING_SECRET", sign_sec),
+            ("COMMERCE_WRITE_KEY", write_key),
+        ):
+            if val and (
+                val in FORBIDDEN_REPO_EXAMPLE_SECRETS
+                or val.lower() in FORBIDDEN_REPO_EXAMPLE_SECRETS
+                or "replace_with_" in val.lower()
+                or "replace-with-" in val.lower()
+            ):
+                raise ValueError(
+                    f"{name} cannot use a publicly known repository default or placeholder value"
+                )
+
+        if sign_sec and write_key and sign_sec == write_key:
+            raise ValueError("COMMAND_AUTH_SIGNING_SECRET must be separate from COMMERCE_WRITE_KEY")
+        if sign_sec and read_key and sign_sec == read_key:
+            raise ValueError(
+                "COMMAND_AUTH_SIGNING_SECRET must be separate from COMMERCE_SERVICE_KEY"
+            )
+
+        # In deployed environments, autonomous recovery strictly requires >= 256-bit (32+ char)
+        # explicit signing secret and write key. If autonomous_recovery_enabled=False, read-only
+        # operation continues safely without signing/write credentials.
+        if self.autonomous_recovery_enabled and env_norm not in LOCAL_DEV_ENVIRONMENTS:
+            for name, val in (
+                ("COMMAND_AUTH_SIGNING_SECRET", sign_sec),
+                ("COMMERCE_WRITE_KEY", write_key),
+            ):
+                if (
+                    len(val) < 32
+                    or "local-only" in val.lower()
+                    or "change-me" in val.lower()
+                    or val.lower() in INSECURE_DEFAULT_SECRETS
+                ):
+                    raise ValueError(
+                        f"Deployed environment (APP_ENV='{self.app_env}') with autonomous recovery "
+                        f"enabled requires an explicit strong {name} (>= 32 chars, >= 256-bit)"
+                    )
         return self
 
     @model_validator(mode="after")

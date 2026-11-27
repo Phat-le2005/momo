@@ -263,7 +263,7 @@ class BoundedAgentRuntime:
         adapter: ModelAdapter | None = None,
         max_steps: int = 6,
         max_replans: int = 2,
-        max_wall_time_seconds: float = 15.0,
+        max_wall_time_seconds: float = 45.0,
         token_budget: int | None = None,
         manage_transactions: bool = True,
         stale_investigation_timeout_seconds: int = 120,
@@ -566,7 +566,12 @@ class BoundedAgentRuntime:
         self._maybe_commit()
 
         context_builder = ContextBuilder(self._db, session_id)
-        tool_registry = ReadToolRegistry(self._db, session_id)
+        tool_registry = ReadToolRegistry(
+            self._db,
+            session_id,
+            source_system=case.source_system,
+            source_binding_id=case.source_binding_id,
+        )
 
         tool_observations: list[ToolObservationRecord] = []
         step_traces: list[InvestigationStepTrace] = []
@@ -980,11 +985,68 @@ class BoundedAgentRuntime:
                 break
 
             if step_kind == PlanStepKind.PROPOSE_ACTION:
+                action_name = str(plan.next_step.action_type or plan.next_step.tool_name)
+                if (
+                    case.source_system == "COMMERCE_HTTP"
+                    and action_name
+                    in ("propose_order_sync", "ORDER_SYNC", "propose_refund", "REFUND_EXECUTE")
+                    and replans_used < self._max_replans
+                ):
+                    has_ord_tool = any(
+                        t.status == "OK" and t.tool_name == "get_order" for t in tool_observations
+                    )
+                    has_pay_tool = any(
+                        t.status == "OK"
+                        and t.tool_name in ("get_payment_record", "find_payment_candidates")
+                        for t in tool_observations
+                    )
+                    replan_reason: str | None = None
+                    if not has_ord_tool:
+                        replan_reason = (
+                            f"MISSING_EVIDENCE_CATEGORY(order): Before proposing {action_name}, "
+                            "execute READ_TOOL 'get_order' in this investigation run to observe "
+                            "authoritative order status, total_vnd, and version."
+                        )
+                    elif not has_pay_tool:
+                        replan_reason = (
+                            f"MISSING_EVIDENCE_CATEGORY(payment): Before proposing {action_name}, "
+                            "execute READ_TOOL 'get_payment_record' (or 'find_payment_candidates') "
+                            "in this investigation run to verify authoritative payment status and "
+                            "order_id linkage."
+                        )
+                    elif action_name in ("propose_order_sync", "ORDER_SYNC") and (
+                        plan.next_step.args.get("expected_order_version") is None
+                        and plan.next_step.args.get("expected_version") is None
+                    ):
+                        replan_reason = (
+                            "MISSING_REQUIRED_ARGUMENT(expected_order_version): Include the exact "
+                            "integer `expected_order_version` from your `get_order` observation "
+                            "in `next_step.args` before proposing ORDER_SYNC."
+                        )
+
+                    if replan_reason is not None:
+                        replans_used += 1
+                        validation_feedback = replan_reason
+                        self._record_event(
+                            case=case,
+                            event_type="PLAN_REVISED",
+                            payload={
+                                "run_id": effective_run_id,
+                                "step": steps_executed,
+                                "replan_attempt": replans_used,
+                                "max_replans": self._max_replans,
+                                "reason": replan_reason,
+                            },
+                        )
+                        expected_case_version = case.version
+                        self._maybe_commit()
+                        continue
+
                 case, stop_reason = self._handle_propose_action(
                     case=case,
                     session_id=session_id,
                     run_id=effective_run_id,
-                    action_name=str(plan.next_step.action_type or plan.next_step.tool_name),
+                    action_name=action_name,
                     args=plan.next_step.args,
                     decision_summary=plan.decision_summary,
                     tool_observations=tool_observations,
@@ -1219,37 +1281,343 @@ class BoundedAgentRuntime:
             raw_order_id = args.get("order_id")
             raw_payment_id = args.get("payment_id")
             raw_amount = args.get("amount")
-            raw_exp_version = args.get("expected_order_version")
+            raw_currency = args.get("currency")
+            raw_exp_order_version = args.get("expected_order_version")
+            raw_exp_version_alias = args.get("expected_version")
+
+            # Prompt 14.6 Fix 1 & 2: Reject contradictory version aliases and non-strict integers
+            has_canonical_ver = raw_exp_order_version is not None
+            has_alias_ver = raw_exp_version_alias is not None
+            contradictory_ver_aliases = (
+                has_canonical_ver
+                and has_alias_ver
+                and raw_exp_order_version != raw_exp_version_alias
+            )
+            raw_exp_version = raw_exp_order_version if has_canonical_ver else raw_exp_version_alias
 
             if (
                 not isinstance(raw_order_id, str)
                 or not raw_order_id.strip()
                 or not isinstance(raw_payment_id, str)
                 or not raw_payment_id.strip()
+                or contradictory_ver_aliases
                 or (raw_amount is not None and (not is_strict_int(raw_amount) or raw_amount <= 0))
+                or (
+                    raw_currency is not None
+                    and (not isinstance(raw_currency, str) or not raw_currency.strip())
+                )
                 or (
                     raw_exp_version is not None
                     and (not is_strict_int(raw_exp_version) or raw_exp_version < 1)
                 )
             ):
+                block_reason = (
+                    "CONTRADICTORY_VERSION_ALIASES"
+                    if contradictory_ver_aliases
+                    else "INVALID_ACTION_ARGUMENTS"
+                )
                 self._record_event(
                     case=case,
                     event_type="UNSAFE_PROPOSAL_BLOCKED",
                     payload={
                         "run_id": run_id,
                         "attempted_action": "ORDER_SYNC",
-                        "reason": "INVALID_ACTION_ARGUMENTS",
+                        "reason": block_reason,
                     },
                 )
                 case = self._safe_transition(
                     case,
                     CaseState.ESCALATED,
-                    reason="Chặn đề xuất ORDER_SYNC do tham số đầu ra từ model không hợp lệ.",
+                    reason=(
+                        "Chặn đề xuất ORDER_SYNC do tham số đầu ra từ model không hợp lệ "
+                        f"({block_reason})."
+                    ),
                 )
-                return case, "INVALID_ACTION_ARGUMENTS_BLOCKED"
+                return case, f"{block_reason}_BLOCKED"
 
             order_id = raw_order_id.strip()
             payment_id = raw_payment_id.strip()
+
+            # For real external COMMERCE_HTTP cases, validate authoritative MiniStore records
+            # observed via HTTP tools (rather than local SimOrder/SimPayment simulator tables).
+            if case.source_system == "COMMERCE_HTTP" and case.source_binding_id:
+                from app.models.monitoring import CommerceSourceBinding
+                from app.monitoring.service import build_connector_for_binding
+
+                # Prompt 14.6 Fix 2: COMMERCE_HTTP state-changing proposals MUST explicitly
+                # supply target expected_order_version — NEVER silently substitute latest version!
+                if raw_exp_version is None:
+                    self._record_event(
+                        case=case,
+                        event_type="UNSAFE_PROPOSAL_BLOCKED",
+                        payload={
+                            "run_id": run_id,
+                            "attempted_action": "ORDER_SYNC",
+                            "reason": "MISSING_EXPECTED_ORDER_VERSION",
+                            "order_id": order_id,
+                            "payment_id": payment_id,
+                        },
+                    )
+                    case = self._safe_transition(
+                        case,
+                        CaseState.WAITING_EVIDENCE,
+                        reason=(
+                            "Chặn đề xuất ORDER_SYNC: Agent phải cung cấp rõ "
+                            "expected_order_version từ bằng chứng quan sát."
+                        ),
+                    )
+                    return case, "MISSING_EXPECTED_VERSION_BLOCKED"
+
+                proposed_version = int(raw_exp_version)
+
+                # Prompt 14.7 Fix 3: Require exact structured current-run returned evidence
+                # for BOTH order_id AND payment_id (NEVER rely on tool args or substring matches
+                # and NEVER fall back to unrelated fact_evidence_ids[:4]!).
+                current_run_ev_ids = [
+                    t.evidence_id for t in tool_observations if t.status == "OK" and t.evidence_id
+                ]
+                current_run_ev_rows = (
+                    list(
+                        self._db.scalars(
+                            select(Evidence).where(Evidence.id.in_(current_run_ev_ids))
+                        ).all()
+                    )
+                    if current_run_ev_ids
+                    else []
+                )
+
+                order_ev_refs: list[str] = []
+                payment_ev_refs: list[str] = []
+                for ev_row in current_run_ev_rows:
+                    p_json = ev_row.payload_json or {}
+                    inner = p_json.get("data") if isinstance(p_json.get("data"), dict) else p_json
+                    if not isinstance(inner, dict):
+                        continue
+                    # Exact structured order record returned by get_order ({"order": {...}})
+                    ord_rec = inner.get("order") if isinstance(inner.get("order"), dict) else inner
+                    if (
+                        isinstance(ord_rec, dict)
+                        and (
+                            str(ord_rec.get("id") or "") == order_id
+                            or str(ord_rec.get("order_id") or "") == order_id
+                        )
+                        and ("status" in ord_rec or "total_vnd" in ord_rec or "version" in ord_rec)
+                        and "amount_vnd" not in ord_rec
+                        and "provider" not in ord_rec
+                    ):
+                        order_ev_refs.append(ev_row.id)
+                    # Exact structured payment record returned by get_payment_record
+                    pay_rec = (
+                        inner.get("payment") if isinstance(inner.get("payment"), dict) else inner
+                    )
+                    if (
+                        isinstance(pay_rec, dict)
+                        and (
+                            str(pay_rec.get("id") or "") == payment_id
+                            or str(pay_rec.get("payment_id") or "") == payment_id
+                        )
+                        and (
+                            "amount_vnd" in pay_rec
+                            or "provider" in pay_rec
+                            or "order_id" in pay_rec
+                        )
+                    ):
+                        payment_ev_refs.append(ev_row.id)
+                    # Exact structured candidate returned by find_payment_candidates
+                    cands = inner.get("candidates")
+                    if isinstance(cands, list):
+                        for cand in cands:
+                            if isinstance(cand, dict) and (
+                                str(cand.get("id") or "") == payment_id
+                                or str(cand.get("payment_id") or "") == payment_id
+                            ):
+                                payment_ev_refs.append(ev_row.id)
+                                break
+
+                relevant_ev_refs = list(dict.fromkeys(order_ev_refs + payment_ev_refs))
+                http_prov_ok = bool(order_ev_refs) and bool(payment_ev_refs)
+
+                binding = self._db.get(CommerceSourceBinding, case.source_binding_id)
+                http_order: dict[str, Any] | None = None
+                http_payment: dict[str, Any] | None = None
+                if binding is not None:
+                    try:
+                        conn = build_connector_for_binding(binding)
+                        http_order = conn.get_order(order_id)["data"]
+                        http_payment = conn.get_payment(payment_id)["data"]
+                    except Exception:  # noqa: BLE001
+                        http_order = None
+                        http_payment = None
+
+                # Independently verify merchant, session, world_epoch, link, amount, currency
+                auth_order_ver: int | None = None
+                if isinstance(http_order, dict) and is_strict_int(http_order.get("version")):
+                    auth_order_ver = int(http_order["version"])
+
+                scope_ok = True
+                if binding is not None and isinstance(http_order, dict):
+                    ord_merchant = http_order.get("merchant_id")
+                    ord_csess = http_order.get("commerce_session_id")
+                    ord_epoch = http_order.get("world_epoch")
+                    if ord_merchant and str(ord_merchant) != binding.merchant_id:
+                        scope_ok = False
+                    if ord_csess and str(ord_csess) != binding.commerce_session_id:
+                        scope_ok = False
+                    if ord_epoch is not None and int(ord_epoch) != binding.commerce_world_epoch:
+                        scope_ok = False
+                if binding is not None and isinstance(http_payment, dict):
+                    pay_merchant = http_payment.get("merchant_id")
+                    pay_csess = http_payment.get("commerce_session_id")
+                    if pay_merchant and str(pay_merchant) != binding.merchant_id:
+                        scope_ok = False
+                    if pay_csess and str(pay_csess) != binding.commerce_session_id:
+                        scope_ok = False
+
+                auth_amount = (
+                    int(http_payment.get("amount_vnd") or 0)
+                    if isinstance(http_payment, dict)
+                    else 0
+                )
+                order_total = (
+                    int(http_order.get("total_vnd") or -1) if isinstance(http_order, dict) else -1
+                )
+                agent_amount_ok = raw_amount is None or int(raw_amount) == auth_amount
+                agent_currency_ok = raw_currency is None or raw_currency.strip().upper() == "VND"
+
+                # Prompt 14.6 Fix 2: Reject stale version explicitly (request fresh investigation)
+                if (
+                    http_prov_ok
+                    and scope_ok
+                    and auth_order_ver is not None
+                    and proposed_version != auth_order_ver
+                ):
+                    self._record_event(
+                        case=case,
+                        event_type="UNSAFE_PROPOSAL_BLOCKED",
+                        payload={
+                            "run_id": run_id,
+                            "attempted_action": "ORDER_SYNC",
+                            "reason": "STALE_ORDER_VERSION",
+                            "order_id": order_id,
+                            "payment_id": payment_id,
+                            "proposed_version": proposed_version,
+                            "authoritative_version": auth_order_ver,
+                        },
+                    )
+                    case = self._safe_transition(
+                        case,
+                        CaseState.WAITING_EVIDENCE,
+                        reason=(
+                            f"Từ chối đề xuất lỗi thời: Agent đề xuất version {proposed_version} "
+                            f"nhưng phiên bản hiện tại là {auth_order_ver}. Cần điều tra lại."
+                        ),
+                    )
+                    return case, "STALE_VERSION_REJECTED"
+
+                http_verified = (
+                    http_prov_ok
+                    and scope_ok
+                    and isinstance(http_order, dict)
+                    and isinstance(http_payment, dict)
+                    and str(http_payment.get("order_id") or "") == order_id
+                    and str(http_payment.get("status") or "").upper() in ("SUCCEEDED", "SUCCESS")
+                    and auth_amount > 0
+                    and auth_amount == order_total
+                    and agent_amount_ok
+                    and agent_currency_ok
+                    and auth_order_ver is not None
+                    and proposed_version == auth_order_ver
+                )
+                if not http_verified or http_order is None or http_payment is None:
+                    detail_reason = "COMMERCE_HTTP_PAYMENT_NOT_VERIFIED"
+                    if not http_prov_ok:
+                        detail_reason = "MISSING_CURRENT_RUN_PROVENANCE"
+                    elif not scope_ok:
+                        detail_reason = "MERCHANT_SCOPE_MISMATCH"
+                    elif not agent_amount_ok:
+                        detail_reason = "PAYMENT_AMOUNT_MISMATCH"
+                    elif not agent_currency_ok:
+                        detail_reason = "PAYMENT_CURRENCY_MISMATCH"
+
+                    # Prompt 14.7 Fix 3: Do NOT attach a permanent HOLD_ACTION risk signal
+                    # solely for missing evidence when a subsequent investigation can collect it!
+                    risk_id: str | None = None
+                    if detail_reason != "MISSING_CURRENT_RUN_PROVENANCE":
+                        risk = self._create_risk_signal(
+                            case=case,
+                            session_id=session_id,
+                            category=RiskCategory.UNVERIFIED_PAYMENT.value,
+                            level=RiskLevel.HIGH.value,
+                            response=RiskResponse.HOLD_ACTION.value,
+                            evidence_refs=relevant_ev_refs,
+                            details={
+                                "attempted_action": "ORDER_SYNC",
+                                "block_reason": detail_reason,
+                                "order_id": order_id,
+                                "payment_id": payment_id,
+                            },
+                        )
+                        risk_signal_ids.append(risk.id)
+                        risk_id = risk.id
+                    self._record_event(
+                        case=case,
+                        event_type="UNSAFE_PROPOSAL_BLOCKED",
+                        payload={
+                            "run_id": run_id,
+                            "attempted_action": "ORDER_SYNC",
+                            "reason": detail_reason,
+                            "risk_signal_id": risk_id,
+                        },
+                    )
+                    case = self._safe_transition(
+                        case,
+                        CaseState.WAITING_EVIDENCE,
+                        reason=f"Chặn ORDER_SYNC ({detail_reason}): dữ liệu Commerce chưa hợp lệ.",
+                    )
+                    return case, "UNVERIFIED_PAYMENT_BLOCKED"
+
+                proposal = ActionProposal(
+                    id=f"PROP-{uuid.uuid4().hex[:10].upper()}",
+                    case_id=case.id,
+                    session_id=session_id,
+                    investigation_run_id=run_id,
+                    action_type=ActionType.ORDER_SYNC.value,
+                    params_json={
+                        "order_id": order_id,
+                        "payment_id": payment_id,
+                        "merchant_id": binding.merchant_id if binding else "",
+                        "amount": auth_amount,
+                        "currency": "VND",
+                        "expected_order_version": proposed_version,
+                    },
+                    evidence_refs=relevant_ev_refs,
+                    expected_version=case.version,
+                    risk_level=RiskLevel.LOW.value,
+                    status=ActionProposalStatus.PROPOSED.value,
+                    created_at=datetime.now(UTC),
+                )
+                self._db.add(proposal)
+                self._db.flush()
+                proposed_action_ids.append(proposal.id)
+                self._record_event(
+                    case=case,
+                    event_type="ACTION_PROPOSED",
+                    payload={
+                        "run_id": run_id,
+                        "proposal_id": proposal.id,
+                        "action_type": proposal.action_type,
+                        "params_json": proposal.params_json,
+                        "evidence_refs": proposal.evidence_refs,
+                        "status": proposal.status,
+                    },
+                )
+                case = self._safe_transition(
+                    case,
+                    CaseState.WAITING_APPROVAL,
+                    reason=decision_summary,
+                    extra_payload={"proposal_id": proposal.id, "action_type": proposal.action_type},
+                )
+                return case, "ACTION_PROPOSED"
 
             # Check authoritative evidence provenance: both order_id and payment_id must have
             # been observed in this investigation's tool reads!
@@ -1365,6 +1733,7 @@ class BoundedAgentRuntime:
                 id=f"PROP-{uuid.uuid4().hex[:10].upper()}",
                 case_id=case.id,
                 session_id=session_id,
+                investigation_run_id=run_id,
                 action_type=ActionType.ORDER_SYNC.value,
                 params_json={
                     "order_id": order.id,
@@ -1569,6 +1938,7 @@ class BoundedAgentRuntime:
                 id=f"PROP-{uuid.uuid4().hex[:10].upper()}",
                 case_id=case.id,
                 session_id=session_id,
+                investigation_run_id=run_id,
                 action_type=ActionType.REFUND_EXECUTE.value,
                 params_json={
                     "payment_id": payment.id,
@@ -1613,6 +1983,7 @@ class BoundedAgentRuntime:
             id=f"PROP-{uuid.uuid4().hex[:10].upper()}",
             case_id=case.id,
             session_id=session_id,
+            investigation_run_id=run_id,
             action_type=ActionType.HOLD_ORDER.value,
             params_json=dict(args),
             evidence_refs=fact_evidence_ids,

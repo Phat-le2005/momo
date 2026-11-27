@@ -33,6 +33,14 @@ from app.models.enums import (
     VerificationVerdict,
 )
 from app.models.incidents import AgentTask, Incident, IncidentCase
+from app.models.judge import BlindChallengeRun
+from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
+from app.models.open_world import (
+    BehavioralBaseline,
+    BusinessObservation,
+    IncidentExperience,
+    RecoveryCommand,
+)
 from app.models.risk import RiskSignal
 from app.models.scenario_runs import SimScenarioRun
 from app.models.session import DemoSession
@@ -66,20 +74,26 @@ __all__ = [
     "ActionType",
     "AgentTask",
     "AgentTaskState",
+    "AnomalyObservation",
     "Approval",
     "ApprovalDecision",
+    "BehavioralBaseline",
+    "BlindChallengeRun",
+    "BusinessObservation",
     "Case",
     "CaseEvent",
     "CaseState",
     "ChallengeRun",
     "ChallengeStatus",
     "ChallengeType",
+    "CommerceSourceBinding",
     "DemoSession",
     "Evidence",
     "EvidenceKind",
     "FulfillmentStatus",
     "Incident",
     "IncidentCase",
+    "IncidentExperience",
     "IncidentStatus",
     "InventoryLevel",
     "InventoryMovement",
@@ -94,6 +108,7 @@ __all__ = [
     "PaymentEventType",
     "PaymentStatus",
     "Product",
+    "RecoveryCommand",
     "RefundStatus",
     "ReservationStatus",
     "RiskCategory",

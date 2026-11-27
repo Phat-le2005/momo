@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from urllib.parse import urlparse
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LOCAL_ENVS: frozenset[str] = frozenset({"local", "test", "dev", "development"})
+APPROVED_VNPAY_SANDBOX_HOSTS: frozenset[str] = frozenset({"sandbox.vnpayment.vn"})
+TEST_ONLY_VNPAY_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "vnpay.test"})
 
 
 class CommerceSettings(BaseSettings):
@@ -30,6 +33,12 @@ class CommerceSettings(BaseSettings):
     service_api_key: SecretStr = SecretStr(
         "finshop-local-only-service-connector-key-2026-change-me"
     )
+    recovery_write_enabled: bool = True
+    service_write_api_key: SecretStr = SecretStr("")
+    command_auth_signing_secret: SecretStr = SecretStr("")
+    command_auth_key_id: str = "finresolve-policy-hmac-v1"
+    chaos_enabled: bool = False
+    chaos_admin_key: SecretStr = SecretStr("finshop-local-only-chaos-admin-key-2026-change-me")
     mock_provider_secret: SecretStr = SecretStr(
         "finshop-local-only-mock-provider-secret-2026-change-me"
     )
@@ -40,6 +49,25 @@ class CommerceSettings(BaseSettings):
     test_merchant_password: SecretStr = SecretStr("FinShopLocal!2026")
     merchant_session_ttl_seconds: int = Field(default=28800, ge=60, le=604800)
     customer_session_ttl_seconds: int = Field(default=604800, ge=60, le=2592000)
+
+    # VNPAY Sandbox config (disabled by default; missing creds never block MOCK startup)
+    vnpay_enabled: bool = False
+    vnpay_tmn_code: str = ""
+    vnpay_hash_secret: SecretStr = SecretStr("")
+    vnpay_version: str = "2.1.0"
+    vnpay_payment_url: str = "https://sandbox.vnpayment.vn/paymentv2/vpcpay.html"
+    vnpay_api_url: str = "https://sandbox.vnpayment.vn/merchant_webapi/api/transaction"
+    vnpay_return_url: str = "http://localhost:3100/payment/vnpay/return"
+    vnpay_ipn_public_url: str = ""
+    vnpay_refund_enabled: bool = False
+    vnpay_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
+    vnpay_payment_expiry_minutes: int = Field(default=15, ge=5, le=120)
+    vnpay_querydr_max_attempts: int = Field(default=5, ge=1, le=20)
+    vnpay_querydr_min_age_seconds: int = Field(default=30, ge=0, le=3600)
+
+    # Public HTTPS gateway configuration (explicitly disabled by default)
+    public_gateway_enabled: bool = False
+    public_base_url: str = ""
 
     # Optional FinResolve integration (Commerce must work cleanly when empty/offline)
     finresolve_api_base_url: str = ""
@@ -53,6 +81,7 @@ class CommerceSettings(BaseSettings):
     outbox_lease_seconds: int = Field(default=30, ge=5, le=300)
     outbox_max_attempts: int = Field(default=10, ge=1, le=50)
     max_request_body_bytes: int = Field(default=1_048_576, ge=1024, le=10_485_760)
+    receipt_storage_dir: str = ""
     rate_limit_checkout_per_minute: int = Field(default=120, ge=1, le=10_000)
     rate_limit_auth_per_minute: int = Field(default=60, ge=1, le=10_000)
     rate_limit_payment_per_minute: int = Field(default=120, ge=1, le=10_000)
@@ -66,22 +95,84 @@ class CommerceSettings(BaseSettings):
 
     @field_validator("source_mode")
     @classmethod
-    def _only_mock_supported(cls, value: str) -> str:
-        if value.strip().upper() != "MOCK":
-            raise ValueError("Only COMMERCE_SOURCE_MODE=MOCK is supported in Prompt 10.1")
-        return "MOCK"
+    def _only_mock_or_sandbox_supported(cls, value: str) -> str:
+        norm = value.strip().upper()
+        if norm not in {"MOCK", "SANDBOX"}:
+            raise ValueError("Only COMMERCE_SOURCE_MODE=MOCK or SANDBOX is supported")
+        return norm
+
+    @model_validator(mode="after")
+    def _validate_vnpay_sandbox_hosts(self) -> CommerceSettings:
+        allowed_hosts = set(APPROVED_VNPAY_SANDBOX_HOSTS)
+        if self.app_env.strip().lower() == "test":
+            allowed_hosts |= TEST_ONLY_VNPAY_HOSTS
+
+        for label, raw_url in (
+            ("COMMERCE_VNPAY_PAYMENT_URL", self.vnpay_payment_url.strip()),
+            ("COMMERCE_VNPAY_API_URL", self.vnpay_api_url.strip()),
+        ):
+            if not raw_url:
+                continue
+            parsed = urlparse(raw_url)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme not in {"https", "http"} or (
+                parsed.scheme == "http" and self.app_env.strip().lower() != "test"
+            ):
+                raise ValueError(f"{label} must use HTTPS (production endpoints forbidden)")
+            if host not in allowed_hosts:
+                raise ValueError(
+                    f"{label} host '{host}' is not an approved VNPAY Sandbox host "
+                    f"(allowed: {sorted(APPROVED_VNPAY_SANDBOX_HOSTS)}). "
+                    "Production VNPAY endpoints are strictly forbidden."
+                )
+        return self
 
     @model_validator(mode="after")
     def _validate_secrets(self) -> CommerceSettings:
+        forbidden_rotated = {
+            "finresolve-local-only-command-auth-hmac-secret-2026-change-me",
+            "finshop-local-only-service-write-key-2026-change-me",
+        }
+        sign_sec = self.command_auth_signing_secret.get_secret_value().strip()
+        write_key = self.service_write_api_key.get_secret_value().strip()
+        read_key = self.service_api_key.get_secret_value().strip()
+
+        for name, val in (
+            ("COMMERCE_COMMAND_AUTH_SIGNING_SECRET", sign_sec),
+            ("COMMERCE_SERVICE_WRITE_API_KEY", write_key),
+        ):
+            if val and val.lower() in forbidden_rotated:
+                raise ValueError(
+                    f"{name} cannot use a rotated publicly known repository default secret"
+                )
+        if sign_sec and write_key and sign_sec == write_key:
+            raise ValueError(
+                "COMMERCE_COMMAND_AUTH_SIGNING_SECRET must be separate from "
+                "COMMERCE_SERVICE_WRITE_API_KEY"
+            )
+        if sign_sec and read_key and sign_sec == read_key:
+            raise ValueError(
+                "COMMERCE_COMMAND_AUTH_SIGNING_SECRET must be separate from "
+                "COMMERCE_SERVICE_API_KEY"
+            )
+
         if self.app_env.strip().lower() not in LOCAL_ENVS:
-            for name, secret in (
+            required_pairs = [
                 ("COMMERCE_AUTH_SECRET", self.auth_secret.get_secret_value().strip()),
-                ("COMMERCE_SERVICE_API_KEY", self.service_api_key.get_secret_value().strip()),
+                ("COMMERCE_SERVICE_API_KEY", read_key),
                 (
                     "COMMERCE_MOCK_PROVIDER_SECRET",
                     self.mock_provider_secret.get_secret_value().strip(),
                 ),
-            ):
+            ]
+            if self.recovery_write_enabled:
+                required_pairs.extend(
+                    [
+                        ("COMMERCE_SERVICE_WRITE_API_KEY", write_key),
+                        ("COMMERCE_COMMAND_AUTH_SIGNING_SECRET", sign_sec),
+                    ]
+                )
+            for name, secret in required_pairs:
                 if (
                     len(secret) < 32
                     or "local-only" in secret.lower()
@@ -103,8 +194,21 @@ class CommerceSettings(BaseSettings):
         return self.app_env.strip().lower() in LOCAL_ENVS
 
     @property
+    def is_vnpay_configured(self) -> bool:
+        return bool(
+            self.vnpay_enabled
+            and self.vnpay_tmn_code.strip()
+            and self.vnpay_hash_secret.get_secret_value().strip()
+            and self.vnpay_return_url.strip()
+        )
+
+    @property
     def cors_origins(self) -> list[str]:
-        return [o.strip().rstrip("/") for o in self.web_origin.split(",") if o.strip()]
+        origins = [o.strip().rstrip("/") for o in self.web_origin.split(",") if o.strip()]
+        pub = self.public_base_url.strip().rstrip("/")
+        if self.public_gateway_enabled and pub and pub not in origins:
+            origins.append(pub)
+        return origins
 
 
 @lru_cache

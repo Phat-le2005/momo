@@ -1,0 +1,91 @@
+name: Runtime Acceptance (Docker Compose)
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  docker-runtime-acceptance:
+    name: Full Stack Docker Compose Acceptance (9 Services + Real OCR + Volume Persistence)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install host acceptance test client dependencies
+        run: python -m pip install --upgrade pip && pip install httpx pillow
+
+      - name: Generate ephemeral 256-bit local secrets (redacted)
+        run: |
+          python FinResolve/infra/init_local_secrets.py
+          echo "MONITOR_PAYMENT_SYNC_GRACE_SECONDS=0" >> FinResolve/infra/.env
+
+      - name: Validate Docker Compose configuration
+        run: docker compose --env-file FinResolve/infra/.env -f FinResolve/infra/docker-compose.yml config --quiet
+
+      - name: Build and start complete 9-service Docker Compose stack
+        run: docker compose --env-file FinResolve/infra/.env -f FinResolve/infra/docker-compose.yml up -d --build
+
+      - name: Wait for services and capture compose status
+        run: |
+          sleep 15
+          docker compose --env-file FinResolve/infra/.env -f FinResolve/infra/docker-compose.yml ps | tee compose-ps.txt
+
+      - name: Execute live cross-service HTTP, OCR, and telemetry acceptance
+        run: |
+          python FinResolve/infra/runtime_acceptance.py \
+            --env-file FinResolve/infra/.env \
+            --output runtime-acceptance-report.json
+
+      - name: Verify persistent private receipt volume survives commerce-api container recreation
+        run: |
+          COMP_ID=$(python -c "import json; print(json.load(open('runtime-acceptance-report.json'))['checks']['experiment_c_pixel_ocr_receipt']['complaint_id'])")
+          echo "Verifying persistent receipt for complaint: ${COMP_ID}"
+          docker compose --env-file FinResolve/infra/.env -f FinResolve/infra/docker-compose.yml up -d --force-recreate --no-deps commerce-api
+          sleep 8
+          docker compose --env-file FinResolve/infra/.env -f FinResolve/infra/docker-compose.yml exec -T commerce-api \
+            python -c "from pathlib import Path; p = Path('/var/lib/finshop/private_receipts/MERCHANT_FINSHOP_01') / '${COMP_ID}.png'; assert p.exists() and p.stat().st_size > 0, f'Receipt missing: {p}'; print(f'PERSISTENT_RECEIPT_VERIFIED: {p} ({p.stat().st_size} bytes)')"
+
+      - name: Execute real Playwright Chromium browser E2E against live Docker stack
+        run: |
+          mkdir -p /tmp/pw-runner
+          cd /tmp/pw-runner
+          npm init -y > /dev/null
+          npm install @playwright/test@1.52.0
+          printf 'module.exports = { testDir: ".", timeout: 30000, use: { browserName: "chromium", channel: "chrome", headless: true, launchOptions: { args: ["--no-sandbox", "--disable-setuid-sandbox"] } } };\n' > /tmp/pw-runner/playwright.config.js
+          cp "${GITHUB_WORKSPACE}/FinResolve/frontend/e2e/guardian-experience.spec.ts" /tmp/pw-runner/guardian-experience.spec.ts
+          FINRESOLVE_WEB_URL=http://localhost:3000 ./node_modules/.bin/playwright test --reporter=list | tee "${GITHUB_WORKSPACE}/playwright-e2e-output.txt"
+
+      - name: Capture final compose ps
+        if: always()
+        run: docker compose --env-file FinResolve/infra/.env -f FinResolve/infra/docker-compose.yml ps | tee compose-ps-final.txt || true
+
+      - name: Upload sanitized runtime acceptance artifacts (zero secrets)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-acceptance-evidence
+          path: |
+            runtime-acceptance-report.json
+            playwright-e2e-output.txt
+            compose-ps.txt
+            compose-ps-final.txt
+          if-no-files-found: warn
+
+      - name: Cleanup Docker Compose stack and ephemeral volumes
+        if: always()
+        run: |
+          docker compose --env-file FinResolve/infra/.env -f FinResolve/infra/docker-compose.yml down -v || true
+          rm -f FinResolve/infra/.env

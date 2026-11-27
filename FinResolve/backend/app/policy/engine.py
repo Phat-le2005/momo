@@ -12,7 +12,13 @@ Hard Domain Invariants:
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
@@ -20,10 +26,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import SourceMode, get_settings
-from app.models.actions import ActionProposal
+from app.models.actions import ActionProposal, Approval
 from app.models.cases import Case, Evidence
 from app.models.enums import (
     ActionType,
+    ApprovalDecision,
     CaseState,
     EvidenceKind,
     OrderPaymentStatus,
@@ -32,6 +39,7 @@ from app.models.enums import (
     RefundStatus,
     RiskResponse,
 )
+from app.models.monitoring import AnomalyObservation, CommerceSourceBinding
 from app.models.risk import RiskSignal
 from app.models.simulator import SimOrder, SimPayment, SimRefund
 from app.policy.contracts import (
@@ -54,6 +62,36 @@ class PolicyEvaluationResult:
     violation_message: str | None = None
     checked_preconditions: list[str] = field(default_factory=list)
     context_snapshot: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CommercePolicyDecision:
+    """Authoritative PolicyEngine decision with HMAC-SHA256 signed command authorization."""
+
+    allowed: bool
+    decision_code: str
+    policy_version: str
+    command: str
+    risk_level: str
+    requires_human_approval: bool
+    authorization_id: str | None = None
+    authorization_token: str | None = None
+    authorization_digest: str | None = None
+    approval_id: str | None = None
+    violation_code: str | None = None
+    violation_message: str | None = None
+    checked_preconditions: list[str] = field(default_factory=list)
+    context_snapshot: dict[str, Any] = field(default_factory=dict)
+
+
+COMMERCE_ALLOWED_COMMANDS: frozenset[str] = frozenset(
+    {
+        "REQUEST_ORDER_SYNC",
+        "REQUEST_EVENT_REDELIVERY",
+        "REQUEST_PAYMENT_RECONCILIATION",
+        "REQUEST_MANUAL_REVIEW",
+    }
+)
 
 
 class PolicyEngine:
@@ -699,4 +737,375 @@ class PolicyEngine:
             violation_message=message,
             checked_preconditions=checked,
             context_snapshot=snapshot or {},
+        )
+
+    def evaluate_commerce_recovery(
+        self,
+        *,
+        binding: CommerceSourceBinding,
+        obs: AnomalyObservation,
+        command: str,
+        request_hash: str,
+        idempotency_key: str = "",
+        expected_version: int | None = None,
+        order_snapshot: dict[str, Any] | None = None,
+        payment_snapshot: dict[str, Any] | None = None,
+        target_event_id: str | None = None,
+        approval_id: str | None = None,
+        require_human_approval: bool = False,
+    ) -> CommercePolicyDecision:
+        """Deterministic PolicyEngine authorization for MiniStore recovery commands.
+
+        Never trusts agent-supplied risk labels or Policy RAG text. Evaluates actual
+        authoritative business state, scope, risk signals, and human approval records.
+        Defaults to DENY whenever required evidence or authorization is missing.
+        """
+        norm_cmd = command.strip().upper()
+        checked: list[str] = []
+
+        def _deny_cmd(
+            code: str,
+            msg: str,
+            risk: str = "HIGH",
+            needs_approval: bool = True,
+            snap: dict[str, Any] | None = None,
+        ) -> CommercePolicyDecision:
+            return CommercePolicyDecision(
+                allowed=False,
+                decision_code=f"DENY:{code}",
+                policy_version=POLICY_VERSION,
+                command=norm_cmd,
+                risk_level=risk,
+                requires_human_approval=needs_approval,
+                violation_code=code,
+                violation_message=msg,
+                checked_preconditions=checked,
+                context_snapshot=snap or {},
+            )
+
+        # 1. Scope & world-epoch isolation
+        if binding.session_id != self._session_id or obs.session_id != self._session_id:
+            return _deny_cmd(
+                "SESSION_SCOPE_MISMATCH",
+                "Commerce binding or anomaly does not belong to active session",
+            )
+        if not binding.is_enabled or binding.world_reset_required:
+            return _deny_cmd(
+                "INACTIVE_SOURCE_BINDING",
+                f"CommerceSourceBinding '{binding.id}' is disabled or requires world reset",
+            )
+        if binding.commerce_world_epoch != obs.world_epoch:
+            return _deny_cmd(
+                "STALE_WORLD_EPOCH",
+                f"Binding world_epoch ({binding.commerce_world_epoch}) != anomaly "
+                f"world_epoch ({obs.world_epoch})",
+            )
+        checked.append("scope_and_world_epoch_verified")
+
+        # 2. Source mode enforcement
+        if self._settings.source_mode != SourceMode.MOCK:
+            return _deny_cmd(
+                "UNSUPPORTED_SOURCE_MODE",
+                "Autonomous commerce recovery is restricted to SOURCE_MODE=MOCK",
+            )
+        checked.append("source_mode_is_mock")
+
+        # 3. Command capability allowlist
+        if norm_cmd not in COMMERCE_ALLOWED_COMMANDS:
+            return _deny_cmd(
+                "UNSUPPORTED_RECOVERY_COMMAND",
+                f"Command '{norm_cmd}' is not an authorized recovery capability",
+            )
+        checked.append("command_in_capability_allowlist")
+
+        # 4. Active HOLD_ACTION risk signal check on linked Case
+        if obs.linked_case_id:
+            case_obj = self._db.scalar(
+                select(Case).where(
+                    Case.id == obs.linked_case_id,
+                    Case.session_id == self._session_id,
+                )
+            )
+            if case_obj is not None and case_obj.state in (
+                CaseState.RESOLVED.value,
+                CaseState.FAILED.value,
+            ):
+                return _deny_cmd(
+                    "CASE_ALREADY_TERMINAL",
+                    f"Linked Case '{case_obj.id}' is in terminal state '{case_obj.state}'",
+                )
+            hold_signals = list(
+                self._db.scalars(
+                    select(RiskSignal).where(
+                        RiskSignal.case_id == obs.linked_case_id,
+                        RiskSignal.session_id == self._session_id,
+                        RiskSignal.response == RiskResponse.HOLD_ACTION.value,
+                    )
+                ).all()
+            )
+            active_holds = [
+                s
+                for s in hold_signals
+                if str(s.details_json.get("lifecycle_status") or "ACTIVE").upper() == "ACTIVE"
+            ]
+            if active_holds:
+                return _deny_cmd(
+                    "RISK_HOLD_ACTION_ACTIVE",
+                    f"Active HOLD_ACTION risk signals block mutation: "
+                    f"{[s.category for s in active_holds]}",
+                )
+            checked.append("no_active_hold_action_risk_signal")
+
+        # 5. Command-specific authoritative evidence & deterministic risk evaluation
+        derived_risk = "HIGH"
+        needs_approval = require_human_approval
+        decision_code = "ALLOW_POLICY_ENGINE_VERIFIED"
+        snapshot: dict[str, Any] = {
+            "binding_id": binding.id,
+            "merchant_id": binding.merchant_id,
+            "commerce_session_id": binding.commerce_session_id,
+            "world_epoch": binding.commerce_world_epoch,
+            "request_hash": request_hash,
+        }
+
+        if norm_cmd == "REQUEST_ORDER_SYNC":
+            if not obs.affected_order_id or order_snapshot is None or payment_snapshot is None:
+                return _deny_cmd(
+                    "MISSING_AUTHORITATIVE_EVIDENCE",
+                    "REQUEST_ORDER_SYNC requires authoritative order and payment snapshots",
+                )
+            o_id = str(order_snapshot.get("id") or "")
+            o_status = str(order_snapshot.get("status") or "").upper()
+            o_recon = str(order_snapshot.get("reconciliation_status") or "CLEAR").upper()
+            o_ver = order_snapshot.get("version")
+            p_id = str(payment_snapshot.get("id") or payment_snapshot.get("payment_id") or "")
+            p_order_id = str(payment_snapshot.get("order_id") or "")
+            p_status = str(payment_snapshot.get("status") or "").upper()
+            p_provider = str(payment_snapshot.get("provider") or "").upper()
+            p_synced = bool(payment_snapshot.get("is_synced_to_order", False))
+            p_recon = bool(payment_snapshot.get("reconciliation_required", False))
+
+            if o_id != obs.affected_order_id or p_order_id != o_id:
+                return _deny_cmd(
+                    "TARGET_ENTITY_MISMATCH",
+                    f"Payment '{p_id}' (order={p_order_id}) does not match target order "
+                    f"'{obs.affected_order_id}'",
+                )
+            if p_provider != "LOCAL_MOCK":
+                return _deny_cmd(
+                    "EXTERNAL_PROVIDER_WRITE_FORBIDDEN",
+                    f"Autonomous sync is forbidden for external provider '{p_provider}'",
+                )
+            if o_status == "CANCELLED":
+                return _deny_cmd(
+                    "CANCELLED_ORDER_RESURRECTION_FORBIDDEN",
+                    "Cancelled orders MUST NOT be resurrected by automated sync",
+                )
+            if o_status != "PENDING_PAYMENT":
+                return _deny_cmd(
+                    "INVALID_ORDER_STATE_FOR_SYNC",
+                    f"Order '{o_id}' has status '{o_status}', expected 'PENDING_PAYMENT'",
+                )
+            if p_status != "SUCCEEDED" or p_synced:
+                return _deny_cmd(
+                    "PAYMENT_NOT_ELIGIBLE_FOR_SYNC",
+                    f"Payment '{p_id}' is not an unsynced SUCCEEDED payment "
+                    f"(status={p_status}, is_synced={p_synced})",
+                )
+            if p_recon or o_recon == "RECONCILIATION_REQUIRED":
+                return _deny_cmd(
+                    "RECONCILIATION_CONFLICT_BLOCKS_SYNC",
+                    "Reconciliation conflict present; human finance review required",
+                )
+            if expected_version is None or not isinstance(o_ver, int) or o_ver != expected_version:
+                return _deny_cmd(
+                    "STALE_OR_MISSING_ORDER_VERSION",
+                    f"Order version mismatch or missing: expected={expected_version}, "
+                    f"authoritative={o_ver}",
+                )
+            checked.append("authoritative_local_mock_sync_preconditions_verified")
+            derived_risk = "LOW"
+            decision_code = "ALLOW_POLICY_ENGINE_LOCAL_MOCK_LOW_RISK"
+            snapshot.update({"order_id": o_id, "payment_id": p_id, "order_version": o_ver})
+
+        elif norm_cmd == "REQUEST_EVENT_REDELIVERY":
+            if not target_event_id and not obs.affected_order_id:
+                return _deny_cmd(
+                    "SCOPED_TARGET_REQUIRED",
+                    "REQUEST_EVENT_REDELIVERY requires explicit event_id or order_id",
+                )
+            checked.append("scoped_event_redelivery_target_verified")
+            derived_risk = "LOW"
+            decision_code = "ALLOW_POLICY_ENGINE_SCOPED_REDELIVERY"
+            snapshot.update({"event_id": target_event_id, "order_id": obs.affected_order_id})
+
+        elif norm_cmd == "REQUEST_PAYMENT_RECONCILIATION":
+            if not obs.affected_order_id or order_snapshot is None:
+                return _deny_cmd(
+                    "MISSING_AUTHORITATIVE_EVIDENCE",
+                    "REQUEST_PAYMENT_RECONCILIATION requires authoritative order snapshot",
+                )
+            o_ver = order_snapshot.get("version")
+            if (
+                expected_version is not None
+                and isinstance(o_ver, int)
+                and o_ver != expected_version
+            ):
+                return _deny_cmd(
+                    "STALE_ORDER_VERSION",
+                    f"Order version mismatch: expected={expected_version}, authoritative={o_ver}",
+                )
+            checked.append("reconciliation_flag_preconditions_verified")
+            derived_risk = "LOW"
+            decision_code = "ALLOW_POLICY_ENGINE_RECONCILIATION_FLAG"
+            snapshot.update({"order_id": obs.affected_order_id, "order_version": o_ver})
+
+        elif norm_cmd == "REQUEST_MANUAL_REVIEW":
+            checked.append("manual_review_escalation_non_mutating")
+            derived_risk = "LOW"
+            decision_code = "ALLOW_POLICY_ENGINE_MANUAL_REVIEW"
+
+        # 6. Validate human Approval record when required (or when approval_id is supplied)
+        if needs_approval or approval_id is not None:
+            if not approval_id:
+                return _deny_cmd(
+                    "HUMAN_APPROVAL_REQUIRED",
+                    f"Command '{norm_cmd}' requires a valid, unexpired human Approval record",
+                    risk=derived_risk,
+                    needs_approval=True,
+                )
+            approval = self._db.scalar(select(Approval).where(Approval.id == approval_id))
+            if approval is None:
+                return _deny_cmd(
+                    "APPROVAL_NOT_FOUND",
+                    f"Approval '{approval_id}' does not exist",
+                    risk=derived_risk,
+                    needs_approval=True,
+                )
+            if approval.decision != ApprovalDecision.APPROVED.value:
+                return _deny_cmd(
+                    "APPROVAL_NOT_APPROVED",
+                    f"Approval '{approval_id}' has decision '{approval.decision}'",
+                    risk=derived_risk,
+                    needs_approval=True,
+                )
+            now = datetime.now(UTC)
+            exp = approval.expiry
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=UTC)
+            if exp <= now:
+                return _deny_cmd(
+                    "APPROVAL_EXPIRED",
+                    f"Approval '{approval_id}' expired at {exp.isoformat()}",
+                    risk=derived_risk,
+                    needs_approval=True,
+                )
+            proposal = self._db.scalar(
+                select(ActionProposal).where(
+                    ActionProposal.id == approval.proposal_id,
+                    ActionProposal.session_id == self._session_id,
+                )
+            )
+            if proposal is None:
+                return _deny_cmd(
+                    "APPROVAL_SCOPE_MISMATCH",
+                    f"Approval '{approval_id}' does not belong to active session",
+                    risk=derived_risk,
+                    needs_approval=True,
+                )
+            if obs.linked_case_id and proposal.case_id and proposal.case_id != obs.linked_case_id:
+                return _deny_cmd(
+                    "APPROVAL_CASE_MISMATCH",
+                    f"Approval '{approval_id}' is bound to Case '{proposal.case_id}', "
+                    f"not '{obs.linked_case_id}'",
+                    risk=derived_risk,
+                    needs_approval=True,
+                )
+            prop_params = proposal.params_json or {}
+            prop_order = prop_params.get("order_id")
+            if prop_order and obs.affected_order_id and prop_order != obs.affected_order_id:
+                return _deny_cmd(
+                    "APPROVAL_TARGET_MISMATCH",
+                    f"Approval target order '{prop_order}' != '{obs.affected_order_id}'",
+                    risk=derived_risk,
+                    needs_approval=True,
+                )
+            prop_hash = str(prop_params.get("request_hash") or "").strip()
+            if not prop_hash:
+                return _deny_cmd(
+                    "APPROVAL_MISSING_REQUEST_HASH",
+                    "Approval proposal must cryptographically bind request_hash",
+                    risk=derived_risk,
+                    needs_approval=True,
+                )
+            if not hmac.compare_digest(prop_hash, request_hash):
+                return _deny_cmd(
+                    "APPROVAL_REQUEST_HASH_MISMATCH",
+                    "Approval request_hash does not match command payload hash",
+                    risk=derived_risk,
+                    needs_approval=True,
+                )
+            checked.append("human_approval_record_verified")
+
+        if not self._settings.autonomous_recovery_enabled:
+            return _deny_cmd(
+                "AUTONOMOUS_RECOVERY_DISABLED",
+                "Autonomous recovery is explicitly disabled (read-only mode active)",
+                risk=derived_risk,
+                needs_approval=True,
+            )
+        signing_secret = self._settings.command_auth_signing_secret.get_secret_value().strip()
+        if len(signing_secret) < 32:
+            return _deny_cmd(
+                "SIGNING_SECRET_UNAVAILABLE",
+                "Command authorization signing secret missing or < 256-bit (fail closed)",
+                risk=derived_risk,
+                needs_approval=needs_approval,
+            )
+
+        now_ts = datetime.now(UTC)
+        exp_ts = now_ts + timedelta(seconds=self._settings.command_auth_ttl_seconds)
+        auth_id = f"AUTH-{uuid.uuid4().hex[:12].upper()}"
+        auth_payload = {
+            "auth_id": auth_id,
+            "key_id": self._settings.command_auth_key_id,
+            "policy_version": POLICY_VERSION,
+            "policy_decision": decision_code,
+            "command": norm_cmd,
+            "idempotency_key": idempotency_key,
+            "request_hash": request_hash,
+            "merchant_id": binding.merchant_id,
+            "commerce_session_id": binding.commerce_session_id,
+            "world_epoch": binding.commerce_world_epoch,
+            "source_binding_id": binding.id,
+            "target_order_id": obs.affected_order_id,
+            "target_payment_id": obs.affected_payment_id,
+            "target_event_id": target_event_id,
+            "expected_version": expected_version,
+            "approval_id": approval_id,
+            "issued_at": int(now_ts.timestamp()),
+            "expires_at": int(exp_ts.timestamp()),
+        }
+        canonical_bytes = json.dumps(
+            auth_payload, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")
+        sig_hex = hmac.new(
+            signing_secret.encode("utf-8"), canonical_bytes, hashlib.sha256
+        ).hexdigest()
+        b64_payload = base64.urlsafe_b64encode(canonical_bytes).decode("ascii").rstrip("=")
+        auth_token = f"{b64_payload}.{sig_hex}"
+
+        return CommercePolicyDecision(
+            allowed=True,
+            decision_code=decision_code,
+            policy_version=POLICY_VERSION,
+            command=norm_cmd,
+            risk_level=derived_risk,
+            requires_human_approval=needs_approval,
+            authorization_id=auth_id,
+            authorization_token=auth_token,
+            authorization_digest=sig_hex,
+            approval_id=approval_id,
+            checked_preconditions=checked,
+            context_snapshot=snapshot,
         )

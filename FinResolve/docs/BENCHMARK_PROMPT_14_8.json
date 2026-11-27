@@ -1,0 +1,27 @@
+{
+  "executed_at_utc": "2026-11-26T14:23:33.941328+00:00",
+  "model": "gemini-3.1-flash-lite",
+  "model_mode": "LLM_API",
+  "is_fallback": false,
+  "healthy_transactions": 2,
+  "false_positives": 6,
+  "false_positive_rate": 3.0,
+  "detection_precision": 0.14285714285714285,
+  "detection_recall": 1.0,
+  "detection_latency_ms": 1742.1,
+  "end_to_end_recovery_latency_ms": 13962.4,
+  "tokens_used": 9795,
+  "tool_calls": [
+    "get_order",
+    "get_payment_record"
+  ],
+  "run_id": "RUN-DFC37E7DF8",
+  "proposal_id": "PROP-8C306CBBA3",
+  "command_id": "RCMD-D0B33CE93E",
+  "policy_decision": "ALLOW_POLICY_ENGINE_LOCAL_MOCK_L",
+  "execution_certainty": "COMMAND_EXECUTION_VERIFIED",
+  "order_status_after": "CONFIRMED",
+  "verification_verdict": "VERIFIED_RECOVERY",
+  "unauthorized_mutations": 0,
+  "duplicate_mutations": 0
+}

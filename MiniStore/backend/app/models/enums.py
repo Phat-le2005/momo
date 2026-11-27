@@ -20,6 +20,17 @@ class ReconciliationStatus(StrEnum):
     RESOLVED = "RESOLVED"
 
 
+class PaymentProvider(StrEnum):
+    LOCAL_MOCK = "LOCAL_MOCK"
+    VNPAY_SANDBOX = "VNPAY_SANDBOX"
+
+
+class ObservationProvenance(StrEnum):
+    LOCAL_MOCK = "LOCAL_MOCK"
+    TEST_FIXTURE = "TEST_FIXTURE"
+    VNPAY_SANDBOX = "VNPAY_SANDBOX"
+
+
 class PaymentStatus(StrEnum):
     INITIATED = "INITIATED"
     PENDING = "PENDING"

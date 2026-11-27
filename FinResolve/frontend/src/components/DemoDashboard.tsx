@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useState, type FormEvent } from "react";
 import { ActivityTimelinePanel } from "@/components/mission/ActivityTimelinePanel";
 import { ApprovalInboxPanel } from "@/components/mission/ApprovalInboxPanel";
+import { ContinuousMonitorPanel } from "@/components/mission/ContinuousMonitorPanel";
 import { SupervisorStatusPanel } from "@/components/mission/SupervisorStatusPanel";
 import { Panel, StatusPill, primaryButton, secondaryButton } from "@/components/StatusPill";
 import {
@@ -714,6 +715,8 @@ export function DemoDashboard() {
           </Panel>
         </div>
       </div>
+
+      <ContinuousMonitorPanel session={mc.session} />
     </div>
   );
 }

@@ -155,7 +155,16 @@ class PaymentResponse(BaseModel):
     order_id: str
     merchant_id: str
     provider: str
+    provider_environment: str = "LOCAL_MOCK"
     provider_ref: str
+    provider_txn_no: str | None = None
+    provider_txn_date: str | None = None
+    provider_response_code: str | None = None
+    provider_transaction_status: str | None = None
+    observation_source: str = "INTERNAL_LEDGER"
+    signature_verified: bool = False
+    last_observed_at: datetime | None = None
+    redirect_url: str | None = None
     correlation_id: str
     amount_vnd: int
     refunded_amount_vnd: int
@@ -165,6 +174,35 @@ class PaymentResponse(BaseModel):
     reconciliation_required: bool = False
     reconciliation_note: str | None = None
     confirmed_at: datetime | None = None
+    created_at: datetime
+
+
+class PaymentQueryAttemptResponse(BaseModel):
+    id: str
+    payment_id: str
+    order_id: str
+    provider: str
+    request_id: str
+    command: str
+    http_status: int | None = None
+    provider_response_code: str | None = None
+    provider_transaction_status: str | None = None
+    signature_verified: bool
+    mapped_payment_status: str | None = None
+    observation_provenance: str
+    error_message: str | None = None
+    created_at: datetime
+
+
+class ReconciliationRecordResponse(BaseModel):
+    id: str
+    order_id: str
+    payment_id: str | None = None
+    operator_id: str
+    action_type: str
+    note: str
+    evidence_json: dict[str, Any]
+    verified_postconditions: bool
     created_at: datetime
 
 

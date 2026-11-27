@@ -30,6 +30,8 @@ ALLOWED_READ_TOOLS: frozenset[str] = frozenset(
         "get_inventory",
         "get_policy",
         "get_order_events",
+        "get_operational_telemetry",
+        "get_incident_experience",
     }
 )
 
@@ -98,6 +100,7 @@ _INT_ARG_KEYS: frozenset[str] = frozenset(
         "requested_amount",
         "remaining_refundable_amount",
         "expected_order_version",
+        "expected_version",
         "order_amount",
         "payment_amount",
     }
@@ -163,8 +166,10 @@ def _validate_arg_types(args: dict[str, Any]) -> None:
                 )
             if key == "remaining_refundable_amount" and (val < 0 or val > 100_000_000_000):
                 raise ValueError(f"Argument '{key}' must be a non-negative integer")
-            if key == "expected_order_version" and (val < 1 or val > 1_000_000):
-                raise ValueError("Argument 'expected_order_version' must be >= 1")
+            if key in ("expected_order_version", "expected_version") and (
+                val < 1 or val > 1_000_000
+            ):
+                raise ValueError(f"Argument '{key}' must be >= 1")
         elif key == "simulate_timeout":
             if not isinstance(val, bool):
                 raise ValueError("Argument 'simulate_timeout' must be a boolean")
