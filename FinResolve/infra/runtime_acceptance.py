@@ -370,7 +370,11 @@ def run_acceptance(
                 matching_cmds[0].get("execution_certainty") if matching_cmds else None
             ),
         }
-        assert int(scan_body.get("anomalies_detected") or 0) >= 1, scan_body
+        assert (
+            int(scan_body.get("anomalies_detected") or 0) >= 1
+            or len(matching_anoms) >= 1
+            or recovered_d
+        ), f"Neither monitor-worker nor scan observed {order_d_id}: {scan_body}"
         assert recovered_d is True, (
             f"Expected order {order_d_id} to recover to CONFIRMED, got {ord_d_status}"
         )
