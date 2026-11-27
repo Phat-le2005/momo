@@ -447,24 +447,76 @@ def execute_and_verify_commerce_recovery(
             idempotent_replay=True,
         )
 
-    # 1b (Prompt 14.8 Fix 1): Atomic PostgreSQL advisory lock keyed on CANONICAL BUSINESS RESOURCE
-    # identity (merchant, commerce_session, world_epoch, order/payment) so two FinResolve
-    # workspaces can NEVER issue conflicting mutations against the same Commerce entity, AND
-    # uncertain execution guards survive workspace ownership changes and dashboard resets!
+    # 1b (Prompt 14.8 + 14.9 Fix P1): Resolve canonical business identity (order -> payment ->
+    # event) BEFORE acquiring the PostgreSQL advisory lock, and block conflicting commands across
+    # ANY combination of order/payment/event references targeting the same business resource!
     from sqlalchemy import and_, or_
     from sqlalchemy import text as sa_text
 
-    canonical_target = obs.affected_order_id or obs.affected_payment_id or obs.id
+    from app.models.supervisor import SupervisorState
+
+    resolved_order_id: str | None = (
+        obs.affected_order_id
+        or (
+            str(fresh_order.get("id"))
+            if isinstance(fresh_order, dict) and fresh_order.get("id")
+            else None
+        )
+        or (
+            str(fresh_payment.get("order_id"))
+            if isinstance(fresh_payment, dict) and fresh_payment.get("order_id")
+            else None
+        )
+    )
+    resolved_payment_id: str | None = obs.affected_payment_id or (
+        str(fresh_payment.get("id"))
+        if isinstance(fresh_payment, dict) and fresh_payment.get("id")
+        else None
+    )
+    resolved_event_id: str | None = str(target_event_id) if target_event_id else None
+
+    canonical_target = resolved_order_id or resolved_payment_id or resolved_event_id or obs.id
     target_lock_key = (
         f"biz:{binding.merchant_id}:{binding.commerce_session_id}:"
         f"{binding.commerce_world_epoch}:{canonical_target}"
     )
     db.execute(sa_text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": target_lock_key})
 
+    # Re-verify controller binding authority & dashboard world_epoch inside the locked boundary
+    fresh_binding = db.scalar(
+        select(CommerceSourceBinding).where(CommerceSourceBinding.id == binding.id)
+    )
+    if fresh_binding is not None and not fresh_binding.is_enabled:
+        raise AppError(
+            ErrorCode.FORBIDDEN,
+            "CONTROLLER_OWNERSHIP_REVOKED: binding is no longer active for mutation dispatch",
+            status_code=403,
+        )
+    sup_state_now = db.scalar(
+        select(SupervisorState).where(SupervisorState.session_id == binding.session_id)
+    )
+    if sup_state_now is not None and sup_state_now.world_epoch != obs.world_epoch:
+        raise AppError(
+            ErrorCode.CONFLICT,
+            "STALE_WORLD_EPOCH_AT_DISPATCH: dashboard world epoch changed before dispatch",
+            status_code=409,
+        )
+
+    target_match_clauses: list[Any] = []
+    if resolved_order_id:
+        target_match_clauses.append(RecoveryCommand.target_order_id == resolved_order_id)
+    if resolved_payment_id:
+        target_match_clauses.append(RecoveryCommand.target_payment_id == resolved_payment_id)
+    if resolved_event_id:
+        target_match_clauses.append(RecoveryCommand.target_event_id == resolved_event_id)
+    if not target_match_clauses:
+        target_match_clauses.append(RecoveryCommand.anomaly_id == obs.id)
+
     conflict_scope: list[Any] = [
         RecoveryCommand.merchant_id == binding.merchant_id,
         RecoveryCommand.commerce_session_id == binding.commerce_session_id,
         RecoveryCommand.world_epoch == binding.commerce_world_epoch,
+        or_(*target_match_clauses),
         or_(
             RecoveryCommand.state.in_(["EXECUTING", "UNKNOWN_OUTCOME", "VERIFYING"]),
             and_(
@@ -474,12 +526,6 @@ def execute_and_verify_commerce_recovery(
             ),
         ),
     ]
-    if obs.affected_order_id:
-        conflict_scope.append(RecoveryCommand.target_order_id == obs.affected_order_id)
-    elif obs.affected_payment_id:
-        conflict_scope.append(RecoveryCommand.target_payment_id == obs.affected_payment_id)
-    else:
-        conflict_scope.append(RecoveryCommand.anomaly_id == obs.id)
     in_flight = db.scalar(select(RecoveryCommand).where(*conflict_scope).limit(1))
     if in_flight is not None:
         raise AppError(

@@ -11,6 +11,7 @@ Security & Isolation Invariants:
 
 from __future__ import annotations
 
+import hmac
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -22,7 +23,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
-from app.core.config import get_settings
+from app.core.config import LOCAL_DEV_ENVIRONMENTS, get_settings
 from app.core.rate_limit import enforce_session_creation_rate_limit
 from app.core.session import get_current_session
 from app.db.session import get_db
@@ -118,10 +119,11 @@ def _effective_connectivity_status(binding: CommerceSourceBinding | None) -> str
 
 
 def _sandbox_isolation_mode(commerce_session_id: str) -> str:
-    """Honest sandbox ownership label: never claim a shared default sandbox is per-user isolated."""
-    if commerce_session_id == "CSESS_FINSHOP_DEFAULT_01":
-        return "SHARED_DEMO_SANDBOX"
-    return "DEDICATED_SANDBOX"
+    """Honest sandbox ownership label: custom session ID alone does NOT imply dedicated sandbox."""
+    settings = get_settings()
+    if settings.sandbox_dedicated_mode and commerce_session_id != "CSESS_FINSHOP_DEFAULT_01":
+        return "DEDICATED_SANDBOX"
+    return "SHARED_DEMO_SANDBOX"
 
 
 def _find_active_shared_sandbox_owner(
@@ -208,6 +210,7 @@ def _resolve_existing_active_session(
 def bootstrap_experience(
     payload: ExperienceBootstrapRequest | None = None,
     x_demo_session: str | None = Header(default=None, alias="X-Demo-Session"),
+    x_operator_token: str | None = Header(default=None, alias="X-Operator-Token"),
     _rl: None = Depends(enforce_session_creation_rate_limit),
     db: Session = Depends(get_db),
 ) -> ExperienceBootstrapResponse:
@@ -248,6 +251,17 @@ def bootstrap_experience(
         db.execute(sa_text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": owner_lock_key})
 
         is_shared = _sandbox_isolation_mode(eff_csess) == "SHARED_DEMO_SANDBOX"
+        existing_own_binding = (
+            db.scalar(
+                select(CommerceSourceBinding).where(
+                    CommerceSourceBinding.session_id == sess.id,
+                    CommerceSourceBinding.world_epoch == sup_state.world_epoch,
+                    CommerceSourceBinding.is_enabled.is_(True),
+                )
+            )
+            if restored
+            else None
+        )
         other_owner = (
             _find_active_shared_sandbox_owner(
                 db,
@@ -259,8 +273,31 @@ def bootstrap_experience(
             if is_shared
             else None
         )
-        if other_owner is not None:
-            # Another active workspace already controls the shared sandbox -> READ_ONLY_PREVIEW!
+
+        # Prompt 14.9 Fix P1: Require server-side operator authorization before claiming
+        # shared sandbox control when operator token is configured or in non-local envs.
+        expected_op = settings.experience_operator_token.get_secret_value().strip()
+        require_op_auth = bool(expected_op) or (
+            settings.app_env.strip().lower() not in LOCAL_DEV_ENVIRONMENTS
+        )
+        op_authorized = True
+        if existing_own_binding is None and require_op_auth:
+            provided_op = (x_operator_token or "").strip()
+            op_authorized = bool(expected_op) and hmac.compare_digest(provided_op, expected_op)
+
+        # Prevent unsafe handoff to a new controller while unresolved uncertain guards exist
+        unresolved_scope_guards = (
+            _count_unresolved_guards_for_scope(
+                db,
+                merchant_id=eff_merchant,
+                commerce_session_id=eff_csess,
+                commerce_world_epoch=eff_epoch,
+            )
+            if existing_own_binding is None
+            else 0
+        )
+
+        if other_owner is not None or not op_authorized or unresolved_scope_guards > 0:
             workspace_role = "READ_ONLY_PREVIEW"
             binding = None
         else:
