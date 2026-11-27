@@ -24,7 +24,9 @@ jobs:
         run: python -m pip install --upgrade pip && pip install httpx pillow
 
       - name: Generate ephemeral 256-bit local secrets (redacted)
-        run: python FinResolve/infra/init_local_secrets.py
+        run: |
+          python FinResolve/infra/init_local_secrets.py
+          echo "MONITOR_PAYMENT_SYNC_GRACE_SECONDS=0" >> FinResolve/infra/.env
 
       - name: Validate Docker Compose configuration
         run: docker compose --env-file FinResolve/infra/.env -f FinResolve/infra/docker-compose.yml config --quiet
@@ -52,6 +54,17 @@ jobs:
           docker compose --env-file FinResolve/infra/.env -f FinResolve/infra/docker-compose.yml exec -T commerce-api \
             python -c "from pathlib import Path; p = Path('/var/lib/finshop/private_receipts/MERCHANT_FINSHOP_01') / '${COMP_ID}.png'; assert p.exists() and p.stat().st_size > 0, f'Receipt missing: {p}'; print(f'PERSISTENT_RECEIPT_VERIFIED: {p} ({p.stat().st_size} bytes)')"
 
+      - name: Execute real Playwright Chromium browser E2E against live Docker stack
+        run: |
+          mkdir -p /tmp/pw-runner
+          cd /tmp/pw-runner
+          npm init -y > /dev/null
+          npm install --no-save @playwright/test@1.52.0
+          npx playwright install --with-deps chromium
+          cp "${GITHUB_WORKSPACE}/FinResolve/frontend/e2e/guardian-experience.spec.ts" /tmp/pw-runner/guardian-experience.spec.ts
+          FINRESOLVE_WEB_URL=http://127.0.0.1:3000 npx playwright test guardian-experience.spec.ts --reporter=list,json > "${GITHUB_WORKSPACE}/playwright-e2e-output.txt" 2>&1 || (cat "${GITHUB_WORKSPACE}/playwright-e2e-output.txt"; exit 1)
+          cat "${GITHUB_WORKSPACE}/playwright-e2e-output.txt"
+
       - name: Capture final compose ps
         if: always()
         run: docker compose --env-file FinResolve/infra/.env -f FinResolve/infra/docker-compose.yml ps | tee compose-ps-final.txt || true
@@ -63,6 +76,7 @@ jobs:
           name: runtime-acceptance-evidence
           path: |
             runtime-acceptance-report.json
+            playwright-e2e-output.txt
             compose-ps.txt
             compose-ps-final.txt
           if-no-files-found: warn

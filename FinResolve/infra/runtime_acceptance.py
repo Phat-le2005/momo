@@ -67,6 +67,7 @@ def run_acceptance(
     finresolve_web_url: str,
     commerce_web_url: str,
     service_read_key: str,
+    operator_token: str = "",
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
         "executed_at_utc": datetime.now(UTC).isoformat(),
@@ -240,14 +241,34 @@ def run_acceptance(
             "completed_fixed_60s_is_complete": w_comp.get("is_complete"),
         }
 
-        # 6. FinResolve Unified Experience session bootstrap & worker health verification
-        r_boot = client.post(f"{finresolve_url}/api/v1/experience/bootstrap", json={})
+        # 6. Prompt 14.9: Verify anonymous visitor receives READ_ONLY_PREVIEW & authorized
+        #    operator claims CONTROLLER via X-Operator-Token (never exposed in browser bundle)
+        r_anon = client.post(f"{finresolve_url}/api/v1/experience/bootstrap", json={})
+        assert r_anon.status_code == 200, r_anon.text
+        anon_data = r_anon.json()
+        assert anon_data["session"]["workspace_role"] == "READ_ONLY_PREVIEW", anon_data
+        r_anon_scan = client.post(
+            f"{finresolve_url}/api/v1/experience/scan",
+            headers={"X-Demo-Session": anon_data["session"]["token"]},
+        )
+        assert r_anon_scan.status_code in (200, 403), r_anon_scan.status_code
+
+        op_headers = {"X-Operator-Token": operator_token} if operator_token else {}
+        r_boot = client.post(
+            f"{finresolve_url}/api/v1/experience/bootstrap", headers=op_headers, json={}
+        )
         assert r_boot.status_code == 200, r_boot.text
         boot_data = r_boot.json()
+        assert boot_data["session"]["workspace_role"] == "CONTROLLER", boot_data
         sess_id = boot_data["session"]["session_id"]
         sess_token = boot_data["session"]["token"]
         assert sess_token, f"No session token in {boot_data}"
         fin_headers = {"X-Demo-Session": sess_token, "X-Session-Token": sess_token}
+
+        report["checks"]["security_operator_ownership"] = {
+            "anonymous_workspace_role": anon_data["session"]["workspace_role"],
+            "operator_workspace_role": boot_data["session"]["workspace_role"],
+        }
 
         r_sup = client.get(f"{finresolve_url}/api/v1/supervisor/status", headers=fin_headers)
         assert r_sup.status_code == 200, r_sup.text
@@ -406,11 +427,13 @@ def main() -> int:
 
     env_path = Path(args.env_file)
     read_key = ""
+    op_token = ""
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
             if line.startswith("COMMERCE_SERVICE_API_KEY="):
                 read_key = line.split("=", 1)[1].strip()
-                break
+            elif line.startswith("EXPERIENCE_OPERATOR_TOKEN="):
+                op_token = line.split("=", 1)[1].strip()
     if not read_key:
         raise RuntimeError("COMMERCE_SERVICE_API_KEY not found in env file")
 
@@ -420,6 +443,7 @@ def main() -> int:
         finresolve_web_url=args.finresolve_web_url,
         commerce_web_url=args.commerce_web_url,
         service_read_key=read_key,
+        operator_token=op_token,
     )
     out_path = Path(args.output)
     out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
