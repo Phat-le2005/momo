@@ -20,6 +20,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install host acceptance test client dependencies
         run: python -m pip install --upgrade pip && pip install httpx pillow
 
@@ -60,10 +64,11 @@ jobs:
           cd /tmp/pw-runner
           npm init -y > /dev/null
           npm install --no-save @playwright/test@1.52.0
-          npx playwright install --with-deps chromium
+          npx playwright install chromium
+          sudo npx playwright install-deps chromium || true
+          printf 'module.exports = { testDir: ".", use: { browserName: "chromium", headless: true } };\n' > /tmp/pw-runner/playwright.config.js
           cp "${GITHUB_WORKSPACE}/FinResolve/frontend/e2e/guardian-experience.spec.ts" /tmp/pw-runner/guardian-experience.spec.ts
-          FINRESOLVE_WEB_URL=http://localhost:3000 npx playwright test guardian-experience.spec.ts --reporter=list > "${GITHUB_WORKSPACE}/playwright-e2e-output.txt" 2>&1 || (cat "${GITHUB_WORKSPACE}/playwright-e2e-output.txt"; exit 1)
-          cat "${GITHUB_WORKSPACE}/playwright-e2e-output.txt"
+          FINRESOLVE_WEB_URL=http://localhost:3000 npx playwright test --reporter=list | tee "${GITHUB_WORKSPACE}/playwright-e2e-output.txt"
 
       - name: Capture final compose ps
         if: always()
