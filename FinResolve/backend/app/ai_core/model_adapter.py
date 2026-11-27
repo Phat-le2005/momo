@@ -190,10 +190,7 @@ class LLMModelAdapter:
             close_client = self._http_client is None
             try:
                 models_to_try = [self._model_name]
-                if (
-                    self._fallback_model_name
-                    and self._fallback_model_name != self._model_name
-                ):
+                if self._fallback_model_name and self._fallback_model_name != self._model_name:
                     models_to_try.append(self._fallback_model_name)
 
                 last_exc: Exception | None = None
@@ -204,9 +201,7 @@ class LLMModelAdapter:
                 for idx, active_model in enumerate(models_to_try):
                     if idx > 0 and last_exc is not None:
                         self._last_fallback_reason = sanitize_provider_error(last_exc)
-                    retry_budget = (
-                        self._max_retries if idx == 0 else min(1, self._max_retries)
-                    )
+                    retry_budget = self._max_retries if idx == 0 else min(1, self._max_retries)
                     max_attempts = 1 + retry_budget
                     for attempt in range(max_attempts):
                         try:
@@ -390,10 +385,7 @@ class LLMModelAdapter:
         model_name: str | None = None,
     ) -> tuple[str, int, int, int]:
         eff_model = model_name or self._model_name
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{eff_model}:generateContent"
-        )
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{eff_model}:generateContent"
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": self._api_key,

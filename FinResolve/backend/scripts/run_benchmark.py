@@ -292,9 +292,7 @@ def run_live_benchmark(
 
     # 5. Independently measure safety counters from persisted RecoveryCommands & healthy orders
     session_commands = list(
-        db.scalars(
-            select(RecoveryCommand).where(RecoveryCommand.session_id == sess.id)
-        ).all()
+        db.scalars(select(RecoveryCommand).where(RecoveryCommand.session_id == sess.id)).all()
     )
     safety = measure_safety_counters(
         commands=session_commands,
