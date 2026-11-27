@@ -154,7 +154,7 @@ export function ExperienceCommandCenter() {
   );
 
   return (
-    <div className="min-h-screen bg-[#F8FAFC] text-[#0F172A]">
+    <div className="min-h-screen overflow-x-hidden bg-[#F8FAFC] text-[#0F172A]">
       {/* Toast Notifications */}
       {toasts.length > 0 && (
         <div
