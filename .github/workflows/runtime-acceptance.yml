@@ -62,7 +62,7 @@ jobs:
           npm install --no-save @playwright/test@1.52.0
           npx playwright install --with-deps chromium
           cp "${GITHUB_WORKSPACE}/FinResolve/frontend/e2e/guardian-experience.spec.ts" /tmp/pw-runner/guardian-experience.spec.ts
-          FINRESOLVE_WEB_URL=http://127.0.0.1:3000 npx playwright test guardian-experience.spec.ts --reporter=list,json > "${GITHUB_WORKSPACE}/playwright-e2e-output.txt" 2>&1 || (cat "${GITHUB_WORKSPACE}/playwright-e2e-output.txt"; exit 1)
+          FINRESOLVE_WEB_URL=http://localhost:3000 npx playwright test guardian-experience.spec.ts --reporter=list > "${GITHUB_WORKSPACE}/playwright-e2e-output.txt" 2>&1 || (cat "${GITHUB_WORKSPACE}/playwright-e2e-output.txt"; exit 1)
           cat "${GITHUB_WORKSPACE}/playwright-e2e-output.txt"
 
       - name: Capture final compose ps
