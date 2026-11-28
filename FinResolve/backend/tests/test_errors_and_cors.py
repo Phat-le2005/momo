@@ -94,6 +94,41 @@ def test_cors_allows_configured_origin_only(client: TestClient) -> None:
     assert "access-control-allow-origin" not in denied.headers
 
 
+@pytest.mark.parametrize(
+    ("origin", "requested_headers", "expected_status"),
+    [
+        ("http://localhost:3000", "content-type,x-demo-session,x-operator-token", 200),
+        ("https://evil.example", "content-type,x-demo-session,x-operator-token", 400),
+        ("http://localhost:3000", "x-untrusted-admin", 400),
+    ],
+)
+def test_operator_bootstrap_cors_preflight(
+    client: TestClient,
+    origin: str,
+    requested_headers: str,
+    expected_status: int,
+) -> None:
+    response = client.options(
+        "/api/v1/experience/bootstrap",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": requested_headers,
+        },
+    )
+
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        assert response.headers["access-control-allow-origin"] == origin
+        allowed_headers = {
+            header.strip().lower()
+            for header in response.headers["access-control-allow-headers"].split(",")
+        }
+        assert {"content-type", "x-demo-session", "x-operator-token"} <= allowed_headers
+    if origin == "https://evil.example":
+        assert "access-control-allow-origin" not in response.headers
+
+
 def test_wildcard_origin_rejected() -> None:
     with pytest.raises(ValidationError):
         Settings(web_origin="*")

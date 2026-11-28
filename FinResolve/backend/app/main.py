@@ -58,6 +58,7 @@ def create_app() -> FastAPI:
         allow_headers=[
             "Content-Type",
             "X-Demo-Session",
+            "X-Operator-Token",
             "X-Demo-Manager-Token",
             "X-Judge-Token",
             "X-Idempotency-Key",

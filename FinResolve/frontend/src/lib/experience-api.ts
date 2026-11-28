@@ -55,7 +55,7 @@ export type ExperienceAnomaly = {
   recovery_source: string | null;
   first_observed_at: string;
   last_observed_at: string;
-  evidence_refs: string[];
+  evidence_refs: Array<string | Record<string, unknown>>;
 };
 
 export type ExperienceApproval = {

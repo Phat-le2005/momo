@@ -406,12 +406,16 @@ export function ExperienceCommandCenter() {
                   <p className="mt-1.5 text-xs text-[#64748B]">Chưa có mã bằng chứng đính kèm.</p>
                 ) : (
                   <ul className="mt-2 space-y-1.5">
-                    {selectedAnomaly.evidence_refs.map((ref) => (
+                    {selectedAnomaly.evidence_refs.map((ref, index) => (
                       <li
-                        key={ref}
+                        key={`${selectedAnomaly.id}-evidence-${index}`}
                         className="rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] px-3 py-1.5 font-mono text-xs text-[#334155]"
                       >
-                        {ref}
+                        {typeof ref === "string" ? ref : (
+                          <pre className="whitespace-pre-wrap break-words">
+                            {JSON.stringify(ref, null, 2)}
+                          </pre>
+                        )}
                       </li>
                     ))}
                   </ul>
