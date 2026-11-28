@@ -29,7 +29,10 @@ function CheckoutContent() {
   const [customerNote, setCustomerNote] = useState("");
   const [voucherCode, setVoucherCode] = useState("");
   const [paymentMethods, setPaymentMethods] = useState<PaymentMethodDTO[]>([]);
-  const [paymentMethod, setPaymentMethod] = useState<string>("LOCAL_MOCK");
+  const [selectedPaymentMethod, setSelectedPaymentMethod] = useState("");
+  const paymentMethod = paymentMethods.find((method) =>
+    method.available && method.id === selectedPaymentMethod,
+  )?.id ?? paymentMethods.find((method) => method.available)?.id;
   const [submitting, setSubmitting] = useState(false);
   const [paying, setPaying] = useState(false);
   const [createdOrder, setCreatedOrder] = useState<OrderDTO | null>(null);
@@ -97,6 +100,7 @@ function CheckoutContent() {
 
   async function handleCreateOrder(e: React.FormEvent) {
     e.preventDefault();
+    if (!paymentMethod) return;
     setError(null);
     setSubmitting(true);
     try {
@@ -351,21 +355,7 @@ function CheckoutContent() {
             <div className="border-t border-slate-100 pt-4">
               <h2 className="text-sm font-extrabold text-slate-900">Phương thức thanh toán</h2>
               <div className="mt-2.5 space-y-2">
-                {(paymentMethods.length > 0
-                  ? paymentMethods
-                  : [
-                      {
-                        id: "LOCAL_MOCK",
-                        label_vi: "Thanh toán thử nghiệm nội bộ (LOCAL_MOCK — mô phỏng)",
-                        available: true,
-                      },
-                      {
-                        id: "VNPAY_SANDBOX",
-                        label_vi: "VNPAY Sandbox (Chưa cấu hình khóa Sandbox — tạm thời chưa khả dụng)",
-                        available: false,
-                      },
-                    ]
-                ).map((pm) => {
+                {paymentMethods.map((pm) => {
                   const selected = paymentMethod === pm.id;
                   return (
                     <label
@@ -384,7 +374,7 @@ function CheckoutContent() {
                           name="pm"
                           disabled={!pm.available}
                           checked={selected}
-                          onChange={() => pm.available && setPaymentMethod(pm.id)}
+                          onChange={() => setSelectedPaymentMethod(pm.id)}
                         />
                         <div>
                           <p className="text-xs font-bold text-slate-900">{pm.label_vi}</p>
@@ -404,7 +394,7 @@ function CheckoutContent() {
                             : "bg-slate-200 text-slate-600"
                         }`}
                       >
-                        {pm.available ? "Khả dụng" : "Chưa cấu hình"}
+                        {pm.available ? "Khả dụng" : "Không khả dụng"}
                       </span>
                     </label>
                   );
@@ -453,7 +443,7 @@ function CheckoutContent() {
 
             <button
               type="submit"
-              disabled={submitting}
+              disabled={submitting || !paymentMethod}
               className="w-full rounded-xl bg-[#fe2c55] py-3 text-sm font-extrabold text-white hover:bg-[#e02047] disabled:bg-slate-300"
             >
               {submitting ? "Đang tạo đơn..." : "Đặt hàng ngay"}

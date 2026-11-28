@@ -30,6 +30,7 @@ from app.models.entities import (
 )
 from app.models.enums import (
     OrderStatus,
+    PaymentProvider,
     PaymentStatus,
     ReconciliationStatus,
     RefundTransactionStatus,
@@ -111,7 +112,6 @@ class PaymentAdapter(Protocol):
         db: Session,
         *,
         payment_id: str,
-        client_ip: str = "127.0.0.1",
     ) -> PaymentObservation: ...
 
     def request_refund(
@@ -321,8 +321,18 @@ def apply_authoritative_payment_observation(
             status_code=404,
         )
 
-    order = db.scalar(select(Order).where(Order.id == pay_lookup.order_id).with_for_update())
-    payment = db.scalar(select(Payment).where(Payment.id == pay_lookup.id).with_for_update())
+    order = db.scalar(
+        select(Order)
+        .where(Order.id == pay_lookup.order_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    payment = db.scalar(
+        select(Payment)
+        .where(Payment.id == pay_lookup.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if payment is None:
         raise CommerceError(ErrorCode.NOT_FOUND, "Payment not found", status_code=404)
     if (
@@ -361,6 +371,28 @@ def apply_authoritative_payment_observation(
 
     now = datetime.now(UTC)
     curr = PaymentStatus(payment.status)
+    observed_status = target_status
+    if expected_provider == PaymentProvider.VNPAY_SANDBOX.value and (
+        curr == PaymentStatus.UNKNOWN and target_status == PaymentStatus.PENDING
+    ):
+        # Pending evidence does not resolve uncertainty, but the observation must be durable.
+        target_status = curr
+    terminal_expected = {
+        PaymentStatus.SUCCEEDED: PaymentStatus.SUCCEEDED,
+        PaymentStatus.PARTIALLY_REFUNDED: PaymentStatus.SUCCEEDED,
+        PaymentStatus.REFUNDED: PaymentStatus.SUCCEEDED,
+        PaymentStatus.FAILED: PaymentStatus.FAILED,
+    }.get(curr)
+    preserve_terminal = observation_source == "VNPAY_IPN" and terminal_expected is not None
+    if preserve_terminal:
+        if (
+            target_status != terminal_expected
+            or (payment.provider_txn_no and provider_txn_no != payment.provider_txn_no)
+            or (payment.provider_pay_date and provider_pay_date != payment.provider_pay_date)
+        ):
+            force_reconciliation = True
+            reconciliation_note = "Signed VNPAY IPN conflicts with terminal payment"
+        target_status = curr
 
     # 3. Same-state replay path (Section 5.5: MUST validate payload_hash even on IntegrityError!)
     if curr == target_status:
@@ -373,7 +405,7 @@ def apply_authoritative_payment_observation(
                 order_id=payment.order_id,
                 merchant_id=payment.merchant_id,
                 payload_hash=payload_hash,
-                outcome=target_status.value,
+                outcome=observed_status.value,
                 response_json={"status": payment.status, "idempotent_same_state": True},
                 received_at=now,
                 processed_at=now,
@@ -400,6 +432,12 @@ def apply_authoritative_payment_observation(
         payment.last_observed_at = now
         if provider_txn_no and not payment.provider_txn_no:
             payment.provider_txn_no = provider_txn_no
+        if signature_verified and not preserve_terminal:
+            payment.signature_verified = True
+            payment.observation_source = observation_source
+            payment.provider_environment = provider_environment
+            payment.provider_response_code = provider_response_code
+            payment.provider_transaction_status = provider_transaction_status
         if force_reconciliation and not payment.reconciliation_required:
             payment.reconciliation_required = True
             payment.reconciliation_note = reconciliation_note

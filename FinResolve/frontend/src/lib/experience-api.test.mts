@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   computeAdaptivePollIntervalMs,
+  describeVnpayCapability,
   detectOverviewToasts,
   formatMetricOrEmpty,
   formatPercentOrEmpty,
@@ -9,6 +10,40 @@ import {
   translateBusinessEventVi,
   type OverviewToastInput,
 } from "./experience-utils.ts";
+
+test("Guardian separates VNPAY configuration, verified evidence, and unavailable QueryDR", () => {
+  const capability = {
+    vnpay_configured: true,
+    vnpay_evidence_sources: ["VNPAY_IPN" as const],
+    vnpay_querydr_available: false,
+  };
+  assert.deepEqual(describeVnpayCapability(capability, false), {
+    configuration: "Đã cấu hình Sandbox",
+    evidence: "Đã xác minh chữ ký qua IPN",
+    querydr: "Không khả dụng trong cấu hình hiện tại",
+  });
+  assert.equal(describeVnpayCapability(capability, true).configuration, "Chế độ chỉ xem");
+});
+
+test("Guardian distinguishes unknown capability from enabled QueryDR without live evidence", () => {
+  assert.deepEqual(describeVnpayCapability(undefined, false), {
+    configuration: "Chưa rõ cấu hình",
+    evidence: "Chưa đọc được bằng chứng",
+    querydr: "Chưa rõ cấu hình",
+  });
+  const configured = {
+    vnpay_configured: true,
+    vnpay_querydr_available: true,
+  };
+  assert.equal(
+    describeVnpayCapability({ ...configured, vnpay_evidence_sources: [] }, false).querydr,
+    "Đã bật trong cấu hình, chưa xác minh live",
+  );
+  assert.equal(
+    describeVnpayCapability({ ...configured, vnpay_evidence_sources: ["VNPAY_QUERYDR"] }, false).querydr,
+    "Đã ghi nhận phản hồi có chữ ký hợp lệ",
+  );
+});
 
 function makeOverview(
   overrides: Partial<OverviewToastInput> = {},

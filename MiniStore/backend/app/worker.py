@@ -27,14 +27,12 @@ logger = logging.getLogger("finshop.commerce.worker")
 
 
 def run_business_tick() -> dict[str, int]:
-    """Execute one bounded iteration of VNPAY QueryDr, order sync, and reservation expiry."""
+    """Execute one bounded iteration of order sync and reservation expiry."""
     maker = get_sessionmaker()
     with maker() as db:
-        queried = reconcile_pending_vnpay_payments(db)
         synced = sync_confirmed_payments_to_orders(db)
         expired = expire_stale_reservations(db)
     return {
-        "vnpay_queried": queried,
         "synced_orders": synced,
         "expired_reservations": expired,
     }
@@ -71,6 +69,20 @@ def _outbox_loop(stop_flag: threading.Event, poll_s: float) -> None:
     logger.info("FinShop LIVE Outbox delivery thread stopped.")
 
 
+def _querydr_loop(stop_flag: threading.Event, poll_s: float) -> None:
+    settings = get_settings()
+    maker = get_sessionmaker()
+    while not stop_flag.is_set():
+        try:
+            with maker() as db:
+                reconcile_pending_vnpay_payments(
+                    db, limit=1, lease_seconds=int(settings.vnpay_timeout_seconds * 4) + 15
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning("VNPAY QueryDR worker iteration failed")
+        stop_flag.wait(timeout=poll_s)
+
+
 def run_worker_forever() -> None:
     logging.basicConfig(level=logging.INFO)
     stop_flag = threading.Event()
@@ -93,6 +105,12 @@ def run_worker_forever() -> None:
         daemon=True,
     )
     outbox_thread.start()
+    querydr_thread = None
+    if settings.is_vnpay_configured and settings.vnpay_querydr_enabled:
+        querydr_thread = threading.Thread(
+            target=_querydr_loop, args=(stop_flag, biz_poll_s), name="finshop-querydr", daemon=True
+        )
+        querydr_thread.start()
 
     logger.info("FinShop LIVE Core Business worker started (poll=%.1fs)", biz_poll_s)
     while not stop_flag.is_set():
@@ -105,6 +123,8 @@ def run_worker_forever() -> None:
         stop_flag.wait(timeout=biz_poll_s)
 
     outbox_thread.join(timeout=5.0)
+    if querydr_thread is not None:
+        querydr_thread.join(timeout=5.0)
     logger.info("FinShop LIVE Commerce worker stopped cleanly.")
 
 

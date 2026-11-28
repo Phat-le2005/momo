@@ -23,6 +23,11 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
+from app.connectors.commerce import (
+    CommerceConnectorError,
+    CommerceReadConnector,
+    CommerceVnpayCapability,
+)
 from app.core.config import LOCAL_DEV_ENVIRONMENTS, get_settings
 from app.core.rate_limit import enforce_session_creation_rate_limit
 from app.core.session import get_current_session
@@ -377,6 +382,27 @@ def bootstrap_experience(
 
     # Configurable public browser-visible MiniStore URL (never internal docker hostname)
     storefront_url = settings.commerce_public_storefront_url.strip() or "http://localhost:3100"
+    vnpay = CommerceVnpayCapability()
+    if workspace_role == "CONTROLLER" and binding:
+        try:
+            connector = CommerceReadConnector(
+                base_url=settings.commerce_service_base_url,
+                service_key=settings.commerce_service_key.get_secret_value(),
+                merchant_id=binding.merchant_id,
+                commerce_session_id=binding.commerce_session_id,
+                world_epoch=binding.commerce_world_epoch,
+                timeout_seconds=1,
+                max_retries=0,
+            )
+            vnpay = connector.get_vnpay_capability()
+        except (CommerceConnectorError, ValueError):
+            pass
+    if vnpay.vnpay_configured or vnpay.vnpay_evidence_sources:
+        environment_name = "FinShop LIVE Sandbox · Quan sát VNPAY"
+    elif workspace_role == "READ_ONLY_PREVIEW" or vnpay.vnpay_configured is False:
+        environment_name = "FinShop LIVE Sandbox (MOCK)"
+    else:
+        environment_name = "FinShop LIVE Sandbox"
 
     return ExperienceBootstrapResponse(
         status=overall,
@@ -390,7 +416,7 @@ def bootstrap_experience(
             "workspace_role": workspace_role,
         },
         sandbox={
-            "environment_name": "FinShop LIVE Sandbox (MOCK)",
+            "environment_name": environment_name,
             "sandbox_isolation_mode": _sandbox_isolation_mode(eff_csess),
             "workspace_role": workspace_role,
             "merchant_id": binding.merchant_id if binding else eff_merchant,
@@ -399,7 +425,8 @@ def bootstrap_experience(
             "binding_id": binding.id if binding else None,
             "connectivity_status": conn_status,
             "storefront_url": storefront_url,
-            "vnpay_enabled": False,
+            "vnpay_enabled": vnpay.vnpay_configured is True,
+            **vnpay.model_dump(),
         },
         guardian={
             "worker_healthy": worker_ok,

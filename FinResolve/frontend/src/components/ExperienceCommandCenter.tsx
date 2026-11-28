@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useMemo, useState } from "react";
 import { GuardianBadge } from "@/components/GuardianBadge";
 import { useExperience } from "@/hooks/useExperience";
+import { describeVnpayCapability } from "@/lib/experience-utils";
 import {
   formatMetricOrEmpty,
   formatPercentOrEmpty,
@@ -134,13 +135,14 @@ export function ExperienceCommandCenter() {
   const modelMode = guardian?.model_mode ?? bootstrap?.guardian.model_mode ?? "DEMO_RULES";
   const modelName = guardian?.model_name ?? bootstrap?.guardian.model_name ?? "deterministic-demo";
   const storefrontUrl = bootstrap?.sandbox.storefront_url ?? "http://localhost:3100";
-  const envName = bootstrap?.sandbox.environment_name ?? "FinShop LIVE Sandbox (MOCK)";
+  const envName = bootstrap?.sandbox.environment_name ?? "FinShop LIVE Sandbox";
   const workspaceRole =
     overview?.workspace_role ??
     bootstrap?.session.workspace_role ??
     bootstrap?.sandbox.workspace_role ??
     "CONTROLLER";
   const isReadOnlyPreview = workspaceRole === "READ_ONLY_PREVIEW";
+  const vnpay = describeVnpayCapability(bootstrap?.sandbox, isReadOnlyPreview);
 
   const navItems = useMemo(
     () => [
@@ -511,9 +513,11 @@ export function ExperienceCommandCenter() {
 
           <div className="border-t border-[#E2E8F0] p-4 text-xs text-[#64748B]">
             <p className="font-semibold text-[#0F172A]">Chế độ an toàn</p>
-            <p className="mt-1 leading-relaxed">
-              LOCAL_MOCK Sandbox · VNPAY đang tắt có chủ đích.
-            </p>
+            <div className="mt-1 space-y-1 leading-relaxed" aria-label="Trạng thái VNPAY Sandbox">
+              <p><strong>VNPAY</strong> · {vnpay.configuration}</p>
+              <p><strong>Bằng chứng</strong> · {vnpay.evidence}</p>
+              <p><strong>QueryDR</strong> · {vnpay.querydr}</p>
+            </div>
             {overview && (
               <p className="mt-2 font-mono text-[11px] text-[#94A3B8]">
                 {overview.session_id} · Epoch #{overview.world_epoch}
@@ -864,9 +868,9 @@ export function ExperienceCommandCenter() {
                   <div className="mt-5 rounded-xl border border-[#FDE68A] bg-[#FFFBEB] p-4 text-xs leading-relaxed text-[#92400E]">
                     <p className="font-semibold">Nguyên tắc bảo mật Sandbox</p>
                     <p className="mt-1">
-                      Khóa Chaos Admin và khóa ký HMAC chỉ tồn tại ở backend. Các thao tác tiêm lỗi
-                      cấp quản trị không được mở công khai trên trình duyệt khách; hệ thống chỉ thực
-                      thi qua kênh xác thực máy chủ và luôn giữ VNPAY ở trạng thái tắt.
+                      Khóa quản trị và khóa ký HMAC chỉ tồn tại ở backend. FinResolve đọc dữ liệu
+                      VNPAY có phạm vi qua kết nối máy chủ được xác thực. Các thao tác tài chính
+                      VNPAY nằm ngoài quyền của Guardian.
                     </p>
                   </div>
                 </section>

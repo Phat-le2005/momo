@@ -13,6 +13,7 @@ export const COMMERCE_API_BASE =
   process.env.NEXT_PUBLIC_COMMERCE_API_BASE_URL !== undefined
     ? process.env.NEXT_PUBLIC_COMMERCE_API_BASE_URL
     : "http://localhost:8100";
+export const VNPAY_SANDBOX_STOREFRONT = process.env.NEXT_PUBLIC_FINSHOP_VNPAY_SANDBOX === "true";
 
 const CUSTOMER_TOKEN_STORAGE_KEY = "finshop_customer_token_v2";
 const MERCHANT_TOKEN_STORAGE_KEY = "finshop_merchant_token_v2";

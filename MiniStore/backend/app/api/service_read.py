@@ -8,13 +8,14 @@ to merchant_id & commerce_session_id) + `X-Merchant-Id` + `X-Commerce-Session-Id
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.auth import ServicePrincipal, get_service_principal
+from app.core.config import get_settings
 from app.core.errors import CommerceError, ErrorCode
 from app.db.session import get_db
 from app.models.entities import (
@@ -30,10 +31,74 @@ from app.models.entities import (
     RefundTransaction,
     VoucherRedemption,
 )
-from app.models.enums import OrderStatus, OutboxStatus, PaymentStatus, ReconciliationStatus
+from app.models.enums import (
+    ObservationProvenance,
+    OrderStatus,
+    OutboxStatus,
+    PaymentProvider,
+    PaymentStatus,
+    ReconciliationStatus,
+)
 from app.payments.adapter import build_payment_observation
 
 router = APIRouter(prefix="/service", tags=["service-read-connectors"])
+
+
+@router.get("/payment-capabilities")
+def service_payment_capabilities(
+    principal: ServicePrincipal = Depends(get_service_principal),
+    db: Session = Depends(get_db),
+) -> dict[str, bool | list[Literal["VNPAY_IPN", "VNPAY_QUERYDR"]]]:
+    """Read local configuration and accepted Sandbox evidence in the caller's scope."""
+    settings = get_settings()
+    provider = PaymentProvider.VNPAY_SANDBOX.value
+    provenance = ObservationProvenance.VNPAY_SANDBOX.value
+    scoped_payment = (
+        Payment.merchant_id == principal.merchant_id,
+        Payment.commerce_session_id == principal.commerce_session_id,
+        Order.merchant_id == principal.merchant_id,
+        Order.commerce_session_id == principal.commerce_session_id,
+        Order.world_epoch == principal.world_epoch,
+        Payment.provider == provider,
+        Payment.provider_environment == provenance,
+    )
+    sources: list[Literal["VNPAY_IPN", "VNPAY_QUERYDR"]] = []
+    if db.scalar(
+        select(Payment.id)
+        .join(Order, Payment.order_id == Order.id)
+        .where(
+            *scoped_payment,
+            Payment.signature_verified.is_(True),
+            Payment.observation_source == "VNPAY_IPN",
+        )
+        .limit(1)
+    ):
+        sources.append("VNPAY_IPN")
+    if db.scalar(
+        select(PaymentQueryAttempt.id)
+        .join(Payment, PaymentQueryAttempt.payment_id == Payment.id)
+        .join(Order, Payment.order_id == Order.id)
+        .where(
+            *scoped_payment,
+            PaymentQueryAttempt.order_id == Order.id,
+            PaymentQueryAttempt.merchant_id == principal.merchant_id,
+            PaymentQueryAttempt.provider == provider,
+            PaymentQueryAttempt.observation_provenance == provenance,
+            PaymentQueryAttempt.command == "querydr",
+            PaymentQueryAttempt.http_status == 200,
+            PaymentQueryAttempt.provider_response_code == "00",
+            PaymentQueryAttempt.signature_verified.is_(True),
+            PaymentQueryAttempt.mapped_payment_status.is_not(None),
+            PaymentQueryAttempt.error_message.is_(None),
+        )
+        .limit(1)
+    ):
+        sources.append("VNPAY_QUERYDR")
+    return {
+        "vnpay_configured": settings.is_vnpay_configured,
+        "vnpay_querydr_available": settings.is_vnpay_configured and settings.vnpay_querydr_enabled,
+        "vnpay_evidence_sources": sources,
+    }
 
 
 @router.get("/orders")

@@ -80,3 +80,16 @@ def enforce_payment_rate_limit(request: Request) -> None:
             status_code=429,
             details={"retry_after_seconds": retry},
         )
+
+
+def enforce_vnpay_ipn_rate_limit(request: Request) -> None:
+    """Charge an authenticated VNPAY IPN against the provider's separate quota."""
+    limit = get_settings().rate_limit_payment_per_minute
+    ok, retry = _limiter.check(f"vnpay-ipn:{_client_ip(request)}", limit=limit)
+    if not ok:
+        raise CommerceError(
+            ErrorCode.RATE_LIMITED,
+            f"Too many VNPAY notifications; retry in {retry}s",
+            status_code=429,
+            details={"retry_after_seconds": retry},
+        )

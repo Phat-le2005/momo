@@ -14,11 +14,11 @@ Security & Boundary Invariants:
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from app.core.config import get_settings
 
@@ -64,6 +64,12 @@ class CommerceMetricsSnapshot(BaseModel):
     succeeded_payments: int = 0
     unsynced_payments: int = 0
     outbox_lag_count: int = 0
+
+
+class CommerceVnpayCapability(BaseModel):
+    vnpay_configured: StrictBool | None = None
+    vnpay_querydr_available: StrictBool | None = None
+    vnpay_evidence_sources: list[Literal["VNPAY_IPN", "VNPAY_QUERYDR"]] | None = None
 
 
 def validate_approved_commerce_url(base_url: str) -> str:
@@ -257,6 +263,10 @@ class CommerceReadConnector:
     def get_metrics(self) -> tuple[CommerceMetricsSnapshot, datetime]:
         raw, observed_at = self._request_json("/api/v1/service/metrics")
         return CommerceMetricsSnapshot.model_validate(raw), observed_at
+
+    def get_vnpay_capability(self) -> CommerceVnpayCapability:
+        raw, _ = self._request_json("/api/v1/service/payment-capabilities")
+        return CommerceVnpayCapability.model_validate(raw)
 
     def get_telemetry(self) -> tuple[dict[str, Any], datetime]:
         raw, observed_at = self._request_json("/api/v1/service/telemetry")

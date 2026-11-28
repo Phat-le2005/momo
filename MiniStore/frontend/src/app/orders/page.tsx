@@ -6,6 +6,7 @@ import { StoreShell } from "@/components/StoreShell";
 import {
   type CustomerIdentityDTO,
   type OrderDTO,
+  VNPAY_SANDBOX_STOREFRONT,
   commerceFetch,
   ensureCustomerBootstrap,
 } from "@/lib/commerce-api";
@@ -194,7 +195,7 @@ export default function OrdersPage() {
                         href={`/checkout?order_id=${encodeURIComponent(ord.id)}`}
                         className="rounded-xl bg-[#fe2c55] px-3 py-1.5 text-xs font-bold text-white"
                       >
-                        Thanh toán MOCK
+                        {ord.payment?.provider === "VNPAY_SANDBOX" ? "Xem thanh toán" : "Thanh toán MOCK"}
                       </Link>
                       <button
                         type="button"
@@ -205,7 +206,7 @@ export default function OrdersPage() {
                       </button>
                     </>
                   )}
-                  {(ord.payment_status === "SUCCEEDED" ||
+                  {!VNPAY_SANDBOX_STOREFRONT && (ord.payment_status === "SUCCEEDED" ||
                     ord.payment_status === "PARTIALLY_REFUNDED") && (
                     <button
                       type="button"
@@ -220,13 +221,15 @@ export default function OrdersPage() {
                       Yêu cầu hoàn tiền
                     </button>
                   )}
-                  <button
-                    type="button"
-                    onClick={() => setActiveComplaintOrder(ord.id)}
-                    className="rounded-xl border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700"
-                  >
-                    Gửi khiếu nại
-                  </button>
+                  {!VNPAY_SANDBOX_STOREFRONT && (
+                    <button
+                      type="button"
+                      onClick={() => setActiveComplaintOrder(ord.id)}
+                      className="rounded-xl border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700"
+                    >
+                      Gửi khiếu nại
+                    </button>
+                  )}
                 </div>
               </div>
             </article>

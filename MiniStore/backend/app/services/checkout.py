@@ -406,6 +406,10 @@ def create_order_from_items(
             status_code=400,
         )
     norm_pm = payment_method.strip().upper()
+    if norm_pm == "LOCAL_MOCK" and get_settings().vnpay_only_checkout:
+        raise CommerceError(
+            ErrorCode.FORBIDDEN, "LOCAL_MOCK is disabled in this profile", status_code=403
+        )
     if norm_pm not in {"LOCAL_MOCK", "VNPAY_SANDBOX"}:
         raise CommerceError(
             ErrorCode.BAD_REQUEST,

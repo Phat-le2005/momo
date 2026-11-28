@@ -122,8 +122,90 @@ def _sign_response_pipe(data: dict[str, str], secret: str) -> str:
         "vnp_TransactionStatus",
         "vnp_OrderInfo",
     )
+    if data.get("vnp_Command") == "querydr":
+        fields += ("vnp_PromotionCode", "vnp_PromotionAmount")
     raw = "|".join(data.get(f, "") for f in fields)
     return hmac.new(secret.encode("utf-8"), raw.encode("utf-8"), hashlib.sha512).hexdigest()
+
+
+def test_querydr_research_vectors_and_malformed_signatures() -> None:
+    key = "VNPAY-RESEARCH-FAKE-KEY-DO-NOT-USE"
+    body = {
+        "vnp_ResponseId": "RESP0001",
+        "vnp_Command": "querydr",
+        "vnp_ResponseCode": "00",
+        "vnp_Message": "Query success",
+        "vnp_TmnCode": "DEMO0001",
+        "vnp_TxnRef": "FS001",
+        "vnp_Amount": 12_500_000,
+        "vnp_BankCode": "NCB",
+        "vnp_PayDate": "20261129103100",
+        "vnp_TransactionNo": "12345678",
+        "vnp_TransactionType": "01",
+        "vnp_TransactionStatus": "00",
+        "vnp_OrderInfo": "Truy van giao dich FS001",
+    }
+    empty_slots = (
+        "feeb35da0213e790ad12861177d00c39c5f876b8f23cd7cd10d650cec605aa6ad0"
+        "f3ead4606be1e99d7155ac7a1bef95bcf4ab58d95de4886debc54c263af0b5"
+    )
+    zero_promotion = (
+        "12527ae3cb7769457e2d8a30aa883db43f3a115b8bfb5a00f5b9fd0fcab39b522"
+        "e171ce1e08ff260cbce975083dfdc8f7708572d020595abe1838203f32aa5b5"
+    )
+    legacy = (
+        "1d3f89211542473d6c9eb19683bed2789cf0005409e209b8566419bd4588e12f"
+        "6e2f0ed90a4cc437bcc06e3f32df0c128dc104c3a25e23587c3957f238e9741f"
+    )
+    assert verify_querydr_response_signature(
+        {**body, "vnp_SecureHash": empty_slots}, hash_secret=key
+    )
+    promo = {**body, "vnp_PromotionCode": "123", "vnp_PromotionAmount": 0}
+    assert verify_querydr_response_signature(
+        {**promo, "vnp_SecureHash": zero_promotion}, hash_secret=key
+    )
+    for invalid in (legacy, "đ" * 128, "", "f" * 10000):
+        assert not verify_querydr_response_signature(
+            {**body, "vnp_SecureHash": invalid}, hash_secret=key
+        )
+
+
+def test_pay_and_ipn_independent_canonical_vectors() -> None:
+    from urllib.parse import parse_qsl
+
+    key = "VNPAY-RESEARCH-FAKE-KEY-DO-NOT-USE"
+    pay = (
+        "vnp_Amount=12500000&vnp_Command=pay&vnp_CreateDate=20261129103000&vnp_CurrCode=VND"
+        "&vnp_ExpireDate=20261129104500&vnp_IpAddr=127.0.0.1&vnp_Locale=vn"
+        "&vnp_OrderInfo=Thanh+toan+don+hang+FS001&vnp_OrderType=other"
+        "&vnp_ReturnUrl=https%3A%2F%2Fshop.example.test%2Fpayment%2Fvnpay%2Freturn"
+        "&vnp_TmnCode=DEMO0001&vnp_TxnRef=FS001&vnp_Version=2.1.0"
+    )
+    expected = (
+        "21c3718acbcd657acb7639c113b69567c65940bbbf0bffd53bb3bec6f05fb0ed8c"
+        "46b7345233f24cebbf627e46653555f4a598d13fd70bbc8ec37d5b919edb78"
+    )
+    url, digest = build_vnpay_payment_url(
+        "https://sandbox.vnpaytest.vn/paymentv2/vpcpay.html",
+        dict(reversed(parse_qsl(pay))),
+        hash_secret=key,
+    )
+    assert digest == expected
+    assert url.split("?", 1)[1] == f"{pay}&vnp_SecureHash={expected}"
+    ipn = dict(
+        parse_qsl(
+            "vnp_Amount=12500000&vnp_BankCode=NCB&vnp_BankTranNo=TEST123&vnp_CardType=ATM"
+            "&vnp_OrderInfo=Thanh+toan+don+hang+FS001&vnp_PayDate=20261129103100"
+            "&vnp_ResponseCode=00&vnp_TmnCode=DEMO0001&vnp_TransactionNo=12345678"
+            "&vnp_TransactionStatus=00&vnp_TxnRef=FS001"
+        )
+    )
+    ipn["vnp_SecureHash"] = (
+        "ab05ead5566c8a55c95debce622242a4b464dbf4b6192eee28866ae438b8e4323"
+        "da358e29b0cb0e0e1ab2330d972ab52026807df95bb0477b370bb3204750559"
+    )
+    assert verify_vnpay_params_signature({**ipn, "edge_tag": "ignored"}, hash_secret=key)
+    assert not verify_vnpay_params_signature({**ipn, "vnp_Amount": "12500100"}, hash_secret=key)
 
 
 # --- 1. Provider Configuration & Production URL Rejection ---
@@ -155,7 +237,7 @@ def test_provider_configuration_defaults_and_production_url_rejection(
     assert res.status_code == 503
 
     # Production VNPAY URL MUST be rejected at config validation
-    with pytest.raises(ValueError, match="not an approved VNPAY Sandbox host"):
+    with pytest.raises(ValueError, match="approved VNPAY Sandbox endpoint"):
         CommerceSettings(
             app_env="test",
             vnpay_payment_url="https://pay.vnpay.vn/vpcpay.html",
@@ -241,6 +323,24 @@ def test_vnpay_210_signing_encoding_and_amount_conversion() -> None:
 
 
 # --- 3. VNPAY Payment Creation, ReturnURL Read-Only & IPN Protocol ---
+def test_ipn_quota_admits_authenticated_callback_after_unsigned_traffic(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_vnpay(monkeypatch)
+    monkeypatch.setenv("COMMERCE_RATE_LIMIT_PAYMENT_PER_MINUTE", "1")
+    get_settings.cache_clear()
+    path = "/api/v1/payments/vnpay/ipn"
+    payload = {"vnp_TmnCode": TEST_TMN_CODE, "vnp_TxnRef": "SYNTHETIC_UNKNOWN"}
+    for _ in range(3):
+        assert client.get(path, params=payload).json()["RspCode"] == "97"
+
+    payload["vnp_SecureHash"] = sign_vnpay_params(payload, hash_secret=TEST_HASH_SECRET)
+    assert client.get(path, params=payload).json()["RspCode"] == "01"
+    throttled = client.get(path, params=payload)
+    assert throttled.status_code == 200
+    assert throttled.json()["RspCode"] == "99"
+
+
 def test_vnpay_checkout_return_url_and_ipn_lifecycle(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -364,6 +464,8 @@ def test_vnpay_querydr_reconciliation_and_timeout_handling(
 ) -> None:
     """QueryDr recovers missing IPN, rejects bad signatures, preserves UNKNOWN on timeout."""
     _enable_vnpay(monkeypatch)
+    monkeypatch.setenv("COMMERCE_VNPAY_QUERYDR_SERVER_IP", "192.0.2.15")
+    get_settings.cache_clear()
     cust = _guest(client, "QueryDr User")
 
     co = client.post(
@@ -420,8 +522,21 @@ def test_vnpay_querydr_reconciliation_and_timeout_handling(
         )
         assert obs_bad.status == PaymentStatus.UNKNOWN.value
 
-    # 3. Valid signed QueryDr response recovers missing IPN -> SUCCEEDED!
-    def _ok_handler(_req: httpx.Request) -> httpx.Response:
+    def _unsigned_error_handler(req: httpx.Request) -> httpx.Response:
+        payload = json.loads(req.content)
+        assert payload["vnp_IpAddr"] == "192.0.2.15"
+        return httpx.Response(
+            200, json={"vnp_ResponseCode": "99", "vnp_Message": "Unexpected error"}
+        )
+
+    unsigned_client = VNPayHttpClient(transport=httpx.MockTransport(_unsigned_error_handler))
+    with get_sessionmaker()() as db:
+        observation = VNPaySandboxAdapter(http_client=unsigned_client).query_payment_status(
+            db, payment_id=pay["id"]
+        )
+        assert observation.status == PaymentStatus.UNKNOWN.value
+
+    def _signed_query_response(transaction_status: str) -> httpx.Response:
         body = {
             "vnp_ResponseId": "RESP-OK-1",
             "vnp_Command": "querydr",
@@ -434,14 +549,25 @@ def test_vnpay_querydr_reconciliation_and_timeout_handling(
             "vnp_PayDate": "20261125135100",
             "vnp_TransactionNo": "14499002",
             "vnp_TransactionType": "01",
-            "vnp_TransactionStatus": "00",
+            "vnp_TransactionStatus": transaction_status,
             "vnp_OrderInfo": "Query",
         }
         body["vnp_SecureHash"] = _sign_response_pipe(body, TEST_HASH_SECRET)
         assert verify_querydr_response_signature(body, hash_secret=TEST_HASH_SECRET)
         return httpx.Response(200, json=body)
 
-    ok_client = VNPayHttpClient(transport=httpx.MockTransport(_ok_handler))
+    pending_client = VNPayHttpClient(
+        transport=httpx.MockTransport(lambda _: _signed_query_response("01"))
+    )
+    with get_sessionmaker()() as db:
+        observation = VNPaySandboxAdapter(http_client=pending_client).query_payment_status(
+            db, payment_id=pay["id"]
+        )
+        assert observation.status == PaymentStatus.UNKNOWN.value
+
+    ok_client = VNPayHttpClient(
+        transport=httpx.MockTransport(lambda _: _signed_query_response("00"))
+    )
     with get_sessionmaker()() as db:
         obs_ok = VNPaySandboxAdapter(http_client=ok_client).query_payment_status(
             db, payment_id=pay["id"]
@@ -455,10 +581,25 @@ def test_vnpay_querydr_reconciliation_and_timeout_handling(
                 select(PaymentQueryAttempt).where(PaymentQueryAttempt.payment_id == pay["id"])
             ).all()
         )
-        assert len(attempts) == 3
+        assert len(attempts) == 5
+        errors = {attempt.error_message for attempt in attempts}
+        assert "VNPAY QueryDR response signature missing" in errors
+        assert "VNPAY QueryDR response signature invalid" in errors
+        assert any(
+            attempt.signature_verified and attempt.mapped_payment_status == PaymentStatus.PENDING
+            for attempt in attempts
+        )
 
         # Completed payment is NOT queried again by background reconciler
         assert reconcile_pending_vnpay_payments(db, http_client=ok_client) == 0
+
+    # An unsigned query error cannot undermine payment evidence already verified.
+    with get_sessionmaker()() as db:
+        observation = VNPaySandboxAdapter(http_client=unsigned_client).query_payment_status(
+            db, payment_id=pay["id"]
+        )
+        assert observation.status == PaymentStatus.SUCCEEDED.value
+        assert observation.signature_verified is True
 
 
 # --- 5. Capability-Gated VNPAY Refund API ---

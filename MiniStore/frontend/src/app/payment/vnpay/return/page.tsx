@@ -26,16 +26,21 @@ interface ReturnVerifyResponse {
   payment: PaymentDTO;
 }
 
-function VnpayReturnContent() {
-  const searchParams = useSearchParams();
+function VnpayReturnContent({ queryString }: { queryString: string }) {
   const [customer, setCustomer] = useState<CustomerIdentityDTO | null>(null);
   const [result, setResult] = useState<ReturnVerifyResponse | null>(null);
-  const queryString = searchParams.toString();
   const missingParams = !queryString;
   const [error, setError] = useState<string | null>(
     missingParams ? "Thiếu tham số phản hồi từ cổng thanh toán VNPAY Sandbox." : null,
   );
   const [loading, setLoading] = useState(!missingParams);
+  const [pollExpired, setPollExpired] = useState(false);
+  const orderId = result?.order.id;
+  const paymentStatus = result?.payment.status;
+  const orderStatus = result?.order.status;
+  const awaitingPaymentEvidence = paymentStatus === "PENDING" || paymentStatus === "INITIATED";
+  const awaitingOrderSync = paymentStatus === "SUCCEEDED" && orderStatus === "PENDING_PAYMENT";
+  const shouldPoll = (awaitingPaymentEvidence && orderStatus !== "CANCELLED") || awaitingOrderSync;
 
   useEffect(() => {
     if (!queryString) return;
@@ -67,34 +72,47 @@ function VnpayReturnContent() {
     };
   }, [queryString]);
 
-  // Poll persisted authoritative order/payment state while PENDING or INITIATED
+  // Poll persisted state sequentially and stop after a bounded wait.
   useEffect(() => {
-    if (!result) return;
-    const pStatus = result.payment.status;
-    if (pStatus !== "PENDING" && pStatus !== "INITIATED") return;
-
-    const timer = setInterval(async () => {
+    if (!orderId || !shouldPoll) return;
+    const controller = new AbortController();
+    const expiresAt = Date.now() + 90_000;
+    let timer: ReturnType<typeof setTimeout>;
+    async function poll() {
+      if (!orderId || controller.signal.aborted) return;
+      if (Date.now() >= expiresAt) {
+        setPollExpired(true);
+        return;
+      }
       try {
         const detail = await commerceFetch<{ order: OrderDTO }>(
-          `/api/v1/store/orders/${encodeURIComponent(result.order.id)}`,
+          `/api/v1/store/orders/${encodeURIComponent(orderId)}`,
+          { signal: controller.signal },
         );
-        if (detail.order.payment) {
+        const payment = detail.order.payment;
+        if (payment && !controller.signal.aborted) {
           setResult((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  order: detail.order,
-                  payment: detail.order.payment as PaymentDTO,
-                }
+            prev?.order.id === orderId
+              ? { ...prev, order: detail.order, payment }
               : prev,
           );
         }
       } catch {
-        // ignore transient poll errors
+        // A transient error does not change the displayed payment state.
       }
-    }, 3000);
-    return () => clearInterval(timer);
-  }, [result]);
+      if (!controller.signal.aborted) timer = setTimeout(poll, 3000);
+    }
+    timer = setTimeout(poll, 3000);
+    const stop = setTimeout(() => {
+      controller.abort();
+      setPollExpired(true);
+    }, 90_000);
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+      clearTimeout(stop);
+    };
+  }, [orderId, queryString, shouldPoll]);
 
   return (
     <StoreShell customerName={customer?.display_name}>
@@ -167,9 +185,14 @@ function VnpayReturnContent() {
                 )}
               </div>
 
-              {(result.payment.status === "PENDING" || result.payment.status === "INITIATED") && (
+              {(shouldPoll || paymentStatus === "UNKNOWN" ||
+                (awaitingPaymentEvidence && orderStatus === "CANCELLED")) && (
                 <p className="text-center text-xs font-semibold text-blue-700">
-                  Đang xác minh giao dịch qua IPN / QueryDr tự động... Trang sẽ tự cập nhật mỗi 3 giây.
+                  {paymentStatus === "UNKNOWN" || orderStatus === "CANCELLED" || pollExpired
+                    ? "Giao dịch chưa được xác nhận đầy đủ. Hãy đối chiếu trong lịch sử đơn hàng trước khi thử thanh toán lại."
+                    : awaitingOrderSync
+                      ? "Đã xác minh thanh toán. Trang sẽ cập nhật khi đơn hàng được đồng bộ."
+                      : "Đang chờ thông báo xác thực từ VNPAY. Trang sẽ tự cập nhật."}
                 </p>
               )}
 
@@ -192,12 +215,17 @@ function VnpayReturnContent() {
   );
 }
 
+function VnpayReturnRoute() {
+  const queryString = useSearchParams().toString();
+  return <VnpayReturnContent key={queryString} queryString={queryString} />;
+}
+
 export default function VnpayReturnPage() {
   return (
     <Suspense
       fallback={<div className="p-8 text-center text-sm">Đang kiểm tra kết quả VNPAY...</div>}
     >
-      <VnpayReturnContent />
+      <VnpayReturnRoute />
     </Suspense>
   );
 }

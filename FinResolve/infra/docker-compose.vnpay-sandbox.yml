@@ -1,0 +1,89 @@
+# Opt-in overlay. Always use a distinct project and private env file.
+x-vnpay: &vnpay
+  COMMERCE_VNPAY_ENABLED: "true"
+  COMMERCE_VNPAY_REFUND_ENABLED: "false"
+  COMMERCE_VNPAY_ONLY_CHECKOUT: "true"
+  COMMERCE_VNPAY_PAYMENT_URL: https://sandbox.vnpaytest.vn/paymentv2/vpcpay.html
+  COMMERCE_VNPAY_API_URL: https://sandbox.vnpayment.vn/merchant_webapi/api/transaction
+  COMMERCE_VNPAY_RETURN_URL: https://${VNPAY_SANDBOX_SHOP_HOST:?sandbox storefront hostname required}/payment/vnpay/return
+  COMMERCE_VNPAY_IPN_PUBLIC_URL: https://${VNPAY_SANDBOX_IPN_HOST:?sandbox IPN hostname required}/api/v1/payments/vnpay/ipn
+  COMMERCE_VNPAY_QUERYDR_ENABLED: "false"
+  COMMERCE_VNPAY_QUERYDR_MIN_AGE_SECONDS: "930"
+  COMMERCE_VNPAY_QUERYDR_SERVER_IP: ${COMMERCE_VNPAY_QUERYDR_SERVER_IP:-127.0.0.1}
+  COMMERCE_WEB_ORIGIN: https://${VNPAY_SANDBOX_SHOP_HOST:?sandbox storefront hostname required}
+  COMMERCE_ENABLE_MOCK_PAYMENT_TEST_API: "false"
+  COMMERCE_RECOVERY_WRITE_ENABLED: "false"
+  COMMERCE_CHAOS_ENABLED: "false"
+
+services:
+  db:
+    ports: !reset []
+  api:
+    environment:
+      MODEL_PROVIDER: ""
+      MODEL_API_KEY: ""
+      COMMERCE_PUBLIC_STOREFRONT_URL: https://${VNPAY_SANDBOX_SHOP_HOST:?sandbox storefront hostname required}
+    ports: !override ["127.0.0.1:8001:8000"]
+  worker:
+    environment:
+      MODEL_PROVIDER: ""
+      MODEL_API_KEY: ""
+      AUTONOMOUS_RECOVERY_ENABLED: "false"
+  monitor-worker:
+    healthcheck:
+      test: ["CMD", "python", "-c", "from pathlib import Path; from app.db.session import get_engine; from sqlalchemy import text; assert b'app.monitoring.worker' in Path('/proc/1/cmdline').read_bytes(); db=get_engine().connect(); db.execute(text('select 1')); db.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  web:
+    build:
+      args:
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:8001
+    ports: !override ["127.0.0.1:3001:3000"]
+  commerce-db:
+    ports: !reset []
+  commerce-api:
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8100 --no-access-log --no-proxy-headers"]
+    ports: !reset []
+    environment:
+      <<: *vnpay
+      COMMERCE_VNPAY_TMN_CODE: ${COMMERCE_VNPAY_TMN_CODE:?sandbox merchant ID required}
+      COMMERCE_VNPAY_HASH_SECRET: ${COMMERCE_VNPAY_HASH_SECRET:?sandbox hash secret required}
+  commerce-worker:
+    environment:
+      <<: *vnpay
+      COMMERCE_VNPAY_TMN_CODE: ${COMMERCE_VNPAY_TMN_CODE:?sandbox merchant ID required}
+      COMMERCE_VNPAY_HASH_SECRET: ${COMMERCE_VNPAY_HASH_SECRET:?sandbox hash secret required}
+    healthcheck:
+      test: ["CMD", "python", "-c", "from pathlib import Path; from app.db.session import get_engine; from sqlalchemy import text; assert b'app.worker' in Path('/proc/1/cmdline').read_bytes(); db=get_engine().connect(); db.execute(text('select 1')); db.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  commerce-web:
+    ports: !reset []
+    build:
+      args:
+        NEXT_PUBLIC_COMMERCE_API_BASE_URL: ""
+        NEXT_PUBLIC_FINSHOP_VNPAY_SANDBOX: "true"
+  gateway:
+    build:
+      context: ../../MiniStore/backend
+      dockerfile: Dockerfile
+    command: ["uvicorn", "app.gateway:gateway_app", "--host", "0.0.0.0", "--port", "8200", "--no-access-log", "--no-proxy-headers"]
+    environment:
+      COMMERCE_PUBLIC_GATEWAY_ENABLED: "true"
+      COMMERCE_PUBLIC_BASE_URL: https://${VNPAY_SANDBOX_SHOP_HOST:?sandbox storefront hostname required}
+      COMMERCE_PUBLIC_IPN_HOST: ${VNPAY_SANDBOX_IPN_HOST:?sandbox IPN hostname required}
+      COMMERCE_GATEWAY_API_UPSTREAM: http://commerce-api:8100
+      COMMERCE_GATEWAY_WEB_UPSTREAM: http://commerce-web:3100
+    ports: ["127.0.0.1:8200:8200"]
+    depends_on:
+      commerce-api:
+        condition: service_healthy
+      commerce-web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8200/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

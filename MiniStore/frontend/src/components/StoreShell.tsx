@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
+import { VNPAY_SANDBOX_STOREFRONT } from "@/lib/commerce-api";
 
 type NavKey = "home" | "live" | "cart" | "orders" | "profile";
 
@@ -80,7 +81,7 @@ export function StoreShell({
                 FinShop <span className="text-[#fe2c55]">LIVE</span>
               </span>
               <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold tracking-wide text-slate-600">
-                MOCK SANDBOX
+                {VNPAY_SANDBOX_STOREFRONT ? "VNPAY SANDBOX" : "MOCK SANDBOX"}
               </span>
             </div>
           </Link>
@@ -120,12 +121,14 @@ export function StoreShell({
                 {customerName}
               </Link>
             )}
-            <Link
-              href="/merchant"
-              className="rounded-full border border-slate-300 bg-white px-3.5 py-1.5 text-xs font-bold text-slate-800 transition hover:border-[#fe2c55] hover:text-[#fe2c55]"
-            >
-              Kênh Người Bán
-            </Link>
+            {!VNPAY_SANDBOX_STOREFRONT && (
+              <Link
+                href="/merchant"
+                className="rounded-full border border-slate-300 bg-white px-3.5 py-1.5 text-xs font-bold text-slate-800 transition hover:border-[#fe2c55] hover:text-[#fe2c55]"
+              >
+                Kênh Người Bán
+              </Link>
+            )}
           </div>
         </div>
       </header>

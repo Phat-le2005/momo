@@ -25,6 +25,49 @@ export type ExperienceToast = {
   detail: string;
 };
 
+export type VnpayCapability = {
+  vnpay_configured?: boolean | null;
+  vnpay_querydr_available?: boolean | null;
+  vnpay_evidence_sources?: Array<"VNPAY_IPN" | "VNPAY_QUERYDR"> | null;
+};
+
+export function describeVnpayCapability(
+  capability: VnpayCapability | undefined,
+  preview: boolean,
+) {
+  if (preview) {
+    return {
+      configuration: "Chế độ chỉ xem",
+      evidence: "Chưa đọc bằng chứng trong chế độ này",
+      querydr: "Chưa đọc cấu hình trong chế độ này",
+    };
+  }
+  const configured = capability?.vnpay_configured;
+  const sources = capability?.vnpay_evidence_sources;
+  const querydrAvailable = capability?.vnpay_querydr_available;
+  const unavailable = "Không khả dụng trong cấu hình hiện tại";
+  let configuration = "Chưa rõ cấu hình";
+  if (configured === true) configuration = "Đã cấu hình Sandbox";
+  if (configured === false) configuration = unavailable;
+
+  let evidence = "Chưa đọc được bằng chứng";
+  if (sources) {
+    const labels = sources.map((source) => source === "VNPAY_IPN" ? "IPN" : "QueryDR");
+    evidence = labels.length
+      ? `Đã xác minh chữ ký qua ${labels.join(", ")}`
+      : "Chưa có bằng chứng đã xác minh trong phạm vi này";
+  }
+
+  let querydr = "Chưa rõ cấu hình";
+  if (querydrAvailable === false) querydr = unavailable;
+  if (querydrAvailable === true) {
+    querydr = sources?.includes("VNPAY_QUERYDR")
+      ? "Đã ghi nhận phản hồi có chữ ký hợp lệ"
+      : "Đã bật trong cấu hình, chưa xác minh live";
+  }
+  return { configuration, evidence, querydr };
+}
+
 /** Adaptive poll interval:
  * - Active investigation / recovery: 4s
  * - Calm monitoring: 10s
