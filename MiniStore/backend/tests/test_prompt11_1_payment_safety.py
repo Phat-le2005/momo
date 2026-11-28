@@ -87,6 +87,8 @@ QUERYDR_RESP_FIELDS = (
     "vnp_TransactionType",
     "vnp_TransactionStatus",
     "vnp_OrderInfo",
+    "vnp_PromotionCode",
+    "vnp_PromotionAmount",
 )
 
 REFUND_RESP_FIELDS = (

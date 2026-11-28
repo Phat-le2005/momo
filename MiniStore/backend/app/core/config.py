@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from ipaddress import ip_address
 from urllib.parse import urlparse
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LOCAL_ENVS: frozenset[str] = frozenset({"local", "test", "dev", "development"})
-APPROVED_VNPAY_SANDBOX_HOSTS: frozenset[str] = frozenset({"sandbox.vnpayment.vn"})
+APPROVED_VNPAY_SANDBOX_HOSTS = frozenset({"sandbox.vnpayment.vn", "sandbox.vnpaytest.vn"})
 TEST_ONLY_VNPAY_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "vnpay.test"})
 
 
@@ -62,12 +63,16 @@ class CommerceSettings(BaseSettings):
     vnpay_refund_enabled: bool = False
     vnpay_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
     vnpay_payment_expiry_minutes: int = Field(default=15, ge=5, le=120)
+    vnpay_querydr_enabled: bool = True
     vnpay_querydr_max_attempts: int = Field(default=5, ge=1, le=20)
     vnpay_querydr_min_age_seconds: int = Field(default=30, ge=0, le=3600)
+    vnpay_querydr_server_ip: str = "127.0.0.1"
 
     # Public HTTPS gateway configuration (explicitly disabled by default)
     public_gateway_enabled: bool = False
     public_base_url: str = ""
+    public_ipn_host: str = ""
+    vnpay_only_checkout: bool = False
 
     # Optional FinResolve integration (Commerce must work cleanly when empty/offline)
     finresolve_api_base_url: str = ""
@@ -93,6 +98,13 @@ class CommerceSettings(BaseSettings):
             raise ValueError("COMMERCE_WEB_ORIGIN must list explicit origins; wildcard not allowed")
         return value
 
+    @field_validator("vnpay_querydr_server_ip")
+    @classmethod
+    def _validate_vnpay_querydr_server_ip(cls, value: str) -> str:
+        if "%" in value:
+            raise ValueError("QueryDR server IP must not include a zone identifier")
+        return str(ip_address(value.strip()))
+
     @field_validator("source_mode")
     @classmethod
     def _only_mock_or_sandbox_supported(cls, value: str) -> str:
@@ -103,28 +115,32 @@ class CommerceSettings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_vnpay_sandbox_hosts(self) -> CommerceSettings:
-        allowed_hosts = set(APPROVED_VNPAY_SANDBOX_HOSTS)
-        if self.app_env.strip().lower() == "test":
-            allowed_hosts |= TEST_ONLY_VNPAY_HOSTS
-
-        for label, raw_url in (
-            ("COMMERCE_VNPAY_PAYMENT_URL", self.vnpay_payment_url.strip()),
-            ("COMMERCE_VNPAY_API_URL", self.vnpay_api_url.strip()),
+        for label, raw_url, path in (
+            ("COMMERCE_VNPAY_PAYMENT_URL", self.vnpay_payment_url, "/paymentv2/vpcpay.html"),
+            ("COMMERCE_VNPAY_API_URL", self.vnpay_api_url, "/merchant_webapi/api/transaction"),
         ):
-            if not raw_url:
-                continue
             parsed = urlparse(raw_url)
-            host = (parsed.hostname or "").lower()
-            if parsed.scheme not in {"https", "http"} or (
-                parsed.scheme == "http" and self.app_env.strip().lower() != "test"
+            test_endpoint = (
+                self.app_env.strip().lower() == "test"
+                and parsed.hostname in TEST_ONLY_VNPAY_HOSTS
+                and parsed.scheme in {"http", "https"}
+            )
+            approved = raw_url in {f"https://{host}{path}" for host in APPROVED_VNPAY_SANDBOX_HOSTS}
+            if not approved and not test_endpoint:
+                raise ValueError(f"{label} must be an approved VNPAY Sandbox endpoint")
+        if self.vnpay_enabled and self.vnpay_version != "2.1.0":
+            raise ValueError("VNPAY Sandbox requires protocol version 2.1.0")
+        if self.vnpay_only_checkout:
+            shop = urlparse(self.vnpay_return_url)
+            ipn = urlparse(self.vnpay_ipn_public_url)
+            if (
+                not shop.hostname
+                or not ipn.hostname
+                or shop.hostname == ipn.hostname
+                or self.vnpay_return_url != f"https://{shop.hostname}/payment/vnpay/return"
+                or self.vnpay_ipn_public_url != f"https://{ipn.hostname}/api/v1/payments/vnpay/ipn"
             ):
-                raise ValueError(f"{label} must use HTTPS (production endpoints forbidden)")
-            if host not in allowed_hosts:
-                raise ValueError(
-                    f"{label} host '{host}' is not an approved VNPAY Sandbox host "
-                    f"(allowed: {sorted(APPROVED_VNPAY_SANDBOX_HOSTS)}). "
-                    "Production VNPAY endpoints are strictly forbidden."
-                )
+                raise ValueError("Sandbox checkout requires distinct HTTPS Return and IPN routes")
         return self
 
     @model_validator(mode="after")

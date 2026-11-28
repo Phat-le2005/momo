@@ -900,7 +900,6 @@ def merchant_list_payments(
 @router.post("/payments/{payment_id}/querydr")
 def merchant_querydr_payment(
     payment_id: str,
-    request: Request,
     principal: MerchantPrincipal = Depends(get_current_merchant),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -914,10 +913,8 @@ def merchant_querydr_payment(
     if payment is None:
         raise CommerceError(ErrorCode.NOT_FOUND, "Payment not found", status_code=404)
 
-    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    client_ip = forwarded or (request.client.host if request.client else "127.0.0.1")
     adapter = get_payment_adapter(payment.provider)
-    obs = adapter.query_payment_status(db, payment_id=payment.id, client_ip=client_ip)
+    obs = adapter.query_payment_status(db, payment_id=payment.id)
     synced = sync_confirmed_payments_to_orders(db, limit=10)
     return {
         "payment_id": obs.payment_id,

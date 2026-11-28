@@ -18,17 +18,48 @@ from __future__ import annotations
 import logging
 import os
 import re
+from threading import BoundedSemaphore
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import RequestResponseEndpoint
 
 from app.core.config import get_settings
-from app.core.rate_limit import enforce_payment_rate_limit
 
-logger = logging.getLogger("finshop.commerce.gateway")
+logger = logging.getLogger("uvicorn.error").getChild("finshop.gateway")
+# The standalone gateway handles signed URLs. HTTPX logs full URLs at INFO.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+IPN_PATH = "/api/v1/payments/vnpay/ipn"
+CANONICAL_PATH = re.compile(r"/[A-Za-z0-9_./~-]*")
+MAX_STOREFRONT_INFLIGHT = 24
+MAX_IPN_INFLIGHT = 8
+VNPAY_ONLY_BLOCKED = re.compile(
+    r"^/api/v1/store/(live/[^/]+/comments|orders/[^/]+/(complaints|refund-requests))$"
+)
+FORWARD_HEADERS = frozenset(
+    {
+        "accept",
+        "accept-language",
+        "authorization",
+        "content-type",
+        "cookie",
+        "origin",
+        "rsc",
+        "next-router-state-tree",
+        "next-router-prefetch",
+        "next-url",
+        "x-customer-session",
+        "x-customer-token",
+        "x-idempotency-key",
+    }
+)
+CLIENT_CREDENTIAL_HEADERS = frozenset(
+    {"authorization", "cookie", "x-customer-session", "x-customer-token", "x-idempotency-key"}
+)
 
 # Explicitly blocked sensitive path prefixes / patterns
 BLOCKED_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -53,10 +84,10 @@ ALLOWED_API_PATTERNS: tuple[tuple[frozenset[str], re.Pattern[str]], ...] = (
     (frozenset({"POST"}), re.compile(r"^/api/v1/store/live/[^/]+/comments$")),
     (frozenset({"POST"}), re.compile(r"^/api/v1/store/customers/(guest|session|logout)$")),
     (frozenset({"GET"}), re.compile(r"^/api/v1/store/customers/me$")),
-    (
-        frozenset({"GET", "POST", "PATCH", "DELETE"}),
-        re.compile(r"^/api/v1/store/cart(/(items(/[^/]+)?|voucher))?$"),
-    ),
+    (frozenset({"GET"}), re.compile(r"^/api/v1/store/cart$")),
+    (frozenset({"POST"}), re.compile(r"^/api/v1/store/cart/items$")),
+    (frozenset({"PATCH", "DELETE"}), re.compile(r"^/api/v1/store/cart/items/[^/]+$")),
+    (frozenset({"POST", "DELETE"}), re.compile(r"^/api/v1/store/cart/voucher$")),
     (frozenset({"POST"}), re.compile(r"^/api/v1/store/checkout$")),
     (frozenset({"GET"}), re.compile(r"^/api/v1/store/orders(/[^/]+)?$")),
     (
@@ -71,7 +102,7 @@ ALLOWED_WEB_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^/(live|cart|checkout|orders|profile)$"),
     re.compile(r"^/products/[^/]+$"),
     re.compile(r"^/payment/vnpay/return$"),
-    re.compile(r"^/_next/.*$"),
+    re.compile(r"^/_next/static/.+$"),
     re.compile(r"^/products/[^/]+\.(jpg|png|svg|webp)$"),
     re.compile(r"^/favicon\.ico$"),
 )
@@ -83,6 +114,7 @@ HOP_BY_HOP_HEADERS: frozenset[str] = frozenset(
         "proxy-authenticate",
         "proxy-authorization",
         "te",
+        "trailer",
         "trailers",
         "transfer-encoding",
         "upgrade",
@@ -110,6 +142,18 @@ def is_route_allowed(method: str, path: str) -> tuple[bool, str]:
     return False, ""
 
 
+def _is_canonical_path(path: str, raw_path: bytes) -> bool:
+    return bool(
+        CANONICAL_PATH.fullmatch(path)
+        and raw_path == path.encode("ascii")
+        and (path == "/" or all(part not in {"", ".", ".."} for part in path.split("/")[1:]))
+    )
+
+
+def _connection_tokens(values: list[str]) -> set[str]:
+    return {token.strip().lower() for value in values for token in value.split(",")}
+
+
 def create_gateway_app(
     *,
     api_upstream: str | None = None,
@@ -129,11 +173,32 @@ def create_gateway_app(
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        redirect_slashes=False,
     )
+    storefront_slots = BoundedSemaphore(MAX_STOREFRONT_INFLIGHT)
+    ipn_slots = BoundedSemaphore(MAX_IPN_INFLIGHT)
+
+    @gw.middleware("http")
+    async def public_response_policy(
+        request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        response = await call_next(request)
+        path = request.scope["path"]
+        public_asset = path.startswith("/_next/static/") or path == "/favicon.ico"
+        if not public_asset or response.status_code >= 400 or "set-cookie" in response.headers:
+            response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     @gw.get("/healthz")
-    def gateway_healthz() -> dict[str, Any]:
+    def gateway_healthz(request: Request) -> dict[str, Any]:
         settings = get_settings()
+        hosts = request.headers.getlist("host")
+        if not _is_canonical_path("/healthz", request.scope.get("raw_path", b"")) or (
+            settings.public_ipn_host
+            and (len(hosts) != 1 or hosts[0] not in {"127.0.0.1", "127.0.0.1:8200"})
+        ):
+            raise HTTPException(status_code=403)
         return {
             "status": "ok",
             "service": "finshop-public-gateway",
@@ -161,9 +226,22 @@ def create_gateway_app(
                 },
             )
 
-        path = "/" + full_path.lstrip("/")
+        path = "/" + full_path
         allowed, upstream_kind = is_route_allowed(request.method, path)
-        if not allowed:
+        is_ipn = path == IPN_PATH
+        if settings.public_ipn_host:
+            hosts = request.headers.getlist("host")
+            shop_host = urlsplit(settings.public_base_url).hostname
+            route_host = settings.public_ipn_host.lower() if is_ipn else shop_host
+            allowed = (
+                allowed
+                and bool(route_host)
+                and len(hosts) == 1
+                and hosts[0].lower() in {route_host, f"{route_host}:8200"}
+            )
+        if settings.public_ipn_host and VNPAY_ONLY_BLOCKED.fullmatch(path):
+            allowed = False
+        if not allowed or not _is_canonical_path(path, request.scope.get("raw_path", b"")):
             return JSONResponse(
                 status_code=403,
                 content={
@@ -174,51 +252,88 @@ def create_gateway_app(
                 },
             )
 
-        if path == "/api/v1/payments/vnpay/ipn":
-            enforce_payment_rate_limit(request)
-
-        # Enforce request body size limit
-        body = await request.body()
-        if len(body) > settings.max_request_body_bytes:
-            return JSONResponse(
-                status_code=413,
-                content={"error": {"code": "PAYLOAD_TOO_LARGE", "message": "Body too large"}},
-            )
-
         # Preserve raw query string verbatim so VNPAY vnp_SecureHash is NEVER altered!
-        raw_qs = request.scope.get("query_string", b"").decode("latin-1")
+        query = request.scope.get("query_string", b"")
+        if len(query) > 8192:
+            return JSONResponse(status_code=414, content={"error": {"code": "QUERY_TOO_LONG"}})
+        if any(char < 33 or char > 126 for char in query) or b"#" in query:
+            return JSONResponse(status_code=400, content={"error": {"code": "INVALID_QUERY"}})
+        if is_ipn and (
+            request.headers.get("content-length", "0") != "0"
+            or "transfer-encoding" in request.headers
+        ):
+            return JSONResponse(status_code=400, content={"error": {"code": "INVALID_IPN_BODY"}})
+
+        slots = ipn_slots if is_ipn else storefront_slots
+        if not slots.acquire(blocking=False):
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"code": "GATEWAY_BUSY"}},
+                headers={"Retry-After": "1"},
+            )
+        try:
+            return await forward_request(
+                request, path, query, upstream_kind, settings.max_request_body_bytes
+            )
+        finally:
+            slots.release()
+
+    async def forward_request(
+        request: Request, path: str, query: bytes, upstream_kind: str, max_body_bytes: int
+    ) -> Response:
+        body = bytearray()
+        if path != IPN_PATH:
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > max_body_bytes:
+                    return JSONResponse(
+                        status_code=413, content={"error": {"code": "PAYLOAD_TOO_LARGE"}}
+                    )
+                body.extend(chunk)
+
         target_base = api_base if upstream_kind == "api" else web_base
-        target_url = f"{target_base}{path}" + (f"?{raw_qs}" if raw_qs else "")
+        base_url = httpx.URL(target_base)
+        target_url = base_url.copy_with(
+            path=base_url.path.rstrip("/") + path, query=query or None, fragment=None
+        )
 
-        fwd_headers = {
-            k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS
-        }
-        client_host = request.client.host if request.client else "127.0.0.1"
-        prior_xff = fwd_headers.get("x-forwarded-for", "")
-        fwd_headers["x-forwarded-for"] = f"{prior_xff}, {client_host}" if prior_xff else client_host
-        fwd_headers["x-forwarded-proto"] = request.headers.get("x-forwarded-proto", "https")
+        request_headers = FORWARD_HEADERS - _connection_tokens(
+            request.headers.getlist("connection")
+        )
+        fwd_headers = {k: v for k, v in request.headers.items() if k.lower() in request_headers}
+        if path == IPN_PATH:
+            fwd_headers.clear()
+        elif upstream_kind == "web":
+            for name in CLIENT_CREDENTIAL_HEADERS:
+                fwd_headers.pop(name, None)
 
-        # Log path ONLY — never log raw signed query strings!
-        logger.info("Gateway forward %s %s -> %s", request.method, path, upstream_kind)
+        route_class = "vnpay-ipn" if path == IPN_PATH else upstream_kind
+        logger.info("Gateway forward %s %s", request.method, route_class)
 
         transport = api_transport if upstream_kind == "api" else web_transport
-        async with httpx.AsyncClient(timeout=15.0, transport=transport) as client:
-            upstream_resp = await client.request(
-                method=request.method,
-                url=target_url,
-                headers=fwd_headers,
-                content=body if body else None,
-                follow_redirects=False,
+        try:
+            async with httpx.AsyncClient(
+                timeout=15.0, transport=transport, trust_env=False
+            ) as client:
+                upstream_resp = await client.request(
+                    method=request.method,
+                    url=target_url,
+                    headers=fwd_headers,
+                    content=bytes(body),
+                    follow_redirects=False,
+                )
+        except httpx.HTTPError:
+            return JSONResponse(
+                status_code=502, content={"error": {"code": "UPSTREAM_UNAVAILABLE"}}
             )
 
-        resp_headers = {
-            k: v for k, v in upstream_resp.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS
-        }
-        return Response(
-            content=upstream_resp.content,
-            status_code=upstream_resp.status_code,
-            headers=resp_headers,
+        response = Response(content=upstream_resp.content, status_code=upstream_resp.status_code)
+        stripped_headers = HOP_BY_HOP_HEADERS | _connection_tokens(
+            upstream_resp.headers.get_list("connection")
         )
+        for name, value in upstream_resp.headers.multi_items():
+            if name not in stripped_headers and name != "content-encoding":
+                response.headers.append(name, value)
+        return response
 
     return gw
 
@@ -228,4 +343,4 @@ gateway_app = create_gateway_app()
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     port = int(os.environ.get("COMMERCE_GATEWAY_PORT", "8200"))
-    uvicorn.run(gateway_app, host="127.0.0.1", port=port)
+    uvicorn.run(gateway_app, host="127.0.0.1", port=port, access_log=False, proxy_headers=False)

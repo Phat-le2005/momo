@@ -9,8 +9,7 @@ Protocol authority:
 - QueryDr Request (`vnp_Command=querydr`):
   `vnp_RequestId|vnp_Version|vnp_Command|vnp_TmnCode|vnp_TxnRef|vnp_TransactionDate|vnp_CreateDate|vnp_IpAddr|vnp_OrderInfo`
 - QueryDr Response:
-  `vnp_ResponseId|vnp_Command|vnp_ResponseCode|vnp_Message|vnp_TmnCode|vnp_TxnRef|vnp_Amount|vnp_BankCode|vnp_PayDate|vnp_TransactionNo|vnp_TransactionType|vnp_TransactionStatus|vnp_OrderInfo`
-  (appending `|vnp_PromotionCode|vnp_PromotionAmount` when present in response).
+  `vnp_ResponseId|vnp_Command|vnp_ResponseCode|vnp_Message|vnp_TmnCode|vnp_TxnRef|vnp_Amount|vnp_BankCode|vnp_PayDate|vnp_TransactionNo|vnp_TransactionType|vnp_TransactionStatus|vnp_OrderInfo|vnp_PromotionCode|vnp_PromotionAmount`
 - Refund Request (`vnp_Command=refund`):
   `vnp_RequestId|vnp_Version|vnp_Command|vnp_TmnCode|vnp_TransactionType|vnp_TxnRef|vnp_Amount|vnp_TransactionNo|vnp_TransactionDate|vnp_CreateBy|vnp_CreateDate|vnp_IpAddr|vnp_OrderInfo`
 - Refund Response:
@@ -27,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote_plus
@@ -49,8 +49,8 @@ def vnd_to_vnp_amount(amount_vnd: int) -> str:
 def vnp_amount_to_vnd(raw_vnp_amount: str | int) -> int:
     """Parse VNPAY `vnp_Amount` (`amount_vnd * 100`) back to exact integer VND."""
     raw_str = str(raw_vnp_amount).strip()
-    if not raw_str.isdigit():
-        raise ValueError(f"Invalid vnp_Amount: '{raw_str}'")
+    if not re.fullmatch(r"[0-9]{1,12}", raw_str):
+        raise ValueError("Invalid vnp_Amount")
     val = int(raw_str)
     if val <= 0 or val % 100 != 0:
         raise ValueError(f"vnp_Amount must be a positive multiple of 100, got {val}")
@@ -69,7 +69,7 @@ def build_vnpay_hash_data(params: dict[str, Any]) -> str:
     """Build canonical sorted query string for VNPAY 2.1.0 payment URL / IPN / ReturnURL."""
     pairs: list[str] = []
     for key in sorted(params.keys()):
-        if key in {"vnp_SecureHash", "vnp_SecureHashType"}:
+        if not key.startswith("vnp_") or key in {"vnp_SecureHash", "vnp_SecureHashType"}:
             continue
         val = params[key]
         if val is None or str(val) == "":
@@ -102,10 +102,14 @@ def build_vnpay_payment_url(
 def verify_vnpay_params_signature(params: dict[str, Any], *, hash_secret: str) -> bool:
     """Constant-time verification of `vnp_SecureHash` on VNPAY IPN or ReturnURL params."""
     received = str(params.get("vnp_SecureHash") or "").strip()
-    if not received or not hash_secret.strip():
+    if not _valid_hash(received) or not hash_secret.strip():
         return False
     expected = sign_vnpay_params(params, hash_secret=hash_secret)
     return hmac.compare_digest(expected.lower(), received.lower())
+
+
+def _valid_hash(value: str) -> bool:
+    return re.fullmatch(r"[0-9a-fA-F]{128}", value) is not None
 
 
 def sign_querydr_request(payload: dict[str, Any], *, hash_secret: str) -> str:
@@ -128,10 +132,10 @@ def sign_querydr_request(payload: dict[str, Any], *, hash_secret: str) -> str:
 def verify_querydr_response_signature(response: dict[str, Any], *, hash_secret: str) -> bool:
     """Verify VNPAY 2.1.0 `querydr` response signature using documented pipe-delimited format."""
     received = str(response.get("vnp_SecureHash") or "").strip()
-    if not received or not hash_secret.strip():
+    if not _valid_hash(received) or not hash_secret.strip():
         return False
 
-    base_fields = [
+    fields = (
         "vnp_ResponseId",
         "vnp_Command",
         "vnp_ResponseCode",
@@ -145,23 +149,14 @@ def verify_querydr_response_signature(response: dict[str, Any], *, hash_secret: 
         "vnp_TransactionType",
         "vnp_TransactionStatus",
         "vnp_OrderInfo",
-    ]
-    base_data = "|".join(str(response.get(f, "") or "") for f in base_fields)
-    if hmac.compare_digest(
-        _hmac_sha512_hex(hash_secret.strip(), base_data).lower(), received.lower()
-    ):
-        return True
-
-    # Support optional promotion fields appended in VNPAY 2.1.0 when present
-    if "vnp_PromotionCode" in response or "vnp_PromotionAmount" in response:
-        ext_data = (
-            f"{base_data}|{response.get('vnp_PromotionCode', '') or ''}"
-            f"|{response.get('vnp_PromotionAmount', '') or ''}"
-        )
-        return hmac.compare_digest(
-            _hmac_sha512_hex(hash_secret.strip(), ext_data).lower(), received.lower()
-        )
-    return False
+        "vnp_PromotionCode",
+        "vnp_PromotionAmount",
+    )
+    values = [response.get(field) for field in fields]
+    if any(value is not None and type(value) not in (str, int) for value in values):
+        return False
+    data = "|".join("" if value is None else str(value) for value in values)
+    return hmac.compare_digest(_hmac_sha512_hex(hash_secret.strip(), data), received.lower())
 
 
 def sign_refund_request(payload: dict[str, Any], *, hash_secret: str) -> str:
@@ -188,7 +183,7 @@ def sign_refund_request(payload: dict[str, Any], *, hash_secret: str) -> str:
 def verify_refund_response_signature(response: dict[str, Any], *, hash_secret: str) -> bool:
     """Verify VNPAY 2.1.0 `refund` response signature using documented pipe-delimited format."""
     received = str(response.get("vnp_SecureHash") or "").strip()
-    if not received or not hash_secret.strip():
+    if not _valid_hash(received) or not hash_secret.strip():
         return False
     fields = (
         "vnp_ResponseId",

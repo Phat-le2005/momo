@@ -32,6 +32,12 @@ from app.models.enums import (
 from app.services.checkout import release_order_reservations_and_voucher
 from app.services.events import record_commerce_event
 
+UNRESOLVED_PAYMENT_STATUSES = (
+    PaymentStatus.INITIATED.value,
+    PaymentStatus.PENDING.value,
+    PaymentStatus.UNKNOWN.value,
+)
+
 
 def sync_single_confirmed_payment_to_order(
     db: Session,
@@ -504,6 +510,21 @@ def expire_stale_reservations(db: Session, *, limit: int = 25) -> int:
             continue
 
         was_unknown_payment = order.payment_status == PaymentStatus.UNKNOWN.value
+        unresolved_vnpay = None
+        if (
+            order.payment_method == PaymentProvider.VNPAY_SANDBOX.value
+            and order.payment_status in UNRESOLVED_PAYMENT_STATUSES
+        ):
+            unresolved_vnpay = db.scalar(
+                select(Payment)
+                .where(
+                    Payment.order_id == order.id,
+                    Payment.provider == PaymentProvider.VNPAY_SANDBOX.value,
+                    Payment.status.in_(UNRESOLVED_PAYMENT_STATUSES),
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
 
         release_order_reservations_and_voucher(
             db, order=order, reason_status=ReservationStatus.EXPIRED
@@ -512,13 +533,19 @@ def expire_stale_reservations(db: Session, *, limit: int = 25) -> int:
         order.version += 1
         order.updated_at = now
 
-        if was_unknown_payment:
-            reason = (
-                "Order reservation expired while payment status was UNKNOWN. "
-                "Reservations released; manual reconciliation required."
+        if was_unknown_payment or unresolved_vnpay is not None:
+            reason_prefix = (
+                "Order reservation expired without a definitive VNPAY payment result. "
+                if unresolved_vnpay is not None
+                else "Order reservation expired while payment status was UNKNOWN. "
             )
+            reason = reason_prefix + "Reservations released; manual reconciliation required."
             order.reconciliation_status = ReconciliationStatus.RECONCILIATION_REQUIRED.value
             order.reconciliation_reason = reason
+            if unresolved_vnpay is not None:
+                unresolved_vnpay.reconciliation_required = True
+                unresolved_vnpay.reconciliation_note = reason
+                unresolved_vnpay.updated_at = now
             record_commerce_event(
                 db,
                 merchant_id=order.merchant_id,
@@ -526,8 +553,9 @@ def expire_stale_reservations(db: Session, *, limit: int = 25) -> int:
                 world_epoch=order.world_epoch,
                 event_type="PAYMENT_RECONCILIATION_REQUIRED",
                 order_id=order.id,
+                payment_id=unresolved_vnpay.id if unresolved_vnpay is not None else None,
                 correlation_id=order.correlation_id,
-                payload={"reason": reason, "payment_status": PaymentStatus.UNKNOWN.value},
+                payload={"reason": reason, "payment_status": order.payment_status},
             )
 
         record_commerce_event(
@@ -566,7 +594,7 @@ def reconcile_pending_vnpay_payments(
           so they can never starve newer eligible payments.
     """
     settings = get_settings()
-    if not settings.is_vnpay_configured:
+    if not settings.is_vnpay_configured or not settings.vnpay_querydr_enabled:
         return 0
 
     now = datetime.now(UTC)
@@ -579,13 +607,7 @@ def reconcile_pending_vnpay_payments(
         select(Payment)
         .where(
             Payment.provider == PaymentProvider.VNPAY_SANDBOX.value,
-            Payment.status.in_(
-                [
-                    PaymentStatus.INITIATED.value,
-                    PaymentStatus.PENDING.value,
-                    PaymentStatus.UNKNOWN.value,
-                ]
-            ),
+            Payment.status.in_(UNRESOLVED_PAYMENT_STATUSES),
             Payment.created_at <= cutoff,
             Payment.querydr_exhausted.is_(False),
             or_(
@@ -659,11 +681,7 @@ def reconcile_pending_vnpay_payments(
         locked_pay.querydr_locked_until = None
         locked_pay.updated_at = now2
 
-        is_still_pending = locked_pay.status in (
-            PaymentStatus.INITIATED.value,
-            PaymentStatus.PENDING.value,
-            PaymentStatus.UNKNOWN.value,
-        )
+        is_still_pending = locked_pay.status in UNRESOLVED_PAYMENT_STATUSES
         if is_still_pending and attempt_count >= max_attempts:
             reason = (
                 f"VNPAY QueryDr exhausted after {attempt_count} attempt(s) with payment still "

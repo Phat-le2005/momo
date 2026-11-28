@@ -43,7 +43,7 @@ def list_payment_methods() -> list[dict[str, Any]]:
         {
             "id": PaymentProvider.LOCAL_MOCK.value,
             "label_vi": "Thanh toán thử nghiệm nội bộ (LOCAL_MOCK — mô phỏng)",
-            "available": True,
+            "available": not settings.vnpay_only_checkout,
             "is_mock": True,
             "supports_redirect": False,
         },

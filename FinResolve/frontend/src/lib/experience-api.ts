@@ -7,6 +7,7 @@
 
 import type { GuardianVisualState } from "../components/GuardianBadge";
 import { API_BASE_URL, ApiError } from "./api";
+import type { VnpayCapability } from "./experience-utils";
 
 export type ExperienceBootstrapResponse = {
   status: "READY" | "DEGRADED" | "PROVISIONING" | "FAILED" | "EXPIRED" | string;
@@ -19,7 +20,7 @@ export type ExperienceBootstrapResponse = {
     world_epoch: number;
     workspace_role?: "CONTROLLER" | "READ_ONLY_PREVIEW" | string;
   };
-  sandbox: {
+  sandbox: VnpayCapability & {
     environment_name: string;
     sandbox_isolation_mode?: string;
     workspace_role?: "CONTROLLER" | "READ_ONLY_PREVIEW" | string;
@@ -29,7 +30,7 @@ export type ExperienceBootstrapResponse = {
     binding_id: string | null;
     connectivity_status: "CONNECTED" | "DISCONNECTED" | "UNCONFIGURED" | "READ_ONLY_PREVIEW" | string;
     storefront_url: string;
-    vnpay_enabled: boolean;
+    vnpay_enabled: boolean | null;
   };
   guardian: {
     worker_healthy: boolean;

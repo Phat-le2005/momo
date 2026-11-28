@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -24,6 +25,7 @@ from app.core.rate_limit import (
     enforce_auth_rate_limit,
     enforce_checkout_rate_limit,
     enforce_payment_rate_limit,
+    enforce_vnpay_ipn_rate_limit,
 )
 from app.db.session import get_db
 from app.models.entities import (
@@ -1571,7 +1573,6 @@ def mock_payment_provider_notify(
 )
 def vnpay_sandbox_ipn(
     request: Request,
-    _rl: None = Depends(enforce_payment_rate_limit),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
     """Receive and verify VNPAY Sandbox IPN callback.
@@ -1581,7 +1582,20 @@ def vnpay_sandbox_ipn(
     """
     raw_items = list(request.query_params.multi_items())
     adapter = VNPaySandboxAdapter()
-    return adapter.process_ipn(db, raw_query_items=raw_items)
+    try:
+        result = adapter.process_ipn(
+            db,
+            raw_query_items=raw_items,
+            enforce_rate_limit=lambda: enforce_vnpay_ipn_rate_limit(request),
+        )
+    except CommerceError as exc:
+        if exc.code != ErrorCode.RATE_LIMITED:
+            raise
+        result = {"RspCode": "99", "Message": "Callback temporarily rate limited"}
+    logging.getLogger("uvicorn.error").getChild("finshop.payments").info(
+        "VNPAY IPN acknowledgment %s", result["RspCode"]
+    )
+    return result
 
 
 @router.get(
@@ -1598,7 +1612,10 @@ def vnpay_return_verify(
     HARD INVARIANT: ReturnURL NEVER mutates Payment or Order status! Authoritative confirmation
     comes ONLY from verified IPN or verified QueryDr.
     """
-    params = dict(request.query_params.items())
+    items = request.query_params.multi_items()
+    params = dict(items)
+    if len(items) != len(params):
+        raise CommerceError(ErrorCode.BAD_REQUEST, "Tham số VNPAY bị trùng", status_code=400)
     txn_ref = params.get("vnp_TxnRef", "").strip()
     if not txn_ref:
         raise CommerceError(

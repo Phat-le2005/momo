@@ -12,7 +12,9 @@ Safety & Honesty Invariants:
 
 from __future__ import annotations
 
+import re
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -96,7 +98,7 @@ class VNPaySandboxAdapter:
             provider=PaymentProvider.VNPAY_SANDBOX.value,
             supports_redirect_checkout=settings.is_vnpay_configured,
             supports_ipn_signature_verification=True,
-            supports_querydr=settings.is_vnpay_configured,
+            supports_querydr=settings.is_vnpay_configured and settings.vnpay_querydr_enabled,
             supports_partial_refund=settings.is_vnpay_configured and settings.vnpay_refund_enabled,
             supports_refund=settings.is_vnpay_configured and settings.vnpay_refund_enabled,
             is_mock_only=False,
@@ -271,6 +273,7 @@ class VNPaySandboxAdapter:
         *,
         raw_query_items: list[tuple[str, str]],
         provenance_override: str | None = None,
+        enforce_rate_limit: Callable[[], None] | None = None,
     ) -> dict[str, str]:
         """Process official VNPAY `GET /api/v1/payments/vnpay/ipn` callback.
 
@@ -303,6 +306,8 @@ class VNPaySandboxAdapter:
         tmn_code = params.get("vnp_TmnCode", "").strip()
         if tmn_code != settings.vnpay_tmn_code.strip():
             return {"RspCode": IPN_RSP_INVALID_SIGNATURE[0], "Message": "Invalid TmnCode"}
+        if enforce_rate_limit is not None:
+            enforce_rate_limit()
 
         txn_ref = params.get("vnp_TxnRef", "").strip()
         if not txn_ref:
@@ -326,22 +331,26 @@ class VNPaySandboxAdapter:
         txn_status = params.get("vnp_TransactionStatus", "").strip()
         txn_no = params.get("vnp_TransactionNo", "").strip() or None
         pay_date = params.get("vnp_PayDate", "").strip() or None
+        if not re.fullmatch(r"[0-9]{2}", response_code) or (
+            txn_status and not re.fullmatch(r"[0-9]{2}", txn_status)
+        ):
+            return {"RspCode": "99", "Message": "Invalid payment status fields"}
+        if not re.fullmatch(r"[0-9]{1,15}", txn_no or "") or (
+            response_code == txn_status == "00" and int(txn_no or "0") == 0
+        ):
+            return {"RspCode": "99", "Message": "Invalid provider transaction number"}
+        if pay_date:
+            try:
+                datetime.strptime(pay_date, "%Y%m%d%H%M%S")
+                if not re.fullmatch(r"[0-9]{14}", pay_date):
+                    raise ValueError("Incorrect timestamp length")
+            except ValueError:
+                return {"RspCode": "99", "Message": "Invalid payment date"}
         mapping = map_vnpay_ipn_status(response_code=response_code, transaction_status=txn_status)
 
         # Deterministic notification identity bound to provider txn & status
-        notif_id = f"VNPAY-IPN-{txn_ref}-{txn_no or 'NOTXN'}-{response_code}-{txn_status or 'NA'}"
+        notif_id = f"VNPAY-IPN-{txn_ref}-{txn_no}-{response_code}-{txn_status}-{pay_date or 'NA'}"
         prov_env = provenance_override or self._provenance_env()
-
-        # Check already-confirmed terminal state (VNPAY RspCode 02)
-        if payment.status in (
-            PaymentStatus.SUCCEEDED.value,
-            PaymentStatus.PARTIALLY_REFUNDED.value,
-            PaymentStatus.REFUNDED.value,
-        ):
-            return {
-                "RspCode": IPN_RSP_ALREADY_CONFIRMED[0],
-                "Message": IPN_RSP_ALREADY_CONFIRMED[1],
-            }
 
         try:
             updated_pay, is_dup = apply_authoritative_payment_observation(
@@ -388,10 +397,15 @@ class VNPaySandboxAdapter:
         db: Session,
         *,
         payment_id: str,
-        client_ip: str = "127.0.0.1",
         expected_claim_token: str | None = None,
     ) -> PaymentObservation:
         """Execute VNPAY 2.1.0 `querydr` API, persist durable attempt history, and reconcile."""
+        if not get_settings().vnpay_querydr_enabled:
+            raise CommerceError(
+                ErrorCode.FORBIDDEN,
+                "VNPAY_QUERYDR_UNAVAILABLE: Truy vấn đối soát VNPAY đang tạm dừng.",
+                status_code=503,
+            )
         tmn_code, hash_secret, version, _, _ = self._require_configured()
         payment = db.get(Payment, payment_id)
         if payment is None:
@@ -421,8 +435,6 @@ class VNPaySandboxAdapter:
         snap_amount_vnd = payment.amount_vnd
         snap_correlation_id = payment.correlation_id
         order_info = f"Truy van giao dich {snap_provider_ref}"
-        safe_ip = (client_ip or "127.0.0.1").split(",")[0].strip()[:45] or "127.0.0.1"
-
         req_payload: dict[str, Any] = {
             "vnp_RequestId": req_id,
             "vnp_Version": version,
@@ -432,7 +444,7 @@ class VNPaySandboxAdapter:
             "vnp_OrderInfo": order_info,
             "vnp_TransactionDate": txn_date,
             "vnp_CreateDate": create_date,
-            "vnp_IpAddr": safe_ip,
+            "vnp_IpAddr": get_settings().vnpay_querydr_server_ip,
         }
         req_payload["vnp_SecureHash"] = sign_querydr_request(req_payload, hash_secret=hash_secret)
 
@@ -446,18 +458,32 @@ class VNPaySandboxAdapter:
         # External HTTP call executes outside DB row locks
         try:
             http_status, resp_data = self._get_client().post_transaction(req_payload)
-        except httpx.TimeoutException as exc:
-            err_msg = f"VNPAY QueryDr timeout: {exc}"
-        except Exception as exc:  # noqa: BLE001
-            err_msg = f"VNPAY QueryDr transport error: {str(exc)[:300]}"
+        except httpx.TimeoutException:
+            err_msg = "VNPAY QueryDr timeout"
+        except (httpx.HTTPError, ValueError):
+            err_msg = "VNPAY QueryDr transport or response format error"
 
         resp_code = str(resp_data.get("vnp_ResponseCode", "") or "").strip() or None
         txn_status = str(resp_data.get("vnp_TransactionStatus", "") or "").strip() or None
+        invalid_response_code = resp_code is not None and not re.fullmatch(r"[0-9]{2}", resp_code)
+        invalid_transaction_status = txn_status is not None and not re.fullmatch(
+            r"[0-9]{2}", txn_status
+        )
 
         if err_msg is None and http_status == 200:
-            sig_ok = verify_querydr_response_signature(resp_data, hash_secret=hash_secret)
-            if not sig_ok:
-                err_msg = "VNPAY QueryDr response signature verification FAILED"
+            if "vnp_SecureHash" not in resp_data:
+                err_msg = "VNPAY QueryDR response signature missing"
+            else:
+                sig_ok = verify_querydr_response_signature(resp_data, hash_secret=hash_secret)
+                if not sig_ok:
+                    err_msg = "VNPAY QueryDR response signature invalid"
+        if invalid_response_code or invalid_transaction_status:
+            # Bad upstream metadata must not roll back the attempt and bypass the retry budget.
+            err_msg = "VNPAY QueryDR response status fields malformed"
+            if invalid_response_code:
+                resp_code = None
+            if invalid_transaction_status:
+                txn_status = None
 
         # Always persist durable PaymentQueryAttempt history!
         attempt = PaymentQueryAttempt(
@@ -478,18 +504,23 @@ class VNPaySandboxAdapter:
             response_json=_sanitize_vnpay_payload(resp_data),
             created_at=now,
         )
-        db.add(attempt)
-        db.flush()
-
         # P1.1: Re-read & lock Order -> Payment atomically after external HTTP call
-        ord_row = db.scalar(select(Order).where(Order.id == snap_order_id).with_for_update())
+        ord_row = db.scalar(
+            select(Order)
+            .where(Order.id == snap_order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         locked_pay = db.scalar(
-            select(Payment).where(Payment.id == snap_payment_id).with_for_update()
+            select(Payment)
+            .where(Payment.id == snap_payment_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if locked_pay is None:
-            db.commit()
             raise CommerceError(ErrorCode.NOT_FOUND, "Payment not found", status_code=404)
         payment = locked_pay
+        db.add(attempt)
 
         # Section 12 QueryDr lease fencing: stale worker must NOT apply authoritative state
         if expected_claim_token is not None and payment.querydr_claim_token != expected_claim_token:
@@ -528,8 +559,9 @@ class VNPaySandboxAdapter:
         if (
             str(resp_data.get("vnp_TmnCode", "")).strip() != tmn_code
             or str(resp_data.get("vnp_TxnRef", "")).strip() != snap_provider_ref
+            or resp_data.get("vnp_Command") not in (None, "", "querydr")
         ):
-            attempt.error_message = "VNPAY QueryDr response TmnCode/TxnRef mismatch"
+            attempt.error_message = "VNPAY QueryDr response merchant, reference or command mismatch"
             db.commit()
             raise CommerceError(
                 ErrorCode.CONFLICT,
@@ -560,6 +592,12 @@ class VNPaySandboxAdapter:
             response_code=resp_code or "",
             transaction_status=txn_status,
         )
+        terminal_expected = {
+            PaymentStatus.SUCCEEDED.value: PaymentStatus.SUCCEEDED,
+            PaymentStatus.PARTIALLY_REFUNDED.value: PaymentStatus.SUCCEEDED,
+            PaymentStatus.REFUNDED.value: PaymentStatus.SUCCEEDED,
+            PaymentStatus.FAILED.value: PaymentStatus.FAILED,
+        }.get(payment.status)
 
         # P1.5: Strict QueryDr confirmation field validation for SUCCEEDED (00/00)
         resp_id = str(resp_data.get("vnp_ResponseId", "") or "").strip()
@@ -571,8 +609,8 @@ class VNPaySandboxAdapter:
                 missing_or_invalid.append("vnp_ResponseId missing")
             if not resp_amount_raw:
                 missing_or_invalid.append("vnp_Amount missing")
-            if not resp_txn_no:
-                missing_or_invalid.append("vnp_TransactionNo missing")
+            if not re.fullmatch(r"[0-9]{1,15}", resp_txn_no) or int(resp_txn_no) == 0:
+                missing_or_invalid.append("vnp_TransactionNo missing or invalid")
             if resp_txn_type and resp_txn_type != "01":
                 missing_or_invalid.append(
                     f"vnp_TransactionType expected '01', got '{resp_txn_type}'"
@@ -586,18 +624,16 @@ class VNPaySandboxAdapter:
                 )
                 attempt.error_message = detail
                 attempt.mapped_payment_status = PaymentStatus.UNKNOWN.value
-                if payment.status not in (
-                    PaymentStatus.SUCCEEDED.value,
-                    PaymentStatus.PARTIALLY_REFUNDED.value,
-                    PaymentStatus.REFUNDED.value,
-                ):
-                    payment.status = PaymentStatus.UNKNOWN.value
+                if terminal_expected in (None, PaymentStatus.FAILED):
                     payment.reconciliation_required = True
                     payment.reconciliation_note = detail
-                    payment.last_observed_at = now
                     payment.updated_at = now
+                    if terminal_expected is None:
+                        payment.status = PaymentStatus.UNKNOWN.value
+                        payment.last_observed_at = now
                     if ord_row is not None:
-                        ord_row.payment_status = PaymentStatus.UNKNOWN.value
+                        if terminal_expected is None:
+                            ord_row.payment_status = PaymentStatus.UNKNOWN.value
                         ord_row.reconciliation_status = (
                             ReconciliationStatus.RECONCILIATION_REQUIRED.value
                         )
@@ -639,13 +675,12 @@ class VNPaySandboxAdapter:
             },
         )
 
-        # P1.1: Preserve already-confirmed or refunded terminal states under lock
-        if payment.status in (
-            PaymentStatus.SUCCEEDED.value,
-            PaymentStatus.PARTIALLY_REFUNDED.value,
-            PaymentStatus.REFUNDED.value,
-        ):
-            if mapping.payment_status != PaymentStatus.SUCCEEDED:
+        # Preserve the terminal ledger and keep the new signed observation for review.
+        if terminal_expected is not None:
+            if mapping.payment_status != terminal_expected or (
+                payment.provider_txn_no and payment.provider_txn_no != resp_txn_no
+            ):
+                attempt.error_message = "Signed QueryDR conflicts with terminal payment"
                 payment.reconciliation_required = True
                 payment.reconciliation_note = (
                     f"Conflicting QueryDr observation ({mapped_status_str}) on payment in status "

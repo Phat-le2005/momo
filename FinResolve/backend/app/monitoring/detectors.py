@@ -113,6 +113,10 @@ def detect_d01_payment_sync_mismatch(
                         "source": "MINI_STORE_COMMERCE_HTTP",
                         "endpoint": f"/api/v1/service/payments/{pay_id}",
                         "payment_status": pay_status,
+                        "provider": pay.get("provider"),
+                        "provider_environment": pay.get("provider_environment"),
+                        "observation_source": pay.get("observation_source"),
+                        "signature_verified": pay.get("signature_verified"),
                         "is_synced_to_order": is_synced,
                         "age_seconds": round(age_s, 1),
                     },
@@ -127,7 +131,11 @@ def detect_d01_payment_sync_mismatch(
                     f"(grace={grace_seconds}s) while Order {order_id} remains PENDING_PAYMENT."
                 ),
                 case_type="PAYMENT_SYNC_MISMATCH",
-                recommended_action_hint="SYNC_ORDER_FROM_CONFIRMED_PAYMENT",
+                recommended_action_hint=(
+                    "REVIEW_EXTERNAL_PAYMENT_SYNC"
+                    if pay.get("provider") == "VNPAY_SANDBOX"
+                    else "SYNC_ORDER_FROM_CONFIRMED_PAYMENT"
+                ),
             )
         )
     return anomalies
@@ -166,6 +174,10 @@ def detect_d02_late_payment_on_cancelled_order(
                         "source": "MINI_STORE_COMMERCE_HTTP",
                         "endpoint": f"/api/v1/service/payments/{pay_id}",
                         "payment_status": pay_status,
+                        "provider": pay.get("provider"),
+                        "provider_environment": pay.get("provider_environment"),
+                        "observation_source": pay.get("observation_source"),
+                        "signature_verified": pay.get("signature_verified"),
                         "amount_vnd": pay.get("amount_vnd"),
                     },
                     {
@@ -180,7 +192,11 @@ def detect_d02_late_payment_on_cancelled_order(
                     "Order MUST NOT be resurrected automatically; requires reconciliation review."
                 ),
                 case_type="PAYMENT_DISPUTE",
-                recommended_action_hint="HUMAN_APPROVAL_REFUND_OR_RECONCILE",
+                recommended_action_hint=(
+                    "REVIEW_EXTERNAL_LATE_PAYMENT"
+                    if pay.get("provider") == "VNPAY_SANDBOX"
+                    else "HUMAN_APPROVAL_REFUND_OR_RECONCILE"
+                ),
             )
         )
     return anomalies
@@ -482,6 +498,9 @@ def detect_d07_financial_evidence_conflict(snapshot: CommerceSnapshot) -> list[D
                         "endpoint": f"/api/v1/service/payments/{pay_id}",
                         "status": pay_status,
                         "reconciliation_required": recon_req,
+                        "provider_environment": pay.get("provider_environment"),
+                        "observation_source": pay.get("observation_source"),
+                        "signature_verified": pay.get("signature_verified"),
                         "provider_response_code": pay.get("provider_response_code"),
                         "provider_transaction_status": pay.get("provider_transaction_status"),
                     }

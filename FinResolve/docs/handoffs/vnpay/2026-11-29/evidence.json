@@ -1,0 +1,51 @@
+{
+  "baseline_commit": "9832f66ed6559aeaf4aa43646b725ca6139bed70",
+  "competition_runtime": {
+    "healthy_services": 9,
+    "local_mock_available": true,
+    "vnpay_available": false
+  },
+  "candidate": {
+    "healthy_services": 10,
+    "published_on_loopback_only": true,
+    "volumes_separate_from_existing_projects": true,
+    "tunnel_started": false,
+    "provider_pay_calls": 0,
+    "provider_querydr_calls": 0,
+    "querydr_enabled_in_api_and_worker": false,
+    "refund_enabled_in_api_and_worker": false
+  },
+  "tests": {
+    "ministore_backend_passed": 52,
+    "finresolve_backend_passed": 234,
+    "finresolve_frontend_unit_passed": 15,
+    "ministore_frontend_unit_passed": 4,
+    "guardian_playwright_passed": 4,
+    "backend_lint_format_typecheck_passed": true,
+    "finresolve_frontend_lint_typecheck_passed": true
+  },
+  "fixture_gateway": {
+    "return_before_ipn": "PENDING",
+    "ipn_bad_signature": "97",
+    "ipn_valid": "00",
+    "ipn_replay": "02",
+    "order_after_worker": "CONFIRMED",
+    "provenance": "TEST_FIXTURE",
+    "blocked_requests_checked": 6,
+    "signed_callback_fields_absent_from_logs": true
+  },
+  "return_browser": {
+    "pending_until_verified_ipn": true,
+    "poll_deadline": true,
+    "isolates_return_navigation": true,
+    "unknown_stops_poll": true,
+    "static_assets_loaded": true
+  },
+  "guardian_runtime": {
+    "vnpay_configured": true,
+    "querydr_available": false,
+    "fixture_counts_as_verified_live": false,
+    "preview_capability_known": false,
+    "legacy_enabled_boolean_preserved": true
+  }
+}
