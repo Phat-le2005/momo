@@ -32,3 +32,23 @@ Independent live-commerce system (`Next.js + TypeScript + Tailwind CSS` frontend
 - `COMMERCE_TEST_MERCHANT_PASSWORD`: local default `FinShopLocal!2026` (must be overridden in non-local envs).
 - `COMMERCE_MOCK_PROVIDER_SECRET`: server-side secret for `/api/v1/test-payments/mock/notify`.
 - `COMMERCE_SERVICE_API_KEY`: scoped service connector key for `/api/v1/service/*`.
+
+## Dữ liệu đơn hàng mẫu cục bộ
+
+Migration tạo cấu trúc bảng; catalog seed tạo sản phẩm, tồn kho, voucher và khách mẫu.
+Để thêm dữ liệu mua hàng vào database đã migrate, chạy từ thư mục gốc repository:
+
+```powershell
+docker compose --env-file .\FinResolve\infra\.env -f .\FinResolve\infra\docker-compose.yml exec -T commerce-api python -m alembic upgrade head
+docker compose --env-file .\FinResolve\infra\.env -f .\FinResolve\infra\docker-compose.yml cp .\MiniStore\backend\scripts\seed_local_demo.py commerce-api:/tmp/seed_local_demo.py
+docker compose --env-file .\FinResolve\infra\.env -f .\FinResolve\infra\docker-compose.yml exec -T commerce-api python /tmp/seed_local_demo.py
+```
+
+Lần đầu tạo 12 đơn `LOCAL_MOCK`: 8 đơn thanh toán thành công và xác nhận, 2 đơn chờ
+thanh toán, 2 đơn thanh toán thất bại và đã hủy. Dữ liệu đi qua các hàm checkout,
+payment notification, sync và cancellation có sẵn để giữ nhất quán tồn kho và sự kiện.
+Chạy lại giữ nguyên các đơn đã có, không tạo trùng và không khôi phục trạng thái cũ.
+Chương trình chỉ chạy trong môi trường local/dev/docker/test với `MOCK`.
+
+Guardian đọc được nhóm dữ liệu này khi phiên đã kích hoạt Operator và quét nguồn.
+Đơn mẫu thuộc hai khách seed; tài khoản khách mới trên storefront chỉ thấy đơn của chính mình.
